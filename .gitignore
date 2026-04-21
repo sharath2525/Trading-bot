@@ -39,6 +39,7 @@ prompts.log
 
 # Private notes — local only, not for server or GitHub
 DEVNOTES.md
+STRATEGY.md
 
 # Node artifacts (not a Node project — safe to ignore)
 package-lock.json
