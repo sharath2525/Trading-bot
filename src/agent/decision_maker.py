@@ -28,7 +28,7 @@ class TradingAgent:
         self.hyperliquid = hyperliquid
         # Sanitize model: cheap Haiku used only to fix malformed JSON output
         self.sanitize_model = CONFIG.get("sanitize_model") or "claude-haiku-4-5-20251001"
-        self.max_tokens = int(CONFIG.get("max_tokens") or 4096)
+        self.max_tokens = int(CONFIG.get("max_tokens") or 2048)
 
         logging.info("TradingAgent initialized — main model: %s | sanitize model: %s",
                      self.model, self.sanitize_model)
@@ -77,6 +77,13 @@ class TradingAgent:
             "- You can use leverage, but the system enforces a hard cap. Stay within the limits.\n"
             "- In high volatility (elevated ATR) or during funding spikes, reduce or avoid leverage.\n"
             "- Treat allocation_usd as notional exposure; keep it consistent with safe leverage and available margin.\n\n"
+            "Fee policy (CRITICAL — directly affects profitability)\n"
+            "- Hyperliquid charges a 0.045% taker fee on market orders. A full round-trip (open + close) costs ~0.09%.\n"
+            "- The risk limits in context show taker_fee_pct and min_tp_pct_from_entry (system-enforced minimum TP distance).\n"
+            "- NEVER open a trade if the expected price move is less than 3× the round-trip fee (~0.27%).\n"
+            "- BUY: set tp_price at least 0.3% above entry. SELL: set tp_price at least 0.3% below entry.\n"
+            "- Prefer limit orders (order_type: \"limit\") when practical — they pay 0% maker fee, saving the full taker cost.\n"
+            "- Factor funding costs into your holding horizon: if funding is strongly negative for your direction, either reduce size or target a larger TP to compensate.\n\n"
             "Tool usage\n"
             "- Use the fetch_indicator tool whenever an additional datapoint could sharpen your thesis; parameters: indicator (ema/sma/rsi/macd/bbands/atr/adx/obv/vwap/stoch_rsi/all), asset (e.g. \"BTC\", \"OIL\", \"GOLD\"), interval (\"5m\"/\"4h\"), optional period.\n"
             "- Indicators are computed locally from Hyperliquid candle data — works for ALL perp markets (crypto, commodities, indices).\n"
@@ -159,7 +166,8 @@ class TradingAgent:
                     "type": "enabled",
                     "budget_tokens": int(CONFIG.get("thinking_budget_tokens") or 10000),
                 }
-                # When thinking is enabled, max_tokens must be larger
+                if self.max_tokens < 16000:
+                    logging.warning("THINKING_ENABLED forces max_tokens from %d to 16000 — this increases API cost significantly", self.max_tokens)
                 kwargs["max_tokens"] = max(self.max_tokens, 16000)
 
             response = self.client.messages.create(**kwargs)
@@ -180,17 +188,20 @@ class TradingAgent:
                 interval = tool_input["interval"]
                 indicator = tool_input["indicator"]
 
-                # Fetch candles from Hyperliquid
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                        candles = pool.submit(
-                            asyncio.run,
+                # Fetch candles — must run in a fresh event loop on a worker thread
+                # because this method is called from inside the running asyncio loop.
+                import concurrent.futures as _cf
+                def _fetch():
+                    import asyncio as _a
+                    loop = _a.new_event_loop()
+                    try:
+                        return loop.run_until_complete(
                             self.hyperliquid.get_candles(asset, interval, 100)
-                        ).result(timeout=30)
-                else:
-                    candles = asyncio.run(self.hyperliquid.get_candles(asset, interval, 100))
+                        )
+                    finally:
+                        loop.close()
+                with _cf.ThreadPoolExecutor(max_workers=1) as pool:
+                    candles = pool.submit(_fetch).result(timeout=30)
 
                 all_indicators = compute_all(candles)
 
@@ -211,18 +222,27 @@ class TradingAgent:
                         "lower": {"latest": latest(all_indicators.get("bbands_lower", [])), "series": last_n(all_indicators.get("bbands_lower", []), 10)},
                     }
                 elif indicator in ("ema", "sma"):
-                    period = tool_input.get("period", 20)
+                    try:
+                        period = max(2, min(200, int(tool_input.get("period", 20))))
+                    except (ValueError, TypeError):
+                        period = 20
                     from src.indicators.local_indicators import ema as _ema, sma as _sma
                     closes = [c["close"] for c in candles]
                     series = _ema(closes, period) if indicator == "ema" else _sma(closes, period)
                     result = {"latest": latest(series), "series": last_n(series, 10), "period": period}
                 elif indicator == "rsi":
-                    period = tool_input.get("period", 14)
+                    try:
+                        period = max(2, min(200, int(tool_input.get("period", 14))))
+                    except (ValueError, TypeError):
+                        period = 14
                     from src.indicators.local_indicators import rsi as _rsi
                     series = _rsi(candles, period)
                     result = {"latest": latest(series), "series": last_n(series, 10), "period": period}
                 elif indicator == "atr":
-                    period = tool_input.get("period", 14)
+                    try:
+                        period = max(2, min(200, int(tool_input.get("period", 14))))
+                    except (ValueError, TypeError):
+                        period = 14
                     from src.indicators.local_indicators import atr as _atr
                     series = _atr(candles, period)
                     result = {"latest": latest(series), "series": last_n(series, 10), "period": period}

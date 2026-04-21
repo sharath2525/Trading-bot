@@ -141,7 +141,9 @@ class HyperliquidAPI:
             The input ``amount`` rounded to the market's ``szDecimals`` precision.
         """
         # Check main dex cache first
-        meta = self._meta_cache[0] if hasattr(self, '_meta_cache') and self._meta_cache else None
+        meta = None
+        if self._meta_cache and isinstance(self._meta_cache, list) and len(self._meta_cache) > 0:
+            meta = self._meta_cache[0]
         if meta:
             universe = meta.get("universe", [])
             asset_info = next((u for u in universe if u.get("name") == asset), None)
@@ -393,7 +395,7 @@ class HyperliquidAPI:
                 logging.warning("Failed to fetch spot state for unified account: %s", e)
 
         if not total_value:
-            total_value = balance + sum(max(p.get("pnl", 0.0), 0.0) for p in enriched_positions)
+            total_value = balance + sum(p.get("pnl", 0.0) for p in enriched_positions)
         return {"balance": balance, "total_value": total_value, "positions": enriched_positions}
 
     async def get_current_price(self, asset):

@@ -1,9 +1,9 @@
-# Environments
+# Environments — never commit secrets
 .env
 .env.*
 !.env.example
 
-# Python
+# Python artifacts
 __pycache__/
 *.py[cod]
 *.pyo
@@ -11,21 +11,35 @@ __pycache__/
 *.egg-info/
 *.egg
 
-# Virtual envs
+# Virtual environments
 .venv/
 venv/
+env/
 
-# Editors/OS
+# Editors / OS
 .DS_Store
 .idea/
 .vscode/
+Thumbs.db
 
-# Caches
+# Caches / type checkers
 .pytest_cache/
 .mypy_cache/
 .cache/
+.ruff_cache/
 
-llm_requests.log
-trading_history.log
+# Runtime log files (grow unbounded, not useful in git)
 *.log
+nohup.out
+
+# Runtime data files (generated at runtime, not source)
 diary.jsonl
+decisions.jsonl
+prompts.log
+
+# Private notes — local only, not for server or GitHub
+DEVNOTES.md
+
+# Node artifacts (not a Node project — safe to ignore)
+package-lock.json
+node_modules/

@@ -92,7 +92,7 @@ class RiskManager:
             return False, "Daily loss circuit breaker is active — no new trades until tomorrow (UTC)"
         if self.daily_high_value and self.daily_high_value > 0:
             drawdown_pct = ((self.daily_high_value - account_value) / self.daily_high_value) * 100
-            if drawdown_pct >= self.daily_loss_circuit_breaker_pct:
+            if drawdown_pct > self.daily_loss_circuit_breaker_pct:
                 self.circuit_breaker_active = True
                 self.circuit_breaker_date = datetime.now(timezone.utc).date()
                 return False, (
@@ -122,20 +122,42 @@ class RiskManager:
         return True, ""
 
     # ------------------------------------------------------------------
-    # Stop-loss enforcement
+    # Stop-loss / Take-profit enforcement
     # ------------------------------------------------------------------
+
+    # Hyperliquid base taker fee (both sides of a round trip = 2×)
+    TAKER_FEE_PCT = 0.045
 
     def enforce_stop_loss(self, sl_price: float | None, entry_price: float,
                            is_buy: bool) -> float:
         """Ensure every trade has a stop-loss. Auto-set if missing."""
         if sl_price is not None:
             return sl_price
-        # Auto-set SL at mandatory_sl_pct from entry
         sl_distance = entry_price * (self.mandatory_sl_pct / 100.0)
         if is_buy:
             return round(entry_price - sl_distance, 2)
         else:
             return round(entry_price + sl_distance, 2)
+
+    def enforce_take_profit(self, tp_price: float | None, entry_price: float,
+                             is_buy: bool) -> float:
+        """Ensure TP covers round-trip fees plus a minimum net profit (3× fees)."""
+        # round-trip fee = 2 × taker_fee; require at least 3× to clear fees with profit
+        min_profit_pct = self.TAKER_FEE_PCT * 2 * 3  # = 0.27 %
+        min_distance = entry_price * (min_profit_pct / 100.0)
+        if is_buy:
+            min_tp = round(entry_price + min_distance, 6)
+            if tp_price is None or tp_price < min_tp:
+                logging.info("RISK: TP adjusted to %.6f to cover fees (min %.4f%% from entry)",
+                             min_tp, min_profit_pct)
+                return min_tp
+        else:
+            max_tp = round(entry_price - min_distance, 6)
+            if tp_price is None or tp_price > max_tp:
+                logging.info("RISK: TP adjusted to %.6f to cover fees (min %.4f%% from entry)",
+                             max_tp, min_profit_pct)
+                return max_tp
+        return tp_price
 
     # ------------------------------------------------------------------
     # Force-close losing positions
@@ -267,9 +289,14 @@ class RiskManager:
         sl_price = trade.get("sl_price")
         enforced_sl = self.enforce_stop_loss(sl_price, entry_price, is_buy)
         if sl_price is None:
-            logging.info("RISK: Auto-setting SL at %.2f (%.1f%% from entry)",
+            logging.info("RISK: Auto-setting SL at %.6f (%.1f%% from entry)",
                         enforced_sl, self.mandatory_sl_pct)
-        trade = {**trade, "sl_price": enforced_sl}
+
+        # 8. Enforce fee-aware take-profit minimum
+        tp_price = trade.get("tp_price")
+        enforced_tp = self.enforce_take_profit(tp_price, entry_price, is_buy)
+
+        trade = {**trade, "sl_price": enforced_sl, "tp_price": enforced_tp}
 
         return True, "", trade
 
@@ -285,4 +312,6 @@ class RiskManager:
             "max_concurrent_positions": self.max_concurrent_positions,
             "min_balance_reserve_pct": self.min_balance_reserve_pct,
             "circuit_breaker_active": self.circuit_breaker_active,
+            "taker_fee_pct": self.TAKER_FEE_PCT,
+            "min_tp_pct_from_entry": round(self.TAKER_FEE_PCT * 2 * 3, 4),
         }

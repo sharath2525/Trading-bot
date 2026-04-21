@@ -127,7 +127,7 @@ def main():
 
             # Global account state
             state = await hyperliquid.get_user_state()
-            total_value = state.get('total_value') or state['balance'] + sum(p.get('pnl', 0) for p in state['positions'])
+            total_value = state.get('total_value') or (state.get('balance', 0) + sum(p.get('pnl', 0) for p in state.get('positions', [])))
             sharpe = calculate_sharpe(trade_log)
 
             account_value = total_value
@@ -136,10 +136,13 @@ def main():
             total_return_pct = ((account_value - initial_account_value) / initial_account_value * 100.0) if initial_account_value else 0.0
 
             positions = []
-            for pos_wrap in state['positions']:
+            for pos_wrap in state.get('positions', []):
                 pos = pos_wrap
                 coin = pos.get('coin')
-                current_px = await hyperliquid.get_current_price(coin) if coin else None
+                try:
+                    current_px = await hyperliquid.get_current_price(coin) if coin else None
+                except Exception:
+                    current_px = None
                 positions.append({
                     "symbol": coin,
                     "quantity": round_or_none(pos.get('szi'), 6),
@@ -152,7 +155,7 @@ def main():
 
             # --- RISK: Force-close positions that exceed max loss ---
             try:
-                positions_to_close = risk_mgr.check_losing_positions(state['positions'])
+                positions_to_close = risk_mgr.check_losing_positions(state.get('positions', []))
                 for ptc in positions_to_close:
                     coin = ptc["coin"]
                     size = ptc["size"]
@@ -204,17 +207,19 @@ def main():
                         "trigger_price": round_or_none(o.get('triggerPx'), 2),
                         "order_type": o.get('orderType')
                     })
-            except Exception:
+            except Exception as e:
+                logging.warning("Failed to fetch open orders: %s", e)
                 open_orders = []
 
             # Reconcile active trades
             try:
                 assets_with_positions = set()
-                for pos in state['positions']:
+                for pos in state.get('positions', []):
                     try:
                         if abs(float(pos.get('szi') or 0)) > 0:
                             assets_with_positions.add(pos.get('coin'))
-                    except Exception:
+                    except Exception as e:
+                        logging.warning("Skipped malformed position in reconcile: %s", e)
                         continue
                 assets_with_orders = {o.get('coin') for o in (open_orders or []) if o.get('coin')}
                 for tr in active_trades[:]:
@@ -302,6 +307,10 @@ def main():
                     candles_5m = await hyperliquid.get_candles(asset, "5m", 100)
                     candles_4h = await hyperliquid.get_candles(asset, "4h", 100)
 
+                    if len(candles_5m) < 30:
+                        add_event(f"Skipping {asset}: only {len(candles_5m)} 5m candles (need 30+)")
+                        continue
+
                     intra = compute_all(candles_5m)
                     lt = compute_all(candles_4h)
 
@@ -317,10 +326,10 @@ def main():
                             "rsi7": round_or_none(latest(intra.get("rsi7", [])), 2),
                             "rsi14": round_or_none(latest(intra.get("rsi14", [])), 2),
                             "series": {
-                                "ema20": round_series(last_n(intra.get("ema20", []), 10), 2),
-                                "macd": round_series(last_n(intra.get("macd", []), 10), 2),
-                                "rsi7": round_series(last_n(intra.get("rsi7", []), 10), 2),
-                                "rsi14": round_series(last_n(intra.get("rsi14", []), 10), 2),
+                                "ema20": round_series(last_n(intra.get("ema20", []), 5), 2),
+                                "macd": round_series(last_n(intra.get("macd", []), 5), 2),
+                                "rsi7": round_series(last_n(intra.get("rsi7", []), 5), 2),
+                                "rsi14": round_series(last_n(intra.get("rsi14", []), 5), 2),
                             }
                         },
                         "long_term": {
@@ -328,8 +337,8 @@ def main():
                             "ema50": round_or_none(latest(lt.get("ema50", [])), 2),
                             "atr3": round_or_none(latest(lt.get("atr3", [])), 2),
                             "atr14": round_or_none(latest(lt.get("atr14", [])), 2),
-                            "macd_series": round_series(last_n(lt.get("macd", []), 10), 2),
-                            "rsi_series": round_series(last_n(lt.get("rsi14", []), 10), 2),
+                            "macd_series": round_series(last_n(lt.get("macd", []), 5), 2),
+                            "rsi_series": round_series(last_n(lt.get("rsi14", []), 5), 2),
                         },
                         "open_interest": round_or_none(oi, 2),
                         "funding_rate": round_or_none(funding, 8),
@@ -430,7 +439,7 @@ def main():
                 "positions": positions,
                 "open_orders": open_orders_struct,
                 "recent_fills": recent_fills_struct,
-                "positions_count": len([p for p in state['positions'] if abs(float(p.get('szi') or 0)) > 0]),
+                "positions_count": len([p for p in state.get('positions', []) if abs(float(p.get('szi') or 0)) > 0]),
             }
             try:
                 with open(decisions_path, "a") as f:
@@ -446,7 +455,9 @@ def main():
                         continue
                     action = output.get("action")
                     current_price = asset_prices.get(asset, 0)
-                    action = output["action"]
+                    if not current_price or current_price <= 0:
+                        add_event(f"Skipping {asset}: invalid/zero price, cannot size order")
+                        continue
                     rationale = output.get("rationale", "")
                     if rationale:
                         add_event(f"Decision rationale for {asset}: {rationale}")
@@ -491,17 +502,20 @@ def main():
                         else:
                             order = await hyperliquid.place_buy_order(asset, amount) if is_buy else await hyperliquid.place_sell_order(asset, amount)
 
-                        # Confirm by checking recent fills for this asset shortly after placing
-                        await asyncio.sleep(1)
-                        fills_check = await hyperliquid.get_recent_fills(limit=10)
+                        # Confirm fill — retry up to 3 times with 1s intervals
                         filled = False
-                        for fc in reversed(fills_check):
+                        for _attempt in range(3):
+                            await asyncio.sleep(1)
                             try:
-                                if (fc.get('coin') == asset or fc.get('asset') == asset):
-                                    filled = True
-                                    break
+                                fills_check = await hyperliquid.get_recent_fills(limit=20)
+                                for fc in reversed(fills_check):
+                                    if fc.get('coin') == asset or fc.get('asset') == asset:
+                                        filled = True
+                                        break
                             except Exception:
-                                continue
+                                pass
+                            if filled:
+                                break
                         trade_log.append({"type": action, "price": current_price, "amount": amount, "exit_plan": output["exit_plan"], "filled": filled})
                         tp_oid = None
                         sl_oid = None
@@ -530,7 +544,7 @@ def main():
                             "tp_oid": tp_oid,
                             "sl_oid": sl_oid,
                             "exit_plan": output["exit_plan"],
-                            "opened_at": datetime.now().isoformat()
+                            "opened_at": datetime.now(timezone.utc).isoformat()
                         })
                         add_event(f"{action.upper()} {asset} amount {amount:.4f} at ~{current_price}")
                         if rationale:
@@ -559,15 +573,6 @@ def main():
                             f.write(json.dumps(diary_entry) + "\n")
                     else:
                         add_event(f"Hold {asset}: {output.get('rationale', '')}")
-                        # Write hold to diary
-                        with open(diary_path, "a") as f:
-                            diary_entry = {
-                                "timestamp": datetime.now().isoformat(),
-                                "asset": asset,
-                                "action": "hold",
-                                "rationale": output.get("rationale", "")
-                            }
-                            f.write(json.dumps(diary_entry) + "\n")
                 except Exception as e:
                     import traceback
                     add_event(f"Execution error {asset}: {e}")

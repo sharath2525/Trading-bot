@@ -187,7 +187,7 @@ def bbands(candles: list[dict], period: int = 20, std_dev: float = 2.0) -> dict:
         else:
             window = closes[i - period + 1: i + 1]
             mean = middle[i]
-            variance = sum((x - mean) ** 2 for x in window) / period
+            variance = sum((x - mean) ** 2 for x in window) / len(window)
             sd = math.sqrt(variance)
             upper.append(round(mean + std_dev * sd, 6))
             lower.append(round(mean - std_dev * sd, 6))
