@@ -363,7 +363,8 @@ class HyperliquidAPI:
         """
         state = await self._retry(lambda: self.info.user_state(self.query_address))
         positions = state.get("assetPositions", [])
-        total_value = float(state.get("accountValue", 0.0))
+        margin = state.get("marginSummary") or state.get("crossMarginSummary") or {}
+        total_value = float(margin.get("accountValue") or state.get("accountValue") or 0.0)
         enriched_positions = []
         for pos_wrap in positions:
             pos = pos_wrap["position"]
