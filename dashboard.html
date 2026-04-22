@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trading Desk</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Georgia', serif; background: #f5f4ef; color: #1a1a1a; }
+.container { max-width: 1200px; margin: 0 auto; padding: 28px 20px; }
+
+.header { text-align: center; border-bottom: 2px solid #1a1a1a; padding-bottom: 14px; margin-bottom: 24px; }
+.header h1 { font-size: 28px; font-weight: 700; letter-spacing: 6px; text-transform: uppercase; }
+.header-sub { display: flex; justify-content: space-between; margin-top: 8px; font-size: 12px; color: #888; font-style: italic; }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #ccc; margin-right: 5px; vertical-align: middle; }
+.dot.on { background: #22c55e; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+.stat-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 1px; background: #ccc; border: 1px solid #ccc; margin-bottom: 1px; }
+.stat { background: #fff; padding: 18px 14px; text-align: center; }
+.stat-lbl { font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: #888; margin-bottom: 8px; }
+.stat-val { font-size: 22px; font-weight: 700; }
+.g { color: #15803d; } .r { color: #dc2626; } .n { color: #888; }
+
+.pnl-row { display: grid; grid-template-columns: repeat(4,1fr); gap: 1px; background: #1a1a1a; border: 1px solid #1a1a1a; margin-bottom: 24px; }
+.pnl-card { background: #1a1a1a; padding: 14px; text-align: center; }
+.pnl-lbl { font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: #555; margin-bottom: 7px; }
+.pnl-usd { font-size: 18px; font-weight: 700; }
+.pnl-pct { font-size: 11px; margin-top: 3px; color: #666; }
+
+.charts-row { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; margin-bottom: 22px; }
+.chart-box { background: #fff; border: 1px solid #ccc; padding: 16px; }
+.chart-lbl { font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: #888; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+.tbns { display: flex; gap: 3px; }
+.tbn { background: none; border: 1px solid #ccc; padding: 2px 9px; font-size: 10px; cursor: pointer; color: #888; font-family: Georgia,serif; }
+.tbn.active { background: #1a1a1a; color: #fff; border-color: #1a1a1a; }
+.chart-wrap { height: 190px; position: relative; }
+
+.tabs { display: flex; border-bottom: 2px solid #1a1a1a; margin-bottom: 16px; }
+.tab { padding: 8px 16px; font-size: 10px; letter-spacing: 2px; text-transform: uppercase; cursor: pointer; color: #888; border-bottom: 2px solid transparent; margin-bottom: -2px; background: none; border-top: none; border-left: none; border-right: none; font-family: Georgia,serif; }
+.tab.active { color: #1a1a1a; border-bottom-color: #1a1a1a; font-weight: 700; }
+
+table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #ccc; font-size: 12px; }
+th { padding: 10px 14px; text-align: left; font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: #999; border-bottom: 1px solid #ccc; background: #fafaf7; font-weight: 400; }
+td { padding: 12px 14px; border-bottom: 1px solid #f0ede6; }
+tr:last-child td { border-bottom: none; }
+.empty td { text-align: center; color: #aaa; font-style: italic; padding: 28px; }
+
+.badge { display: inline-block; padding: 2px 8px; font-size: 10px; letter-spacing: 1px; border: 1px solid; font-weight: 700; text-transform: uppercase; }
+.long,.buy { border-color: #15803d; color: #15803d; }
+.short,.sell { border-color: #dc2626; color: #dc2626; }
+.hold { border-color: #888; color: #888; }
+
+.dcard { background: #fff; border: 1px solid #ccc; padding: 13px 15px; margin-bottom: 8px; }
+.dcard-hdr { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px; }
+.dcard-time { font-size: 10px; color: #888; white-space: nowrap; margin-left: 10px; }
+.reason { color: #555; line-height: 1.6; font-size: 11px; margin-top: 7px; border-top: 1px solid #f0ede6; padding-top: 7px; max-height: 68px; overflow: hidden; }
+.reason.open { max-height: none; }
+.tog { background: none; border: none; color: #999; font-size: 10px; cursor: pointer; text-decoration: underline; margin-top: 3px; display: block; font-family: Georgia,serif; }
+
+.toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+.btn { background: #1a1a1a; color: #fff; border: none; padding: 7px 16px; font-size: 10px; letter-spacing: 1px; text-transform: uppercase; cursor: pointer; font-family: Georgia,serif; }
+.btn:hover { background: #333; }
+.upd { font-size: 11px; color: #888; }
+
+@media(max-width:700px) { .stat-grid,.pnl-row { grid-template-columns: repeat(2,1fr); } .charts-row { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="header">
+  <h1>Trading Desk</h1>
+  <div class="header-sub">
+    <span><span class="dot" id="dot1"></span><span id="s1">Connecting...</span></span>
+    <span id="upd">—</span>
+  </div>
+</div>
+
+<!-- Stats -->
+<div class="stat-grid">
+  <div class="stat"><div class="stat-lbl">Account Value</div><div class="stat-val" id="sVal">—</div></div>
+  <div class="stat"><div class="stat-lbl">Free Balance</div><div class="stat-val" id="sBal">—</div></div>
+  <div class="stat"><div class="stat-lbl">Total Return</div><div class="stat-val" id="sRet">—</div></div>
+  <div class="stat"><div class="stat-lbl">Open Positions</div><div class="stat-val" id="sPos">—</div></div>
+  <div class="stat"><div class="stat-lbl">Unrealized PnL</div><div class="stat-val" id="sUpnl">—</div></div>
+  <div class="stat"><div class="stat-lbl">Bot Cycles</div><div class="stat-val" id="sCyc">—</div></div>
+  <div class="stat"><div class="stat-lbl">Total Trades</div><div class="stat-val" id="sTrd">—</div></div>
+  <div class="stat"><div class="stat-lbl">Active Since</div><div class="stat-val" id="sAct" style="font-size:14px;">—</div></div>
+</div>
+
+<!-- P&L -->
+<div class="pnl-row">
+  <div class="pnl-card"><div class="pnl-lbl">Today P&L</div><div class="pnl-usd" id="p0">—</div><div class="pnl-pct" id="p0p">—</div></div>
+  <div class="pnl-card"><div class="pnl-lbl">7-Day P&L</div><div class="pnl-usd" id="p7">—</div><div class="pnl-pct" id="p7p">—</div></div>
+  <div class="pnl-card"><div class="pnl-lbl">30-Day P&L</div><div class="pnl-usd" id="p30">—</div><div class="pnl-pct" id="p30p">—</div></div>
+  <div class="pnl-card"><div class="pnl-lbl">All-Time P&L</div><div class="pnl-usd" id="pa">—</div><div class="pnl-pct" id="pap">—</div></div>
+</div>
+
+<!-- Charts -->
+<div class="charts-row">
+  <div class="chart-box">
+    <div class="chart-lbl">
+      <span>Account Value History</span>
+      <div class="tbns">
+        <button class="tbn active" onclick="setR('1d',this)">1D</button>
+        <button class="tbn" onclick="setR('1w',this)">1W</button>
+        <button class="tbn" onclick="setR('1m',this)">1M</button>
+        <button class="tbn" onclick="setR('all',this)">All</button>
+      </div>
+    </div>
+    <div class="chart-wrap"><canvas id="cvMain"></canvas></div>
+  </div>
+  <div class="chart-box">
+    <div class="chart-lbl"><span>Daily P&L</span></div>
+    <div class="chart-wrap"><canvas id="cvDaily"></canvas></div>
+  </div>
+</div>
+
+<!-- Tabs -->
+<div class="toolbar">
+  <div class="tabs">
+    <button class="tab active" onclick="show('pos',this)">Positions</button>
+    <button class="tab" onclick="show('fills',this)">Fills</button>
+    <button class="tab" onclick="show('orders',this)">Orders</button>
+    <button class="tab" onclick="show('ai',this)">AI Log</button>
+  </div>
+  <button class="btn" onclick="init()">&#8635; Refresh</button>
+</div>
+
+<div id="tab-pos">
+  <table><thead><tr><th>Asset</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>Liq.</th><th>Unreal. PnL</th><th>Leverage</th></tr></thead>
+  <tbody id="tPos"><tr class="empty"><td colspan="8">Loading...</td></tr></tbody></table>
+</div>
+<div id="tab-fills" style="display:none">
+  <table><thead><tr><th>Time</th><th>Asset</th><th>Side</th><th>Size</th><th>Price</th><th>Value</th></tr></thead>
+  <tbody id="tFill"><tr class="empty"><td colspan="6">Loading...</td></tr></tbody></table>
+</div>
+<div id="tab-orders" style="display:none">
+  <table><thead><tr><th>Asset</th><th>Side</th><th>Size</th><th>Price</th><th>Trigger</th><th>Type</th></tr></thead>
+  <tbody id="tOrd"><tr class="empty"><td colspan="6">Loading...</td></tr></tbody></table>
+</div>
+<div id="tab-ai" style="display:none">
+  <div id="aiCont" style="color:#aaa;font-style:italic;font-size:12px;padding:10px 0;">Loading...</div>
+</div>
+
+</div><!-- /container -->
+<script>
+// Auto-detect: relative when served from server, absolute when opened locally
+const API = window.location.protocol === 'file:' ? 'http://209.38.120.100:3000' : '';
+
+let entries = [];   // diary entries
+let live    = {};   // /live data
+let cRange  = '1d';
+let cMain   = null, cDaily = null;
+
+const f2   = (n,d=2) => { const x=parseFloat(n); return isNaN(x)?null:x.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}); };
+const fu   = (n,d=2) => { const v=f2(n,d); return v!==null?'$'+v:'—'; };
+const fpnl = n => { const x=parseFloat(n); return isNaN(x)?'—':(x>=0?'+':'')+fu(x); };
+const fpct = n => { const x=parseFloat(n); return isNaN(x)?'—':(x>=0?'+':'')+f2(x,2)+'%'; };
+const pc   = n => parseFloat(n)>=0?'g':'r';
+const lev  = l => { if(!l) return '—'; if(typeof l==='number') return l+'x'; if(typeof l==='object') return (l.value||'')+'x'+(l.type?' '+l.type:''); return l; };
+
+// ── Load diary first — shows data immediately ─────────────────────────────────
+async function loadDiary() {
+  try {
+    const r = await fetch(`${API}/diary?limit=5000`);
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    const d = await r.json();
+    entries = Array.isArray(d) ? d : (d.entries||[]);
+
+    document.getElementById('dot1').className = 'dot on';
+    document.getElementById('s1').textContent = 'Bot running';
+    document.getElementById('upd').textContent = 'Updated: '+new Date().toLocaleTimeString();
+
+    renderStatsFast();   // show last known values immediately
+    renderPnL();
+    renderCharts();
+    renderAI();
+  } catch(e) {
+    document.getElementById('s1').textContent = 'Backend offline';
+  }
+}
+
+// ── Load live data in background (slower, makes HL API call) ─────────────────
+async function loadLive() {
+  try {
+    const r = await fetch(`${API}/live`);
+    if (!r.ok) return;
+    live = await r.json();
+    if (live.error) return;
+    renderStatsLive();   // update with fresh values
+    renderPositions();
+    renderOrders();
+    renderFills();
+  } catch(e) { /* silently fail — diary data already shown */ }
+}
+
+// Show last-known values from diary immediately
+function renderStatsFast() {
+  // find latest diary entry with a valid account value
+  let latest = null;
+  for (let i=entries.length-1;i>=0;i--) {
+    if (parseFloat(entries[i].account_value)>0) { latest=entries[i]; break; }
+  }
+  if (!latest) return;
+
+  const av  = parseFloat(latest.account_value);
+  const bal = parseFloat(latest.balance||0);
+  const pos = Array.isArray(latest.positions)?latest.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
+
+  document.getElementById('sVal').textContent = fu(av);
+  document.getElementById('sBal').textContent = bal>0?fu(bal):'—';
+  document.getElementById('sPos').textContent = latest.positions_count||pos.length||'0';
+
+  let upnl=0; pos.forEach(p=>{const v=parseFloat(p.unrealized_pnl||0);if(!isNaN(v))upnl+=v;});
+  const uel=document.getElementById('sUpnl'); uel.textContent=upnl?fpnl(upnl):'$0.00'; uel.className='stat-val '+(upnl>=0?'g':'r');
+
+  const first=entries.find(e=>parseFloat(e.account_value)>0);
+  if(first){ const ret=((av-parseFloat(first.account_value))/parseFloat(first.account_value))*100; const re=document.getElementById('sRet'); re.textContent=fpct(ret); re.className='stat-val '+pc(ret); }
+
+  let b=0,s=0; entries.forEach(e=>(e.decisions||[]).forEach(d=>{const a=(d.action||'').toLowerCase();if(a==='buy')b++;else if(a==='sell')s++;}));
+  document.getElementById('sCyc').textContent=entries.length;
+  document.getElementById('sTrd').textContent=b+s;
+  if(entries.length) document.getElementById('sAct').textContent=new Date(entries[0].timestamp).toLocaleDateString([],{month:'short',day:'numeric',year:'numeric'});
+}
+
+// Update with fresh live values
+function renderStatsLive() {
+  const av  = parseFloat(live.account_value||0);
+  const bal = parseFloat(live.balance||0);
+  const pos = Array.isArray(live.positions)?live.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
+
+  if(av>0) document.getElementById('sVal').textContent=fu(av);
+  if(bal>=0) document.getElementById('sBal').textContent=fu(bal);
+  document.getElementById('sPos').textContent=pos.length;
+
+  let upnl=0; pos.forEach(p=>{const v=parseFloat(p.unrealized_pnl||0);if(!isNaN(v))upnl+=v;});
+  const uel=document.getElementById('sUpnl'); uel.textContent=fpnl(upnl); uel.className='stat-val '+(upnl>=0?'g':'r');
+
+  // update return with live value
+  const first=entries.find(e=>parseFloat(e.account_value)>0);
+  if(first&&av>0){ const ret=((av-parseFloat(first.account_value))/parseFloat(first.account_value))*100; const re=document.getElementById('sRet'); re.textContent=fpct(ret); re.className='stat-val '+pc(ret); }
+}
+
+// ── P&L ───────────────────────────────────────────────────────────────────────
+function renderPnL() {
+  const curAV = parseFloat(live.account_value) || (() => { for(let i=entries.length-1;i>=0;i--){const v=parseFloat(entries[i].account_value);if(v>0)return v;} return 0; })();
+  if(!curAV) return;
+
+  const set = (uid,pid,fromEntry) => {
+    const base = parseFloat(fromEntry?.account_value||0);
+    if(!base) return;
+    const usd=curAV-base, pct=(usd/base)*100;
+    const u=document.getElementById(uid),p=document.getElementById(pid);
+    u.textContent=(usd>=0?'+':'')+fu(usd); u.style.color=usd>=0?'#22c55e':'#ef4444';
+    p.textContent=fpct(pct); p.style.color=pct>=0?'#22c55e':'#ef4444';
+  };
+
+  const n=new Date(), mid=new Date(n.getFullYear(),n.getMonth(),n.getDate()).getTime();
+  const todayFirst=entries.find(e=>new Date(e.timestamp).getTime()>=mid)||entries[0];
+  const ago7 =entries.find(e=>new Date(e.timestamp).getTime()>=Date.now()-7*864e5)||entries[0];
+  const ago30=entries.find(e=>new Date(e.timestamp).getTime()>=Date.now()-30*864e5)||entries[0];
+  const first=entries.find(e=>parseFloat(e.account_value)>0);
+
+  set('p0','p0p',todayFirst);
+  set('p7','p7p',ago7);
+  set('p30','p30p',ago30);
+  set('pa','pap',first);
+}
+
+// ── Charts ────────────────────────────────────────────────────────────────────
+function setR(r,btn) {
+  cRange=r;
+  document.querySelectorAll('.tbn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  renderCharts();
+}
+
+function renderCharts() {
+  const ms={'1d':864e5,'1w':7*864e5,'1m':30*864e5,'all':Infinity}[cRange]||Infinity;
+  const cut=Date.now()-ms;
+
+  // Account value line chart
+  let pts=entries.filter(e=>new Date(e.timestamp).getTime()>=cut&&parseFloat(e.account_value)>0);
+  // Add live value as last point if newer
+  if(live.account_value&&live.timestamp){
+    const liveT=new Date(live.timestamp).getTime();
+    if(!pts.length||liveT>new Date(pts[pts.length-1].timestamp).getTime())
+      pts=[...pts,{timestamp:live.timestamp,account_value:live.account_value}];
+  }
+  if(pts.length>250){const s=Math.ceil(pts.length/250);pts=pts.filter((_,i)=>i%s===0||i===pts.length-1);}
+
+  if(pts.length>=2){
+    const lbs=pts.map(e=>{const d=new Date(e.timestamp);return cRange==='1d'?d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):d.toLocaleDateString([],{month:'short',day:'numeric'});});
+    const vs=pts.map(e=>parseFloat(e.account_value));
+    const up=vs[vs.length-1]>=vs[0];
+    if(cMain) cMain.destroy();
+    cMain=new Chart(document.getElementById('cvMain').getContext('2d'),{
+      type:'line',
+      data:{labels:lbs,datasets:[{data:vs,borderColor:up?'#15803d':'#dc2626',backgroundColor:up?'rgba(21,128,61,0.07)':'rgba(220,38,38,0.07)',borderWidth:1.5,fill:true,tension:0.3,pointRadius:pts.length>60?0:2,pointHoverRadius:4}]},
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>fu(c.raw)}}},scales:{x:{ticks:{font:{size:9},maxTicksLimit:6,color:'#999'},grid:{display:false}},y:{ticks:{font:{size:9},color:'#999',callback:v=>fu(v,0)},grid:{color:'#f0ede6'}}}}
+    });
+  }
+
+  // Daily P&L bar chart
+  const byDay={};
+  entries.forEach(e=>{
+    if(!parseFloat(e.account_value)) return;
+    const d=new Date(e.timestamp).toLocaleDateString([],{month:'short',day:'numeric'});
+    if(!byDay[d]) byDay[d]=[];
+    byDay[d].push(parseFloat(e.account_value));
+  });
+  const days=Object.keys(byDay).slice(-14);
+  if(days.length>=2){
+    const pnls=days.map((d,i)=>{
+      const cur=byDay[d],prev=i>0?byDay[days[i-1]]:null;
+      if(!cur.length) return 0;
+      const last=cur[cur.length-1];
+      const base=prev?.length?prev[prev.length-1]:cur[0];
+      return parseFloat((last-base).toFixed(2));
+    });
+    if(cDaily) cDaily.destroy();
+    cDaily=new Chart(document.getElementById('cvDaily').getContext('2d'),{
+      type:'bar',
+      data:{labels:days,datasets:[{data:pnls,backgroundColor:pnls.map(v=>v>=0?'rgba(21,128,61,0.7)':'rgba(220,38,38,0.7)'),borderWidth:0}]},
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>(c.raw>=0?'+':'')+fu(c.raw)}}},scales:{x:{ticks:{font:{size:9},color:'#999'},grid:{display:false}},y:{ticks:{font:{size:9},color:'#999',callback:v=>(v>=0?'+':'')+fu(v)},grid:{color:'#f0ede6'}}}}
+    });
+  }
+}
+
+// ── Tables ────────────────────────────────────────────────────────────────────
+function renderPositions() {
+  const rows=Array.isArray(live.positions)?live.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
+  const tb=document.getElementById('tPos');
+  if(!rows.length){tb.innerHTML='<tr class="empty"><td colspan="8">No open positions</td></tr>';return;}
+  tb.innerHTML=rows.map(p=>{
+    const qty=parseFloat(p.quantity||0),side=qty>=0?'LONG':'SHORT',pnl=p.unrealized_pnl;
+    return `<tr><td><strong>${p.symbol||'—'}</strong></td><td><span class="badge ${side.toLowerCase()}">${side}</span></td><td>${f2(Math.abs(qty),4)||'—'}</td><td>${fu(p.entry_price)}</td><td>${fu(p.current_price)}</td><td>${fu(p.liquidation_price)}</td><td class="${pc(pnl)}">${fpnl(pnl)}</td><td>${lev(p.leverage)}</td></tr>`;
+  }).join('');
+}
+
+function renderOrders() {
+  const rows=Array.isArray(live.open_orders)?live.open_orders:[];
+  const tb=document.getElementById('tOrd');
+  if(!rows.length){tb.innerHTML='<tr class="empty"><td colspan="6">No open orders</td></tr>';return;}
+  tb.innerHTML=rows.map(o=>{
+    const buy=o.is_buy??o.isBuy;
+    return `<tr><td><strong>${o.coin||'—'}</strong></td><td><span class="badge ${buy?'buy':'sell'}">${buy?'BUY':'SELL'}</span></td><td>${f2(o.size||0,4)||'—'}</td><td>${fu(o.price)}</td><td>${fu(o.trigger_price)||'—'}</td><td>${o.order_type||'—'}</td></tr>`;
+  }).join('');
+}
+
+function renderFills() {
+  const rows=Array.isArray(live.recent_fills)?[...live.recent_fills].reverse():[];
+  const tb=document.getElementById('tFill');
+  if(!rows.length){tb.innerHTML='<tr class="empty"><td colspan="6">No fills yet</td></tr>';return;}
+  tb.innerHTML=rows.map(f=>{
+    const buy=f.is_buy??f.isBuy,t=f.timestamp?new Date(f.timestamp).toLocaleString():'—',val=(parseFloat(f.size||0)*parseFloat(f.price||0))||null;
+    return `<tr><td style="font-size:10px;color:#888;">${t}</td><td><strong>${f.coin||'—'}</strong></td><td><span class="badge ${buy?'buy':'sell'}">${buy!=null?(buy?'BUY':'SELL'):'—'}</span></td><td>${f2(f.size||0,4)||'—'}</td><td>${fu(f.price)}</td><td>${val?fu(val):'—'}</td></tr>`;
+  }).join('');
+}
+
+function renderAI() {
+  const cont=document.getElementById('aiCont');
+  if(!entries.length){cont.innerHTML='<div style="color:#aaa;font-style:italic;">No decisions yet.</div>';return;}
+  cont.innerHTML='';
+  [...entries].reverse().slice(0,60).forEach((e,i)=>{
+    const decs=e.decisions||[],r=e.reasoning||'',t=e.timestamp?new Date(e.timestamp).toLocaleString():'—';
+    const badges=decs.map(d=>{const a=(d.action||'hold').toLowerCase();return `<span class="badge ${a}" style="margin-right:4px;">${d.asset||'?'}: ${a.toUpperCase()}${d.allocation_usd>0?' $'+d.allocation_usd:''}</span>`;}).join('');
+    const safe=r.replace(/</g,'&lt;').replace(/>/g,'&gt;'),preview=safe.slice(0,280),more=safe.length>280;
+    const div=document.createElement('div'); div.className='dcard';
+    div.innerHTML=`<div class="dcard-hdr"><div>${badges||'<span style="color:#aaa;font-size:11px;">No decisions</span>'}</div><div class="dcard-time">${e.cycle?'Cycle #'+e.cycle+' · ':''}${t}</div></div>${r?`<div class="reason" id="rr${i}">${preview}${more?'...':''}</div>${more?`<button class="tog" onclick="togR(${i},this,${JSON.stringify(safe)})">Show more</button>`:''}`:``}`;
+    cont.appendChild(div);
+  });
+}
+
+function togR(i,btn,full){const el=document.getElementById('rr'+i);if(el.classList.contains('open')){el.innerHTML=full.slice(0,280)+'...';el.classList.remove('open');btn.textContent='Show more';}else{el.innerHTML=full;el.classList.add('open');btn.textContent='Show less';}}
+
+function show(name,btn){
+  ['pos','fills','orders','ai'].forEach(t=>{document.getElementById('tab-'+t).style.display=t===name?'block':'none';});
+  document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+}
+
+async function init() {
+  await loadDiary();        // fast — shows data immediately
+  loadLive();               // async — updates in background, no wait
+}
+
+setInterval(loadDiary, 60000);
+setInterval(loadLive,  30000);
+init();
+</script>
+</body>
+</html>
