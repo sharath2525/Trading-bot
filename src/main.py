@@ -633,9 +633,75 @@ def main():
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
+    async def handle_live(request):
+        """Return real-time account state fetched directly from Hyperliquid."""
+        try:
+            state = await hyperliquid.get_user_state()
+            positions = []
+            for pos in state.get('positions', []):
+                coin = pos.get('coin')
+                try:
+                    current_px = await hyperliquid.get_current_price(coin) if coin else None
+                except Exception:
+                    current_px = None
+                positions.append({
+                    "symbol": coin,
+                    "quantity": round_or_none(pos.get('szi'), 6),
+                    "entry_price": round_or_none(pos.get('entryPx'), 2),
+                    "current_price": round_or_none(current_px, 2),
+                    "liquidation_price": round_or_none(pos.get('liquidationPx') or pos.get('liqPx'), 2),
+                    "unrealized_pnl": round_or_none(pos.get('pnl'), 4),
+                    "leverage": pos.get('leverage')
+                })
+            open_orders = []
+            try:
+                for o in await hyperliquid.get_open_orders():
+                    open_orders.append({
+                        "coin": o.get('coin'),
+                        "is_buy": o.get('isBuy'),
+                        "size": round_or_none(o.get('sz'), 6),
+                        "price": round_or_none(o.get('px'), 2),
+                        "trigger_price": round_or_none(o.get('triggerPx'), 2),
+                        "order_type": o.get('orderType')
+                    })
+            except Exception:
+                pass
+            recent_fills = []
+            try:
+                for f in await hyperliquid.get_recent_fills(limit=50):
+                    t_raw = f.get('time') or f.get('timestamp')
+                    ts = None
+                    if t_raw:
+                        try:
+                            t_int = int(t_raw)
+                            ts = datetime.fromtimestamp(t_int / 1000 if t_int > 1e12 else t_int, tz=timezone.utc).isoformat()
+                        except Exception:
+                            ts = str(t_raw)
+                    recent_fills.append({
+                        "timestamp": ts,
+                        "coin": f.get('coin') or f.get('asset'),
+                        "is_buy": f.get('isBuy'),
+                        "size": round_or_none(f.get('sz') or f.get('size'), 6),
+                        "price": round_or_none(f.get('px') or f.get('price'), 2)
+                    })
+            except Exception:
+                pass
+            return web.json_response({
+                "account_value": round_or_none(state.get('total_value'), 2),
+                "balance": round_or_none(state.get('balance'), 2),
+                "positions": positions,
+                "open_orders": open_orders,
+                "recent_fills": recent_fills,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+        except Exception as e:
+            logging.error("handle_live error: %s", e)
+            return web.json_response({"error": str(e)}, status=500)
+
     async def start_api(app):
         """Register HTTP endpoints for observing diary entries and logs."""
         app.router.add_get('/diary', handle_diary)
+        app.router.add_get('/live', handle_live)
         app.router.add_get('/logs', handle_logs)
         app.router.add_route('OPTIONS', '/{path_info:.*}', lambda r: web.Response())
 
