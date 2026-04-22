@@ -698,10 +698,33 @@ def main():
             logging.error("handle_live error: %s", e)
             return web.json_response({"error": str(e)}, status=500)
 
+    async def handle_fills(request):
+        """Return full fill history from Hyperliquid (includes closedPnl, fee, side)."""
+        try:
+            fills = []
+            if hasattr(hyperliquid.info, 'user_fills'):
+                fills = await asyncio.to_thread(hyperliquid.info.user_fills, hyperliquid.query_address)
+            elif hasattr(hyperliquid.info, 'fills'):
+                fills = await asyncio.to_thread(hyperliquid.info.fills, hyperliquid.query_address)
+            return web.json_response(fills if isinstance(fills, list) else [])
+        except Exception as e:
+            logging.error("handle_fills error: %s", e)
+            return web.json_response([], status=200)
+
+    async def handle_index(request):
+        """Serve the trading dashboard HTML."""
+        try:
+            with open('dashboard.html', 'r', encoding='utf-8') as f:
+                return web.Response(text=f.read(), content_type='text/html')
+        except FileNotFoundError:
+            return web.Response(text='<h1>dashboard.html not found in working directory</h1>', content_type='text/html', status=404)
+
     async def start_api(app):
         """Register HTTP endpoints for observing diary entries and logs."""
+        app.router.add_get('/', handle_index)
         app.router.add_get('/diary', handle_diary)
         app.router.add_get('/live', handle_live)
+        app.router.add_get('/fills', handle_fills)
         app.router.add_get('/logs', handle_logs)
         app.router.add_route('OPTIONS', '/{path_info:.*}', lambda r: web.Response())
 
