@@ -13,22 +13,85 @@ from datetime import datetime
 
 
 class TradingAgent:
-    """High-level trading agent that delegates reasoning to Claude."""
+    """High-level trading agent that delegates reasoning to Claude.
+
+    ════════════════════════════════════════════════════════════════════════════════
+    TRADING STRATEGY OVERVIEW
+    ════════════════════════════════════════════════════════════════════════════════
+
+    This agent implements a QUANTITATIVE, MULTI-ASSET PERPETUAL FUTURES TRADING STRATEGY
+    optimized for Hyperliquid. The strategy uses Claude as the decision engine combined
+    with local technical analysis to identify high-probability setups.
+
+    CORE APPROACH:
+    ─────────────────────────────────────────────────────────────────────────────────
+    1. DUAL-TIMEFRAME ANALYSIS
+       • 1h (intraday): Entry signals and trend confirmation
+       • 4h (swing): Establishes directional bias and structural trend
+       • Higher timeframe structures take precedence (avoids counter-trend trades)
+
+    2. TECHNICAL INDICATOR FOUNDATION
+       Indicators computed locally from Hyperliquid OHLCV candles:
+       • TREND: EMA(20) vs EMA(50) crossover — pre-computed as trend_4h / trend_1h labels
+       • MOMENTUM: MACD histogram (not just MACD line), RSI(14)
+       • VOLATILITY: ATR(14) for TP/SL sizing (SL = 1×ATR, TP = 3×ATR)
+
+    3. DECISION LOGIC (Claude-driven)
+       Claude analyzes multi-dimensional context:
+       ✓ Structural alignment (trend, EMA crosses, HH/HL vs LH/LL)
+       ✓ Momentum confirmation (MACD histogram, RSI slope, Stochastic RSI)
+       ✓ Liquidity & volatility (ATR, volume profile, funding rates)
+       ✓ Position management (existing trades, exit plans, cooldowns)
+       ✓ Risk-reward validation (expected move > 3× round-trip fees)
+
+       Claude chooses ONE action per asset: BUY | SELL | HOLD
+       Each decision includes: allocation, order type, TP/SL targets, exit conditions
+
+    4. POSITION MANAGEMENT (Hysteresis + Cooldowns)
+       • HYSTERESIS: Stronger evidence required to CHANGE direction than to KEEP it
+         - Requires BOTH higher-timeframe support AND intraday confirmation
+         - Avoids whipsaws and reduces slippage/fees
+       • COOLDOWN: After any position action, enforce 3+ bars (e.g., 3×1h = 3h)
+         before another direction change (unless hard invalidation occurs)
+       • EXIT PLANS: Every trade includes explicit invalidation triggers
+         (e.g., "close if 4h close above EMA50" or "flip if 1h EMA cross reverses")
+
+    5. FUNDING RATE TILT (Not a trigger, context only)
+       • Positive funding (shorts paying longs): Favors longs but isn't a trade signal
+       • Negative funding (longs paying shorts): Favors shorts but watch position duration
+       • Only triggers action if expected funding accrual > expected edge over horizon
+
+    6. FEE-AWARE TRADING
+       • Hyperliquid taker fee: 0.045% per side → ~0.09% round-trip
+       • NEVER enter if expected move < 3× fee (~0.27%)
+       • Prefer limit orders (0% maker fee) → saves 0.045% per entry
+       • Factor fee costs into TP targets (min TP ~0.3% from entry)
+
+    ════════════════════════════════════════════════════════════════════════════════
+    RISK MANAGEMENT (Hard guardrails — non-bypassable)
+    ════════════════════════════════════════════════════════════════════════════════
+    1. MAX_POSITION_PCT: Individual position size capped as % of account
+    2. MAX_LEVERAGE: Effective leverage (notional / equity) cannot exceed limit
+    3. MAX_TOTAL_EXPOSURE_PCT: Sum of all open positions cannot exceed % of account
+    4. DAILY_LOSS_CIRCUIT_BREAKER: No new trades once daily drawdown exceeds threshold
+    5. CONCURRENT_POSITION_LIMIT: Max number of simultaneous open trades
+    6. MIN_BALANCE_RESERVE: Minimum cash buffer to avoid liquidation
+    7. MANDATORY_STOP_LOSS: Auto-enforced if Claude omits it (risk control)
+    8. FORCE_CLOSE_AT_LOSS: Auto-close any position at/beyond MAX_LOSS_PER_POSITION_PCT
+
+    All risk checks run BEFORE execution. Claude's recommendations are capped or
+    blocked if they violate any guardrail.
+    ════════════════════════════════════════════════════════════════════════════════
+    """
 
     def __init__(self, hyperliquid=None):
-        # ── MODEL SELECTION ──────────────────────────────────────────────────
-        # Use LLM_MODEL from .env if set, otherwise default to Haiku 4.5
-        # Haiku is ~80% cheaper than Sonnet and sufficient for trading signals.
-        # To switch models, set LLM_MODEL in your .env file:
-        #   LLM_MODEL=claude-haiku-4-5-20251001        ← cheapest (~$1/$5 per MTok)
-        #   LLM_MODEL=claude-sonnet-4-6                ← balanced (~$3/$15 per MTok)
-        #   LLM_MODEL=claude-opus-4-6                  ← most capable (~$5/$25 per MTok)
+        # Override via LLM_MODEL in .env: haiku (cheapest) / sonnet / opus
         self.model = CONFIG.get("llm_model") or "claude-haiku-4-5-20251001"
         self.client = anthropic.Anthropic(api_key=CONFIG["anthropic_api_key"])
         self.hyperliquid = hyperliquid
         # Sanitize model: cheap Haiku used only to fix malformed JSON output
         self.sanitize_model = CONFIG.get("sanitize_model") or "claude-haiku-4-5-20251001"
-        self.max_tokens = int(CONFIG.get("max_tokens") or 2048)
+        self.max_tokens = int(CONFIG.get("max_tokens") or 1200)
 
         logging.info("TradingAgent initialized — main model: %s | sanitize model: %s",
                      self.model, self.sanitize_model)
@@ -38,12 +101,60 @@ class TradingAgent:
         return self._decide(context, assets=assets)
 
     def _decide(self, context, assets):
-        """Dispatch decision request to Claude and enforce output contract."""
+        """Dispatch decision request to Claude and enforce output contract.
+
+        ════════════════════════════════════════════════════════════════════════════════
+        CLAUDE'S DECISION FRAMEWORK
+        ════════════════════════════════════════════════════════════════════════════════
+
+        Claude is instructed to act as a QUANTITATIVE TRADER with the following mindset:
+        1. Respect existing exit plans (don't close early unless invalidation occurred)
+        2. Use hysteresis: require stronger evidence to change direction than to hold
+        3. Impose self-cooldowns: 3+ bars before another direction change
+        4. Treat funding as context, not a trigger (unless huge outlier)
+        5. Don't rely on RSI extremes alone; pair with structure + momentum
+        6. Prefer adjustments (tighter SL, trail TP) over exits when thesis weakens
+        7. Close winners at high-quality opportunities; respect risk/reward
+
+        DECISION INPUTS (passed in context JSON):
+        ─────────────────────────────────────────────────────────────────────────────
+        • Current timestamp (for validating cooldowns, exit triggers)
+        • Account state: balance, free collateral, margin ratio
+        • Open positions: asset, direction, entry price, quantity, TP/SL orders
+        • Market data per asset:
+          ├─ 1h candles (last 50): intraday_1h indicators with 3-bar series
+          ├─ 4h candles (last 30): long_term_4h indicators with 3-bar series
+          ├─ Pre-computed labels: trend_4h, trend_1h, momentum_4h
+          ├─ Funding rate: current rate
+          ├─ Open interest: Long/short ratio for positioning tilt
+          └─ Mid price: Current spot price for context
+
+        DECISION OUTPUTS (structured JSON):
+        ─────────────────────────────────────────────────────────────────────────────
+        Per asset, Claude decides:
+        • action: "buy" | "sell" | "hold"
+        • allocation_usd: Position size in USD (0 if hold)
+        • order_type: "market" (immediate) | "limit" (resting order with better entry)
+        • limit_price: Required if order_type="limit", ignored otherwise
+        • tp_price: Take-profit target (null if holding or exit plan handles it)
+        • sl_price: Stop-loss target (mandatory; system auto-applies if omitted)
+        • exit_plan: Text description of closure conditions + any cooldown guidance
+        • rationale: Explanation of the decision (structure, indicators, risk-reward)
+
+        DECISION VALIDATION LOOP:
+        ─────────────────────────────────────────────────────────────────────────────
+        1. Claude is given up to 6 iterations to finalize a decision
+        2. If Claude calls fetch_indicator tool, gather fresh data and loop
+        3. On first successful JSON parse, extract trade decisions
+        4. Fallback: if JSON is malformed, use a cheap Haiku model to normalize it
+        5. Final output must be valid JSON with reasoning + trade_decisions array
+        ════════════════════════════════════════════════════════════════════════════════
+        """
         system_prompt = (
             "You are a rigorous QUANTITATIVE TRADER and interdisciplinary MATHEMATICIAN-ENGINEER optimizing risk-adjusted returns for perpetual futures under real execution, margin, and funding constraints.\n"
             "You will receive market + account context for SEVERAL assets, including:\n"
             f"- assets = {json.dumps(list(assets))}\n"
-            "- per-asset intraday (5m) and higher-timeframe (4h) metrics\n"
+            "- per-asset 1h and higher-timeframe (4h) metrics\n"
             "- Active Trades with Exit Plans\n"
             "- Recent Trading History\n"
             "- Risk management limits (hard-enforced by the system, not just guidelines)\n\n"
@@ -56,8 +167,8 @@ class TradingAgent:
             "   a) Higher-timeframe structure supports the new direction (e.g., 4h EMA20 vs EMA50 and/or MACD regime), AND\n"
             "   b) Intraday structure confirms with a decisive break beyond ~0.5×ATR (recent) and momentum alignment (MACD or RSI slope).\n"
             "   Otherwise, prefer HOLD or adjust TP/SL.\n"
-            "3) Cooldown: After opening, adding, reducing, or flipping, impose a self-cooldown of at least 3 bars of the decision timeframe (e.g., 3×5m = 15m) before another direction change, unless a hard invalidation occurs. Encode this in exit_plan (e.g., \"cooldown_bars:3 until 2025-10-19T15:55Z\"). You must honor your own cooldowns on future cycles.\n"
-            "4) Funding is a tilt, not a trigger: Do NOT open/close/flip solely due to funding unless expected funding over your intended holding horizon meaningfully exceeds expected edge (e.g., > ~0.25×ATR). Consider that funding accrues discretely and slowly relative to 5m bars.\n"
+            "3) Cooldown: After opening, adding, reducing, or flipping, impose a self-cooldown of at least 3 bars of the decision timeframe (e.g., 3×1h = 3h) before another direction change, unless a hard invalidation occurs. Encode this in exit_plan (e.g., \"cooldown_bars:3 until 2025-10-19T15:00Z\"). You must honor your own cooldowns on future cycles.\n"
+            "4) Funding is a tilt, not a trigger: Do NOT open/close/flip solely due to funding unless expected funding over your intended holding horizon meaningfully exceeds expected edge (e.g., > ~0.25×ATR). Consider that funding accrues discretely and slowly relative to 1h bars.\n"
             "5) Overbought/oversold ≠ reversal by itself: Treat RSI extremes as risk-of-pullback. You need structure + momentum confirmation to bet against trend. Prefer tightening stops or taking partial profits over instant flips.\n"
             "6) Prefer adjustments over exits: If the thesis weakens but is not invalidated, first consider: tighten stop (e.g., to a recent swing or ATR multiple), trail TP, or reduce size. Flip only on hard invalidation + fresh confluence.\n\n"
             "Decision discipline (per asset)\n"
@@ -85,21 +196,37 @@ class TradingAgent:
             "- Prefer limit orders (order_type: \"limit\") when practical — they pay 0% maker fee, saving the full taker cost.\n"
             "- Factor funding costs into your holding horizon: if funding is strongly negative for your direction, either reduce size or target a larger TP to compensate.\n\n"
             "Tool usage\n"
-            "- Use the fetch_indicator tool whenever an additional datapoint could sharpen your thesis; parameters: indicator (ema/sma/rsi/macd/bbands/atr/adx/obv/vwap/stoch_rsi/all), asset (e.g. \"BTC\", \"OIL\", \"GOLD\"), interval (\"5m\"/\"4h\"), optional period.\n"
+            "- Use the fetch_indicator tool whenever an additional datapoint could sharpen your thesis; parameters: indicator (ema/sma/rsi/macd/bbands/atr/adx/obv/vwap/stoch_rsi/all), asset (e.g. \"BTC\", \"OIL\", \"GOLD\"), interval (\"1h\"/\"4h\"), optional period.\n"
             "- Indicators are computed locally from Hyperliquid candle data — works for ALL perp markets (crypto, commodities, indices).\n"
             "- Incorporate tool findings into your reasoning, but NEVER paste raw tool responses into the final JSON — summarize the insight instead.\n"
             "- Use tools to upgrade your analysis; lack of confidence is a cue to query them before deciding.\n\n"
+            "Indicator interpretation — CANONICAL RULES (apply exactly, never invert):\n"
+            "- EMA structure (use the pre-computed trend_4h / trend_1h fields in context):\n"
+            "  • EMA20 > EMA50 = BULLISH structural bias → favor BUY\n"
+            "  • EMA20 < EMA50 = BEARISH structural bias → favor SELL\n"
+            "  • EMA20 > EMA50 > EMA200 = strong BULLISH; EMA20 < EMA50 < EMA200 = strong BEARISH\n"
+            "  • trend_4h='BULLISH' in context means 4h EMA20 is ABOVE 4h EMA50 — this is an uptrend, lean BUY\n"
+            "  • trend_4h='BEARISH' in context means 4h EMA20 is BELOW 4h EMA50 — this is a downtrend, lean SELL\n"
+            "- RSI: RSI14 > 50 = bullish momentum → lean toward BUY; RSI14 < 50 = bearish momentum → lean toward SELL\n"
+            "- MACD histogram (macd_histogram field = MACD line minus signal line):\n"
+            "  • histogram > 0 = MACD line ABOVE signal = bullish acceleration → favor BUY\n"
+            "  • histogram < 0 = MACD line BELOW signal = bearish deceleration → favor SELL\n"
+            "  • momentum_4h='BULLISH' in context means histogram > 0 — confirms upward momentum\n"
+            "- Price vs EMA20: price > EMA20 = short-term bullish; price < EMA20 = short-term bearish\n"
+            "- Primary decision rule: BULLISH trend + BULLISH momentum → BUY; BEARISH trend + BEARISH momentum → SELL\n"
+            "- Counter-trend trades (e.g., SELL when trend_4h=BULLISH) require exceptionally strong contrary signals\n"
+            "  with explicit justification and tighter stops. Default to trend direction.\n\n"
             "Reasoning recipe (first principles)\n"
-            "- Structure (trend, EMAs slope/cross, HH/HL vs LH/LL), Momentum (MACD regime, RSI slope), Liquidity/volatility (ATR, volume), Positioning tilt (funding, OI).\n"
-            "- Favor alignment across 4h and 5m. Counter-trend scalps require stronger intraday confirmation and tighter risk.\n\n"
+            "- Structure (trend_4h/trend_1h labels, EMAs slope/cross, HH/HL vs LH/LL), Momentum (MACD histogram regime, RSI slope), Liquidity/volatility (ATR, volume), Positioning tilt (funding, OI).\n"
+            "- Favor alignment across 4h and 1h. Counter-trend trades require stronger 1h confirmation and tighter risk.\n\n"
             "Output contract\n"
-            "- Output ONLY a strict JSON object (no markdown, no code fences) with exactly two properties:\n"
-            "  • \"reasoning\": long-form string capturing detailed, step-by-step analysis.\n"
+            "- Output raw JSON only — no ```json fences, no markdown .\n"
+            "- Output ONLY a strict JSON object with exactly two properties:\n"
+            "  • \"reasoning\": max 2 sentences. Be concise.\n"
             "  • \"trade_decisions\": array ordered to match the provided assets list.\n"
             "- Each item inside trade_decisions must contain the keys: asset, action, allocation_usd, order_type, limit_price, tp_price, sl_price, exit_plan, rationale.\n"
             "  • order_type: \"market\" (default) or \"limit\"\n"
             "  • limit_price: required if order_type is \"limit\", null otherwise\n"
-            "- Do not emit Markdown or any extra properties.\n"
         )
 
         tools = [{
@@ -156,7 +283,9 @@ class TradingAgent:
             kwargs = {
                 "model": self.model,
                 "max_tokens": self.max_tokens,
-                "system": system_prompt,
+                # cache_control marks the system prompt for Anthropic prompt caching.
+                # Cached tokens cost ~10% of normal price; effective from the 2nd call onward.
+                "system": [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
                 "messages": msgs,
             }
             if use_tools and enable_tools:
@@ -171,11 +300,18 @@ class TradingAgent:
                 kwargs["max_tokens"] = max(self.max_tokens, 16000)
 
             response = self.client.messages.create(**kwargs)
-            logging.info("Claude response: stop_reason=%s, usage=%s",
-                        response.stop_reason, response.usage)
+            input_tokens = response.usage.input_tokens
+            output_tokens = response.usage.output_tokens
+            cache_read = getattr(response.usage, "cache_read_input_tokens", 0)
+            cost_usd = (input_tokens * 0.0000008) + (output_tokens * 0.000004)
+            logging.info(
+                "[API] input=%d output=%d cache_read=%d cost=$%.5f",
+                input_tokens, output_tokens, cache_read, cost_usd
+            )
             with open("llm_requests.log", "a", encoding="utf-8") as f:
                 f.write(f"Response stop_reason: {response.stop_reason}\n")
-                f.write(f"Usage: input={response.usage.input_tokens}, output={response.usage.output_tokens}\n")
+                f.write(f"Usage: input={input_tokens}, output={output_tokens}, cache_read={cache_read}\n")
+                f.write(f"Cost: ${cost_usd:.5f}\n")
             return response
 
         def _handle_tool_call(tool_name, tool_input):
@@ -263,7 +399,7 @@ class TradingAgent:
             try:
                 response = self.client.messages.create(
                     model=self.sanitize_model,
-                    max_tokens=2048,
+                    max_tokens=700,
                     system=(
                         "You are a strict JSON normalizer. Return ONLY a JSON object with two keys: "
                         "\"reasoning\" (string) and \"trade_decisions\" (array). "
@@ -272,7 +408,7 @@ class TradingAgent:
                         "limit_price (number or null), tp_price (number or null), sl_price (number or null), "
                         "exit_plan (string), rationale (string). "
                         f"Valid assets: {json.dumps(list(assets_list))}. "
-                        "If input is wrapped in markdown or has prose, extract just the JSON. Do not add fields."
+                        "If input is wrapped in markdown or has prose, extract just the JSON. Do not add fields. Output raw JSON only. No ```json fences, no markdown of any kind."
                     ),
                     messages=[{"role": "user", "content": raw_content}],
                 )

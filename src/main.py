@@ -293,6 +293,7 @@ def main():
             # Gather data for ALL assets first (using Hyperliquid candles + local indicators)
             market_sections = []
             asset_prices = {}
+            asset_trends = {}  # Stores computed 4h trend label per asset for sanity checks
             for asset in args.assets:
                 try:
                     current_price = await hyperliquid.get_current_price(asset)
@@ -303,16 +304,49 @@ def main():
                     oi = await hyperliquid.get_open_interest(asset)
                     funding = await hyperliquid.get_funding_rate(asset)
 
-                    # Fetch candles from Hyperliquid and compute indicators locally
-                    candles_5m = await hyperliquid.get_candles(asset, "5m", 100)
-                    candles_4h = await hyperliquid.get_candles(asset, "4h", 100)
+                    # Fetch candles — 1h for intraday signals (matches 1h decision interval), 4h for structure
+                    candles_1h = await hyperliquid.get_candles(asset, "1h", 60)
+                    candles_4h = await hyperliquid.get_candles(asset, "4h", 60)
 
-                    if len(candles_5m) < 30:
-                        add_event(f"Skipping {asset}: only {len(candles_5m)} 5m candles (need 30+)")
+                    if len(candles_1h) < 26:
+                        add_event(f"Skipping {asset}: only {len(candles_1h)} 1h candles (need 26+)")
                         continue
 
-                    intra = compute_all(candles_5m)
+                    intra = compute_all(candles_1h)
                     lt = compute_all(candles_4h)
+
+                    ema20_1h = latest(intra.get("ema20", []))
+                    ema50_1h = latest(intra.get("ema50", []))
+                    ema20_4h = latest(lt.get("ema20", []))
+                    ema50_4h = latest(lt.get("ema50", []))
+                    macd_hist_1h = latest(intra.get("macd_histogram", []))
+                    macd_hist_4h = latest(lt.get("macd_histogram", []))
+                    macd_sig_1h = latest(intra.get("macd_signal", []))
+                    macd_sig_4h = latest(lt.get("macd_signal", []))
+                    rsi14_1h = latest(intra.get("rsi14", []))
+                    rsi14_4h = latest(lt.get("rsi14", []))
+
+                    # ── Compute trend labels (EMA20 > EMA50 = BULLISH) ───────
+                    # EMA20 > EMA50 means the faster average is above the slower → uptrend (BULLISH)
+                    # EMA20 < EMA50 means faster is below slower → downtrend (BEARISH)
+                    if ema20_4h is not None and ema50_4h is not None:
+                        trend_4h = "BULLISH" if ema20_4h > ema50_4h else "BEARISH"
+                    else:
+                        trend_4h = "UNKNOWN"
+
+                    if ema20_1h is not None and ema50_1h is not None:
+                        trend_1h = "BULLISH" if ema20_1h > ema50_1h else "BEARISH"
+                    else:
+                        trend_1h = "UNKNOWN"
+
+                    # MACD histogram > 0 = MACD line above signal = bullish momentum
+                    momentum_4h = (
+                        "BULLISH" if macd_hist_4h is not None and macd_hist_4h > 0
+                        else "BEARISH" if macd_hist_4h is not None and macd_hist_4h < 0
+                        else "NEUTRAL"
+                    )
+
+                    asset_trends[asset] = trend_4h
 
                     recent_mids = [entry["mid"] for entry in list(price_history.get(asset, []))[-10:]]
                     funding_annualized = round(funding * 24 * 365 * 100, 2) if funding else None
@@ -320,25 +354,34 @@ def main():
                     market_sections.append({
                         "asset": asset,
                         "current_price": round_or_none(current_price, 2),
-                        "intraday": {
-                            "ema20": round_or_none(latest(intra.get("ema20", [])), 2),
-                            "macd": round_or_none(latest(intra.get("macd", [])), 2),
-                            "rsi7": round_or_none(latest(intra.get("rsi7", [])), 2),
-                            "rsi14": round_or_none(latest(intra.get("rsi14", [])), 2),
+                        # Pre-computed trend labels — trust these for directional bias
+                        "trend_4h": trend_4h,       # BULLISH=EMA20>EMA50 on 4h → favor BUY; BEARISH→favor SELL
+                        "trend_1h": trend_1h,       # BULLISH=EMA20>EMA50 on 1h → confirms entry direction
+                        "momentum_4h": momentum_4h, # BULLISH=histogram>0; BEARISH=histogram<0
+                        "intraday_1h": {
+                            "ema20": round_or_none(ema20_1h, 2),
+                            "ema50": round_or_none(ema50_1h, 2),
+                            "macd": round_or_none(latest(intra.get("macd", [])), 4),
+                            "macd_histogram": round_or_none(macd_hist_1h, 4),
+                            "macd_signal": round_or_none(macd_sig_1h, 4),
+                            "rsi14": round_or_none(rsi14_1h, 2),
                             "series": {
-                                "ema20": round_series(last_n(intra.get("ema20", []), 5), 2),
-                                "macd": round_series(last_n(intra.get("macd", []), 5), 2),
-                                "rsi7": round_series(last_n(intra.get("rsi7", []), 5), 2),
-                                "rsi14": round_series(last_n(intra.get("rsi14", []), 5), 2),
+                                "ema20": round_series(last_n(intra.get("ema20", []), 3), 2),
+                                "ema50": round_series(last_n(intra.get("ema50", []), 3), 2),
+                                "macd_histogram": round_series(last_n(intra.get("macd_histogram", []), 3), 4),
+                                "rsi14": round_series(last_n(intra.get("rsi14", []), 3), 2),
                             }
                         },
-                        "long_term": {
-                            "ema20": round_or_none(latest(lt.get("ema20", [])), 2),
-                            "ema50": round_or_none(latest(lt.get("ema50", [])), 2),
-                            "atr3": round_or_none(latest(lt.get("atr3", [])), 2),
+                        "long_term_4h": {
+                            "ema20": round_or_none(ema20_4h, 2),
+                            "ema50": round_or_none(ema50_4h, 2),
                             "atr14": round_or_none(latest(lt.get("atr14", [])), 2),
-                            "macd_series": round_series(last_n(lt.get("macd", []), 5), 2),
-                            "rsi_series": round_series(last_n(lt.get("rsi14", []), 5), 2),
+                            "macd": round_or_none(latest(lt.get("macd", [])), 4),
+                            "macd_histogram": round_or_none(macd_hist_4h, 4),
+                            "macd_signal": round_or_none(macd_sig_4h, 4),
+                            "rsi14": round_or_none(rsi14_4h, 2),
+                            "macd_histogram_series": round_series(last_n(lt.get("macd_histogram", []), 3), 4),
+                            "rsi_series": round_series(last_n(lt.get("rsi14", []), 3), 2),
                         },
                         "open_interest": round_or_none(oi, 2),
                         "funding_rate": round_or_none(funding, 8),
@@ -454,14 +497,25 @@ def main():
                     if not asset or asset not in args.assets:
                         continue
                     action = output.get("action")
+                    trend_4h = asset_trends.get(asset, "UNKNOWN")
                     current_price = asset_prices.get(asset, 0)
                     if not current_price or current_price <= 0:
                         add_event(f"Skipping {asset}: invalid/zero price, cannot size order")
                         continue
+                    # Mandatory sanity log — confirms direction vs trend in every cycle
+                    logging.info("[TRADE] %s action=%s | 4h_trend=%s | entry=%s", asset, action, trend_4h, current_price)
+                    print(f"[TRADE] {asset} action={action} | 4h_trend={trend_4h} | entry={current_price}")
                     rationale = output.get("rationale", "")
                     if rationale:
                         add_event(f"Decision rationale for {asset}: {rationale}")
                     if action in ("buy", "sell"):
+                        # Inversion assertion — fires if trend and order direction are opposite.
+                        # BULLISH (EMA20>EMA50) must produce buy; BEARISH must produce sell.
+                        # If this raises, an inversion is still present somewhere in the signal chain.
+                        if trend_4h == "BULLISH" and action == "sell":
+                            raise ValueError(f"INVERSION BUG DETECTED: {asset} trend=BULLISH but action=sell")
+                        if trend_4h == "BEARISH" and action == "buy":
+                            raise ValueError(f"INVERSION BUG DETECTED: {asset} trend=BEARISH but action=buy")
                         is_buy = action == "buy"
                         alloc_usd = float(output.get("allocation_usd", 0.0))
                         if alloc_usd <= 0:
@@ -713,11 +767,11 @@ def main():
 
     async def handle_index(request):
         """Serve the trading dashboard HTML."""
+        dashboard = pathlib.Path(__file__).parent.parent / 'dashboard.html'
         try:
-            with open('dashboard.html', 'r', encoding='utf-8') as f:
-                return web.Response(text=f.read(), content_type='text/html')
+            return web.Response(text=dashboard.read_text(encoding='utf-8'), content_type='text/html')
         except FileNotFoundError:
-            return web.Response(text='<h1>dashboard.html not found in working directory</h1>', content_type='text/html', status=404)
+            return web.Response(text=f'<h1>dashboard.html not found at {dashboard}</h1>', content_type='text/html', status=404)
 
     async def start_api(app):
         """Register HTTP endpoints for observing diary entries and logs."""
@@ -742,12 +796,6 @@ def main():
         logging.info(f"API server started at http://localhost:{port}")
         await run_loop()
 
-    def calculate_total_return(state, trade_log):
-        """Compute percent return relative to an assumed initial balance."""
-        initial = 10000
-        current = state['balance'] + sum(p.get('pnl', 0) for p in state.get('positions', []))
-        return ((current - initial) / initial) * 100 if initial else 0
-
     def calculate_sharpe(returns):
         """Compute a naive Sharpe-like ratio from the trade log."""
         if not returns:
@@ -759,26 +807,6 @@ def main():
         var = sum((v - mean) ** 2 for v in vals) / len(vals)
         std = math.sqrt(var) if var > 0 else 0
         return mean / std if std > 0 else 0
-
-    async def check_exit_condition(trade, hyperliquid_api):
-        """Evaluate whether a given trade's exit plan triggers a close."""
-        plan = (trade.get("exit_plan") or "").lower()
-        if not plan:
-            return False
-        try:
-            candles_4h = await hyperliquid_api.get_candles(trade["asset"], "4h", 60)
-            indicators = compute_all(candles_4h)
-            if "macd" in plan and "below" in plan:
-                macd_val = latest(indicators.get("macd", []))
-                threshold = float(plan.split("below")[-1].strip())
-                return macd_val is not None and macd_val < threshold
-            if "close above ema50" in plan:
-                ema50_val = latest(indicators.get("ema50", []))
-                current = await hyperliquid_api.get_current_price(trade["asset"])
-                return ema50_val is not None and current > ema50_val
-        except Exception:
-            return False
-        return False
 
     asyncio.run(main_async())
 
