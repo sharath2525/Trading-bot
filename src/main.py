@@ -19,6 +19,8 @@ import json
 from aiohttp import web
 from src.utils.formatting import format_number as fmt, format_size as fmt_sz
 from src.utils.prompt_utils import json_default, round_or_none, round_series
+from src.strategy import entry_confirmed
+from src.trade_state import TradeStateMachine
 
 load_dotenv()
 
@@ -87,6 +89,7 @@ def main():
     hyperliquid = HyperliquidAPI()
     agent = TradingAgent(hyperliquid=hyperliquid)
     risk_mgr = RiskManager()
+    state_mgr = TradeStateMachine()
 
 
     start_time = datetime.now(timezone.utc)
@@ -238,6 +241,21 @@ def main():
             except Exception:
                 pass
 
+            # FIX 3: Time-based exit — force-close trades stuck beyond max_trade_hours
+            for _asset_name in list(args.assets):
+                if state_mgr.get_state(_asset_name) == "ENTERED":
+                    _max_hours = int(CONFIG.get("max_trade_hours") or 12)
+                    if state_mgr.is_trade_expired(_asset_name, _max_hours):
+                        add_event(
+                            f"[TIMEOUT] {_asset_name} force-closing "
+                            f"after {_max_hours}h — no progress"
+                        )
+                        try:
+                            await hyperliquid.market_close(_asset_name)
+                            state_mgr.start_cooldown(_asset_name, interval_seconds=3600)
+                        except Exception as _te:
+                            add_event(f"[TIMEOUT] {_asset_name} close error: {_te}")
+
             recent_fills_struct = []
             try:
                 fills = await hyperliquid.get_recent_fills(limit=50)
@@ -304,9 +322,13 @@ def main():
                     oi = await hyperliquid.get_open_interest(asset)
                     funding = await hyperliquid.get_funding_rate(asset)
 
-                    # Fetch candles — 1h for intraday signals (matches 1h decision interval), 4h for structure
-                    candles_1h = await hyperliquid.get_candles(asset, "1h", 60)
-                    candles_4h = await hyperliquid.get_candles(asset, "4h", 60)
+                    # Fetch candles — 1h for intraday signals, 4h for structure, 15m/5m for entry precision
+                    candles_1h  = await hyperliquid.get_candles(asset, "1h",  60)
+                    candles_4h  = await hyperliquid.get_candles(asset, "4h",  60)
+                    candles_15m = await hyperliquid.get_candles(asset, "15m", 30)
+                    candles_5m  = await hyperliquid.get_candles(asset, "5m",  20)
+                    ind_15m = compute_all(candles_15m)
+                    ind_5m  = compute_all(candles_5m)
 
                     if len(candles_1h) < 26:
                         add_event(f"Skipping {asset}: only {len(candles_1h)} 1h candles (need 26+)")
@@ -351,6 +373,31 @@ def main():
                     recent_mids = [entry["mid"] for entry in list(price_history.get(asset, []))[-10:]]
                     funding_annualized = round(funding * 24 * 365 * 100, 2) if funding else None
 
+                    # Spread from impactPxs in cached metadata — no extra API call
+                    try:
+                        _dex = asset.split(":")[0] if ":" in asset else None
+                        _mdata = await hyperliquid.get_meta_and_ctxs(dex=_dex)
+                        spread_pct = 0.0
+                        if isinstance(_mdata, list) and len(_mdata) >= 2:
+                            _umeta, _uctxs = _mdata[0], _mdata[1]
+                            _uidx = next(
+                                (i for i, u in enumerate(_umeta.get("universe", [])) if u.get("name") == asset),
+                                None
+                            )
+                            if _uidx is not None and _uidx < len(_uctxs):
+                                _ipx = _uctxs[_uidx].get("impactPxs")
+                                if _ipx and len(_ipx) >= 2 and current_price > 0:
+                                    spread_pct = abs(float(_ipx[1]) - float(_ipx[0])) / float(current_price) * 100
+                    except Exception:
+                        spread_pct = 0.0
+
+                    ema20_15m = latest(ind_15m.get("ema20", []))
+                    near_ema_15m = (
+                        abs(current_price - ema20_15m) / current_price < 0.003
+                        if (ema20_15m is not None and current_price > 0)
+                        else True
+                    )
+
                     market_sections.append({
                         "asset": asset,
                         "current_price": round_or_none(current_price, 2),
@@ -387,6 +434,18 @@ def main():
                         "funding_rate": round_or_none(funding, 8),
                         "funding_annualized_pct": funding_annualized,
                         "recent_mid_prices": recent_mids,
+                        "setup_15m": {
+                            "ema20":          round_or_none(latest(ind_15m.get("ema20", [])), 2),
+                            "macd_histogram": round_or_none(latest(ind_15m.get("macd_histogram", [])), 4),
+                            "rsi14":          round_or_none(latest(ind_15m.get("rsi14", [])), 2),
+                            "near_ema":       near_ema_15m,
+                        },
+                        "trigger_5m": {
+                            "macd_histogram": round_or_none(latest(ind_5m.get("macd_histogram", [])), 4),
+                            "rsi14":          round_or_none(latest(ind_5m.get("rsi14", [])), 2),
+                            "candle_bullish": candles_5m[-1]["close"] > candles_5m[-1]["open"] if candles_5m else False,
+                        },
+                        "spread_pct": round(spread_pct, 4),
                     })
                 except Exception as e:
                     add_event(f"Data gather error {asset}: {e}")
@@ -516,6 +575,21 @@ def main():
                             raise ValueError(f"INVERSION BUG DETECTED: {asset} trend=BULLISH but action=sell")
                         if trend_4h == "BEARISH" and action == "buy":
                             raise ValueError(f"INVERSION BUG DETECTED: {asset} trend=BEARISH but action=buy")
+                        # FIX 2: Spread filter
+                        asset_ctx = next((m for m in market_sections if m.get("asset") == asset), {})
+                        _sp = asset_ctx.get("spread_pct", 0)
+                        if _sp and float(_sp) > 0.15:
+                            add_event(f"[SPREAD] {asset} blocked — spread {float(_sp):.3f}% too wide")
+                            continue
+                        # FIX 1: Entry confirmation (15m/5m layers)
+                        if not entry_confirmed(asset_ctx, action):
+                            logging.info(
+                                "[ENTRY] %s direction=%s blocked — "
+                                "15m/5m not confirmed, waiting for pullback",
+                                asset, action
+                            )
+                            add_event(f"[ENTRY] {asset} {action} blocked — 15m/5m not confirmed")
+                            continue
                         is_buy = action == "buy"
                         alloc_usd = float(output.get("allocation_usd", 0.0))
                         if alloc_usd <= 0:
@@ -600,6 +674,7 @@ def main():
                             "exit_plan": output["exit_plan"],
                             "opened_at": datetime.now(timezone.utc).isoformat()
                         })
+                        state_mgr.record_entry(asset)
                         add_event(f"{action.upper()} {asset} amount {amount:.4f} at ~{current_price}")
                         if rationale:
                             add_event(f"Post-trade rationale for {asset}: {rationale}")

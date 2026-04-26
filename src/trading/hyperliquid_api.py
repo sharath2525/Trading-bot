@@ -258,6 +258,10 @@ class HyperliquidAPI:
         order_type = {"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}}
         return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, sl_price, order_type, True))
 
+    async def market_close(self, asset: str, slippage: float = 0.01):
+        """Close the entire open position for asset at market price."""
+        return await self._retry(lambda: self.exchange.market_close(asset, None, slippage))
+
     async def cancel_order(self, asset, oid):
         """Cancel a single order by identifier for a given asset.
 
@@ -353,18 +357,46 @@ class HyperliquidAPI:
         return oids
 
     async def get_user_state(self):
-        """Retrieve wallet state with enriched position PnL calculations.
+        """Retrieve wallet state with correct unified account balance.
 
-        Supports both standard and unified accounts. For unified accounts,
-        the available balance comes from the spot clearinghouse (USDC total).
+        TRUE total = perps_value (marginSummary.accountValue, includes unrealised PnL)
+                   + spot_usdc  (USDC held in the spot/unified wallet).
 
-        Returns:
-            Dictionary with ``balance``, ``total_value``, and ``positions``.
+        The old code only fell back to spot when perps showed zero — it missed the
+        case where a trade is open and marginSummary.accountValue contains only the
+        isolated margin (~$1), not the full portfolio value (~$101).
         """
         state = await self._retry(lambda: self.info.user_state(self.query_address))
         positions = state.get("assetPositions", [])
         margin = state.get("marginSummary") or state.get("crossMarginSummary") or {}
-        total_value = float(margin.get("accountValue") or state.get("accountValue") or 0.0)
+
+        # Perps value — includes unrealised PnL on all open positions
+        perps_value = float(margin.get("accountValue") or state.get("accountValue") or 0.0)
+        withdrawable = float(state.get("withdrawable", 0.0))
+
+        # Spot USDC — always fetch; unified accounts keep idle capital here.
+        # This is NOT conditional on perps being zero.
+        spot_usdc = 0.0
+        try:
+            spot_state = await self._retry(
+                lambda: self.info.spot_user_state(self.query_address)
+            )
+            for bal in spot_state.get("balances", []):
+                if bal.get("coin") == "USDC":
+                    spot_usdc = float(bal.get("total", 0))
+                    break
+        except Exception as e:
+            logging.warning("spot balance fetch failed: %s", e)
+
+        # TRUE unified balance = perps (with PnL) + idle spot USDC
+        total_value = perps_value + spot_usdc
+
+        logging.info(
+            "[BALANCE] perps=%.2f spot_usdc=%.2f total=%.2f",
+            perps_value, spot_usdc, total_value
+        )
+
+        # Enrich positions with live PnL
         enriched_positions = []
         for pos_wrap in positions:
             pos = pos_wrap["position"]
@@ -376,28 +408,15 @@ class HyperliquidAPI:
             pos["pnl"] = pnl
             pos["notional_entry"] = abs(size) * entry_px
             enriched_positions.append(pos)
-        balance = float(state.get("withdrawable", 0.0))
 
-        # Unified account: perps balance may be 0 while funds are in spot USDC.
-        # Check spot clearinghouse for the actual available balance.
-        if balance == 0 and total_value == 0:
-            try:
-                spot_state = await self._retry(
-                    lambda: self.info.spot_user_state(self.query_address)
-                )
-                for bal in spot_state.get("balances", []):
-                    if bal.get("coin") == "USDC":
-                        spot_total = float(bal.get("total", 0))
-                        spot_hold = float(bal.get("hold", 0))
-                        balance = spot_total - spot_hold
-                        total_value = balance + sum(p.get("pnl", 0.0) for p in enriched_positions)
-                        break
-            except Exception as e:
-                logging.warning("Failed to fetch spot state for unified account: %s", e)
-
-        if not total_value:
-            total_value = balance + sum(p.get("pnl", 0.0) for p in enriched_positions)
-        return {"balance": balance, "total_value": total_value, "positions": enriched_positions}
+        return {
+            "balance":      total_value,    # TRUE unified total — used by risk manager
+            "total_value":  total_value,    # alias kept for compatibility
+            "perps_value":  perps_value,    # perps-only — for dashboard breakdown
+            "spot_usdc":    spot_usdc,      # spot USDC — for dashboard breakdown
+            "withdrawable": withdrawable,
+            "positions":    enriched_positions,
+        }
 
     async def get_current_price(self, asset):
         """Return the latest mid-price for ``asset``.
