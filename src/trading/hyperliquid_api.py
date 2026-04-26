@@ -388,8 +388,11 @@ class HyperliquidAPI:
         except Exception as e:
             logging.warning("spot balance fetch failed: %s", e)
 
-        # TRUE unified balance = perps (with PnL) + idle spot USDC
-        total_value = perps_value + spot_usdc
+        # spot_user_state "total" includes USDC locked in isolated positions,
+        # so perps_value (isolated margin equity) is already counted inside spot_usdc.
+        # Adding both would double-count. Use spot_usdc as the primary; fall back
+        # to perps_value only when spot is empty (cross-margin-only accounts).
+        total_value = spot_usdc if spot_usdc > 0 else perps_value
 
         logging.info(
             "[BALANCE] perps=%.2f spot_usdc=%.2f total=%.2f",

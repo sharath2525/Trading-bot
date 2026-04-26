@@ -211,10 +211,9 @@ function renderStatsFast() {
   const pos = Array.isArray(latest.positions)?latest.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
 
   document.getElementById('sVal').textContent = fu(av);
-  const _perps=parseFloat(latest.perps_value||0);
-  const _spot=parseFloat(latest.spot_usdc||0);
-  document.getElementById('sBal').textContent=
-    _perps>0?fu(_perps)+(_spot>0?' + $'+f2(_spot)+' spot':''):(bal>0?fu(bal):'—');
+  const _w=parseFloat(latest.withdrawable||0);
+  const _bal=parseFloat(latest.spot_usdc||latest.balance||0);
+  document.getElementById('sBal').textContent=_w>0?fu(_w):(_bal>0?fu(_bal):'—');
   document.getElementById('sPos').textContent = latest.positions_count||pos.length||'0';
 
   let upnl=0; pos.forEach(p=>{const v=parseFloat(p.unrealized_pnl||0);if(!isNaN(v))upnl+=v;});
@@ -236,12 +235,9 @@ function renderStatsLive() {
   const pos = Array.isArray(live.positions)?live.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
 
   if(av>0) document.getElementById('sVal').textContent=fu(av);
-  if(av>=0){
-    const perps=parseFloat(live.perps_value||0);
-    const spot=parseFloat(live.spot_usdc||0);
-    document.getElementById('sBal').textContent=
-      fu(perps)+(spot>0?' + $'+f2(spot)+' spot':'');
-  }
+  const _lw=parseFloat(live.withdrawable||0);
+  const _ls=parseFloat(live.spot_usdc||live.balance||0);
+  document.getElementById('sBal').textContent=_lw>0?fu(_lw):(_ls>0?fu(_ls):'—');
   document.getElementById('sPos').textContent=pos.length;
 
   let upnl=0; pos.forEach(p=>{const v=parseFloat(p.unrealized_pnl||0);if(!isNaN(v))upnl+=v;});
