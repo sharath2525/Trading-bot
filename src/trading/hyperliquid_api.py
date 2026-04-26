@@ -18,6 +18,7 @@ from eth_account import Account as _Account
 from eth_account.signers.local import LocalAccount
 from websocket._exceptions import WebSocketConnectionClosedException
 import socket
+import time
 
 if TYPE_CHECKING:
     # Type stubs for linter - eth_account's type stubs are incorrect
@@ -130,6 +131,77 @@ class HyperliquidAPI:
                 break
         raise last_err if last_err else RuntimeError("Hyperliquid retry: unknown error")
 
+    async def _check_order_landed(self, asset: str, is_buy: bool) -> bool:
+        """Return True if an open order or very recent fill already exists for asset+side.
+
+        Called before each retry of an order placement to prevent duplicates when a
+        prior attempt succeeded but the response was lost to a connection error.
+        Returns True (= treat as landed) if the check itself fails, so we never
+        double-place when uncertain.
+        """
+        try:
+            orders = await self.get_open_orders()
+            for o in orders:
+                if o.get("coin") == asset:
+                    order_is_buy = o.get("isBuy") if "isBuy" in o else o.get("is_buy")
+                    if order_is_buy == is_buy:
+                        logging.info(
+                            "[IDEMPOTENT] open order found for %s %s — skipping retry",
+                            "BUY" if is_buy else "SELL", asset,
+                        )
+                        return True
+            fills = await self.get_recent_fills(limit=20)
+            cutoff = time.time() - 60  # only fills from the last 60 seconds
+            for f in fills:
+                fill_ts = f.get("time") or f.get("timestamp") or 0
+                if fill_ts > 1e12:
+                    fill_ts /= 1000  # milliseconds → seconds
+                if f.get("coin") == asset and f.get("isBuy") == is_buy and fill_ts > cutoff:
+                    logging.info(
+                        "[IDEMPOTENT] recent fill found for %s %s — skipping retry",
+                        "BUY" if is_buy else "SELL", asset,
+                    )
+                    return True
+            return False
+        except Exception as e:
+            # Cannot confirm — assume landed to avoid a duplicate order
+            logging.warning("[IDEMPOTENT] check failed for %s: %s — treating as landed", asset, e)
+            return True
+
+    async def _order_retry(self, fn, asset: str, is_buy: bool):
+        """Retry-safe order placement with idempotency guard.
+
+        On the first attempt the order is placed normally.  After any connection
+        or timeout failure, ``_check_order_landed`` queries open orders and
+        recent fills before attempting again.  If the original order is already
+        on the exchange the retry is skipped and ``{"status": "already_placed"}``
+        is returned so the caller can treat it as a successful no-op.
+        """
+        last_err = None
+        for attempt in range(3):
+            try:
+                return await asyncio.to_thread(fn)
+            except (WebSocketConnectionClosedException, aiohttp.ClientError,
+                    ConnectionError, TimeoutError, socket.timeout) as e:
+                last_err = e
+                logging.warning(
+                    "[ORDER] %s %s attempt %d/3 failed: %s",
+                    "BUY" if is_buy else "SELL", asset, attempt + 1, e,
+                )
+                self._reset_clients()
+                if await self._check_order_landed(asset, is_buy):
+                    return {"status": "already_placed"}
+                await asyncio.sleep(0.5 * (2 ** attempt))
+            except (RuntimeError, ValueError, KeyError, AttributeError) as e:
+                last_err = e
+                logging.warning("[ORDER] unexpected error attempt %d/3: %s", attempt + 1, e)
+                if attempt == 0:
+                    self._reset_clients()
+                    await asyncio.sleep(0.5)
+                    continue
+                break
+        raise last_err if last_err else RuntimeError("Order placement failed after retries")
+
     def round_size(self, asset, amount):
         """Round order size to the asset precision defined by market metadata.
 
@@ -175,7 +247,7 @@ class HyperliquidAPI:
             Raw SDK response from :meth:`Exchange.market_open`.
         """
         amount = self.round_size(asset, amount)
-        return await self._retry(lambda: self.exchange.market_open(asset, True, amount, None, slippage))
+        return await self._order_retry(lambda: self.exchange.market_open(asset, True, amount, None, slippage), asset, is_buy=True)
 
     async def place_sell_order(self, asset, amount, slippage=0.01):
         """Submit a market sell order with exchange-side rounding and retry logic.
@@ -189,7 +261,7 @@ class HyperliquidAPI:
             Raw SDK response from :meth:`Exchange.market_open`.
         """
         amount = self.round_size(asset, amount)
-        return await self._retry(lambda: self.exchange.market_open(asset, False, amount, None, slippage))
+        return await self._order_retry(lambda: self.exchange.market_open(asset, False, amount, None, slippage), asset, is_buy=False)
 
     async def place_limit_buy(self, asset, amount, limit_price, tif="Gtc"):
         """Submit a limit buy order.
@@ -206,7 +278,7 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"limit": {"tif": tif}}
-        return await self._retry(lambda: self.exchange.order(asset, True, amount, limit_price, order_type))
+        return await self._order_retry(lambda: self.exchange.order(asset, True, amount, limit_price, order_type), asset, is_buy=True)
 
     async def place_limit_sell(self, asset, amount, limit_price, tif="Gtc"):
         """Submit a limit sell order.
@@ -222,7 +294,7 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"limit": {"tif": tif}}
-        return await self._retry(lambda: self.exchange.order(asset, False, amount, limit_price, order_type))
+        return await self._order_retry(lambda: self.exchange.order(asset, False, amount, limit_price, order_type), asset, is_buy=False)
 
     async def place_take_profit(self, asset, is_buy, amount, tp_price):
         """Create a reduce-only trigger order that executes a take-profit exit.
