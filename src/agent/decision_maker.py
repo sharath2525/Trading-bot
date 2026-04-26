@@ -299,7 +299,7 @@ class TradingAgent:
                     logging.warning("THINKING_ENABLED forces max_tokens from %d to 16000 — this increases API cost significantly", self.max_tokens)
                 kwargs["max_tokens"] = max(self.max_tokens, 16000)
 
-            response = self.client.messages.create(**kwargs)
+            response = self.client.messages.create(**kwargs, timeout=45.0)
             input_tokens = response.usage.input_tokens
             output_tokens = response.usage.output_tokens
             cache_read = getattr(response.usage, "cache_read_input_tokens", 0)
@@ -425,14 +425,32 @@ class TradingAgent:
                 return {"reasoning": "", "trade_decisions": []}
 
         # Main loop: up to 6 iterations to handle tool calls
+        def _hold_all(reason: str):
+            logging.warning("[CLAUDE] %s — returning hold for all assets", reason)
+            with open("llm_requests.log", "a", encoding="utf-8") as f:
+                f.write(f"Fallback hold: {reason}\n")
+            return {
+                "reasoning": reason,
+                "trade_decisions": [{
+                    "asset": a, "action": "hold", "allocation_usd": 0.0,
+                    "order_type": "market", "limit_price": None,
+                    "tp_price": None, "sl_price": None,
+                    "exit_plan": "", "rationale": reason,
+                } for a in assets]
+            }
+
         for iteration in range(6):
             try:
                 response = _call_claude(messages)
+            except asyncio.TimeoutError:
+                return _hold_all("Claude API asyncio timeout (45s)")
+            except anthropic.APITimeoutError as e:
+                return _hold_all(f"Claude API timeout (45s): {e}")
             except anthropic.APIError as e:
                 logging.error("Claude API error: %s", e)
                 with open("llm_requests.log", "a", encoding="utf-8") as f:
                     f.write(f"API Error: {e}\n")
-                break
+                return _hold_all(f"Claude API error: {e}")
 
             # Check if the response contains tool use
             tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
