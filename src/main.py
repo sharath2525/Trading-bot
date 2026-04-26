@@ -288,6 +288,8 @@ def main():
                 "total_return_pct": round(total_return_pct, 2),
                 "balance": round_or_none(state['balance'], 2),
                 "account_value": round_or_none(account_value, 2),
+                "perps_value": round_or_none(state.get('perps_value'), 2),
+                "spot_usdc": round_or_none(state.get('spot_usdc'), 2),
                 "sharpe_ratio": round_or_none(sharpe, 3),
                 "positions": positions,
                 "active_trades": [
@@ -538,6 +540,8 @@ def main():
                 "decisions": cycle_decisions,
                 "account_value": round_or_none(account_value, 2),
                 "balance": round_or_none(state['balance'], 2),
+                "perps_value": round_or_none(state.get('perps_value'), 2),
+                "spot_usdc": round_or_none(state.get('spot_usdc'), 2),
                 "positions": positions,
                 "open_orders": open_orders_struct,
                 "recent_fills": recent_fills_struct,
@@ -817,7 +821,9 @@ def main():
                 pass
             return web.json_response({
                 "account_value": round_or_none(state.get('total_value'), 2),
-                "balance": round_or_none(state.get('balance'), 2),
+                "balance":       round_or_none(state.get('balance'), 2),
+                "perps_value":   round_or_none(state.get('perps_value'), 2),
+                "spot_usdc":     round_or_none(state.get('spot_usdc'), 2),
                 "positions": positions,
                 "open_orders": open_orders,
                 "recent_fills": recent_fills,
