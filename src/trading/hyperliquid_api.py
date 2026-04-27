@@ -177,6 +177,13 @@ class HyperliquidAPI:
         on the exchange the retry is skipped and ``{"status": "already_placed"}``
         is returned so the caller can treat it as a successful no-op.
         """
+        # BUG 3 FIX: Pre-flight check before attempt 0 — if already on exchange, skip entirely
+        if await self._check_order_landed(asset, is_buy):
+            logging.info(
+                "[IDEMPOTENT] pre-flight: %s %s already on exchange — skipping",
+                "BUY" if is_buy else "SELL", asset,
+            )
+            return {"status": "already_placed"}
         last_err = None
         for attempt in range(3):
             try:
@@ -296,6 +303,51 @@ class HyperliquidAPI:
         order_type = {"limit": {"tif": tif}}
         return await self._order_retry(lambda: self.exchange.order(asset, False, amount, limit_price, order_type), asset, is_buy=False)
 
+    async def _trigger_order_retry(self, fn, asset: str, tpsl_type: str):
+        """Retry-safe placement for TP/SL trigger orders with idempotency guard.
+
+        Before each retry after the first failure, checks open orders for an
+        existing trigger order of the same type (``"tp"`` or ``"sl"``) for the
+        asset.  If one already exists the retry is skipped and
+        ``{"status": "already_placed"}`` is returned.
+        """
+        last_err = None
+        for attempt in range(3):
+            try:
+                return await asyncio.to_thread(fn)
+            except (WebSocketConnectionClosedException, aiohttp.ClientError,
+                    ConnectionError, TimeoutError, socket.timeout) as e:
+                last_err = e
+                logging.warning(
+                    "[TRIGGER] %s %s attempt %d/3 failed: %s",
+                    tpsl_type.upper(), asset, attempt + 1, e,
+                )
+                self._reset_clients()
+                try:
+                    orders = await self.get_open_orders()
+                    for o in orders:
+                        if o.get('coin') == asset:
+                            ot = o.get('orderType')
+                            if isinstance(ot, dict) and (ot.get('trigger') or {}).get('tpsl') == tpsl_type:
+                                logging.info(
+                                    "[IDEMPOTENT] %s %s trigger order already exists — skipping retry",
+                                    tpsl_type.upper(), asset,
+                                )
+                                return {"status": "already_placed"}
+                except Exception as _ce:
+                    logging.warning("[IDEMPOTENT] trigger check failed: %s — treating as landed", _ce)
+                    return {"status": "already_placed"}
+                await asyncio.sleep(0.5 * (2 ** attempt))
+            except (RuntimeError, ValueError, KeyError, AttributeError) as e:
+                last_err = e
+                logging.warning("[TRIGGER] unexpected error attempt %d/3: %s", attempt + 1, e)
+                if attempt == 0:
+                    self._reset_clients()
+                    await asyncio.sleep(0.5)
+                    continue
+                break
+        raise last_err if last_err else RuntimeError(f"Trigger {tpsl_type} placement failed after retries")
+
     async def place_take_profit(self, asset, is_buy, amount, tp_price):
         """Create a reduce-only trigger order that executes a take-profit exit.
 
@@ -311,7 +363,7 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
-        return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, tp_price, order_type, True))
+        return await self._trigger_order_retry(lambda: self.exchange.order(asset, not is_buy, amount, tp_price, order_type, True), asset, tpsl_type="tp")
 
     async def place_stop_loss(self, asset, is_buy, amount, sl_price):
         """Create a reduce-only trigger order that executes a stop-loss exit.
@@ -328,7 +380,7 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}}
-        return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, sl_price, order_type, True))
+        return await self._trigger_order_retry(lambda: self.exchange.order(asset, not is_buy, amount, sl_price, order_type, True), asset, tpsl_type="sl")
 
     async def market_close(self, asset: str, slippage: float = 0.01):
         """Close the entire open position for asset at market price."""

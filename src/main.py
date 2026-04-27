@@ -299,7 +299,30 @@ def main():
                 except Exception:
                     pass
                 if not _g_diary:
-                    logging.warning("[GUARDIAN] %s: no diary entry — cannot recover TP/SL", _g_asset)
+                    logging.warning("[GUARDIAN] %s: no diary entry — attempting fallback SL from live price", _g_asset)
+                    if not _g_has_sl:
+                        _g_pos = next(
+                            (p for p in state.get('positions', [])
+                             if p.get('coin') == _g_asset and abs(float(p.get('szi') or 0)) > 0),
+                            None,
+                        )
+                        if _g_pos:
+                            _g_szi     = float(_g_pos.get('szi') or 0)
+                            _g_fb_long = _g_szi > 0
+                            _g_fb_size = abs(_g_szi)
+                            _g_fb_px   = asset_prices.get(_g_asset) or 0
+                            if _g_fb_px > 0 and _g_fb_size > 0:
+                                _g_fb_sl = risk_mgr.enforce_stop_loss(None, _g_fb_px, _g_fb_long)
+                                try:
+                                    _g_fb_res = await hyperliquid.place_stop_loss(_g_asset, _g_fb_long, _g_fb_size, _g_fb_sl)
+                                    _g_fb_oid = (hyperliquid.extract_oids(_g_fb_res) or [None])[0]
+                                    add_event(f"[GUARDIAN] {_g_asset} fallback SL placed at {_g_fb_sl} (no diary, size={_g_fb_size:.6f}, oid={_g_fb_oid})")
+                                    logging.warning("[GUARDIAN] %s fallback SL placed at %.2f (no diary)", _g_asset, _g_fb_sl)
+                                    for _gtr in active_trades:
+                                        if _gtr.get('asset') == _g_asset:
+                                            _gtr['sl_oid'] = _g_fb_oid
+                                except Exception as _g_fb_err:
+                                    add_event(f"[GUARDIAN] {_g_asset} fallback SL failed: {_g_fb_err}")
                     continue
                 _g_is_long = _g_diary.get('action') == 'buy'
                 _g_amount  = float(_g_diary.get('amount') or 0)
@@ -646,6 +669,12 @@ def main():
                     if rationale:
                         add_event(f"Decision rationale for {asset}: {rationale}")
                     if action in ("buy", "sell"):
+                        # BUG 1 FIX: Hard gate — skip if state machine says already in position or cooling down
+                        _sm_state = state_mgr.get_state(asset)
+                        if _sm_state in ("ENTERED", "COOLDOWN"):
+                            logging.info("[STATE GATE] %s skipped — state=%s", asset, _sm_state)
+                            add_event(f"[STATE GATE] {asset} skipped — state={_sm_state}, no new entry")
+                            continue
                         # Inversion assertion — fires if trend and order direction are opposite.
                         # BULLISH (EMA20>EMA50) must produce buy; BEARISH must produce sell.
                         # If this raises, an inversion is still present somewhere in the signal chain.
