@@ -241,7 +241,7 @@ def main():
             except Exception:
                 pass
 
-            # FIX 3: Time-based exit — force-close trades stuck beyond max_trade_hours
+            # Time-based exit — force-close trades stuck beyond max_trade_hours
             for _asset_name in list(args.assets):
                 if state_mgr.get_state(_asset_name) == "ENTERED":
                     _max_hours = int(CONFIG.get("max_trade_hours") or 12)
@@ -255,6 +255,79 @@ def main():
                             state_mgr.start_cooldown(_asset_name, interval_seconds=3600)
                         except Exception as _te:
                             add_event(f"[TIMEOUT] {_asset_name} close error: {_te}")
+
+            # TP/SL GUARDIAN — re-place missing trigger orders for every ENTERED position.
+            # TP/SL are placed once at entry; if the exchange dropped the order (rate-limit,
+            # connection reset, race), the position runs naked until this catches it.
+            for _g_asset in list(args.assets):
+                if state_mgr.get_state(_g_asset) != "ENTERED":
+                    continue
+                # Only act if the position still exists on the exchange
+                _g_pos_exists = any(
+                    abs(float(p.get('szi') or 0)) > 0 and p.get('coin') == _g_asset
+                    for p in state.get('positions', [])
+                )
+                if not _g_pos_exists:
+                    continue
+                # Classify existing trigger orders for this asset
+                _g_has_tp = False
+                _g_has_sl = False
+                for _g_o in (open_orders or []):
+                    if _g_o.get('coin') != _g_asset:
+                        continue
+                    _g_ot = _g_o.get('orderType')
+                    if isinstance(_g_ot, dict):
+                        _g_tpsl = (_g_ot.get('trigger') or {}).get('tpsl', '')
+                        if _g_tpsl == 'tp':
+                            _g_has_tp = True
+                        elif _g_tpsl == 'sl':
+                            _g_has_sl = True
+                if _g_has_tp and _g_has_sl:
+                    continue  # Both present — nothing to do
+                # Read TP/SL prices from the most recent buy/sell diary entry for this asset
+                _g_diary = None
+                try:
+                    with open(diary_path, 'r') as _gf:
+                        for _gl in reversed(_gf.readlines()):
+                            try:
+                                _ge = json.loads(_gl)
+                                if _ge.get('asset') == _g_asset and _ge.get('action') in ('buy', 'sell'):
+                                    _g_diary = _ge
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+                if not _g_diary:
+                    logging.warning("[GUARDIAN] %s: no diary entry — cannot recover TP/SL", _g_asset)
+                    continue
+                _g_is_long = _g_diary.get('action') == 'buy'
+                _g_amount  = float(_g_diary.get('amount') or 0)
+                _g_tp_px   = _g_diary.get('tp_price')
+                _g_sl_px   = _g_diary.get('sl_price')
+                if _g_amount <= 0:
+                    logging.warning("[GUARDIAN] %s: zero amount in diary — cannot re-place", _g_asset)
+                    continue
+                if not _g_has_tp and _g_tp_px:
+                    try:
+                        _g_tp_res = await hyperliquid.place_take_profit(_g_asset, _g_is_long, _g_amount, float(_g_tp_px))
+                        _g_tp_oid = (hyperliquid.extract_oids(_g_tp_res) or [None])[0]
+                        add_event(f"[GUARDIAN] {_g_asset} TP re-placed at {_g_tp_px} (oid={_g_tp_oid})")
+                        for _gtr in active_trades:
+                            if _gtr.get('asset') == _g_asset:
+                                _gtr['tp_oid'] = _g_tp_oid
+                    except Exception as _g_err:
+                        add_event(f"[GUARDIAN] {_g_asset} TP re-place failed: {_g_err}")
+                if not _g_has_sl and _g_sl_px:
+                    try:
+                        _g_sl_res = await hyperliquid.place_stop_loss(_g_asset, _g_is_long, _g_amount, float(_g_sl_px))
+                        _g_sl_oid = (hyperliquid.extract_oids(_g_sl_res) or [None])[0]
+                        add_event(f"[GUARDIAN] {_g_asset} SL re-placed at {_g_sl_px} (oid={_g_sl_oid})")
+                        for _gtr in active_trades:
+                            if _gtr.get('asset') == _g_asset:
+                                _gtr['sl_oid'] = _g_sl_oid
+                    except Exception as _g_err:
+                        add_event(f"[GUARDIAN] {_g_asset} SL re-place failed: {_g_err}")
 
             recent_fills_struct = []
             try:
