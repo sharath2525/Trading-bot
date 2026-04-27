@@ -430,19 +430,22 @@ def main():
             asset_trends = {}  # Stores computed 4h trend label per asset for sanity checks
             for asset in args.assets:
                 try:
-                    current_price = await hyperliquid.get_current_price(asset)
+                    # Fetch price/OI/funding and all 4 timeframes in parallel — reduces
+                    # per-asset network time from 7 sequential calls to 1 concurrent batch.
+                    (current_price, oi, funding,
+                     candles_1h, candles_4h, candles_15m, candles_5m) = await asyncio.gather(
+                        hyperliquid.get_current_price(asset),
+                        hyperliquid.get_open_interest(asset),
+                        hyperliquid.get_funding_rate(asset),
+                        hyperliquid.get_candles(asset, "1h",  60),
+                        hyperliquid.get_candles(asset, "4h",  60),
+                        hyperliquid.get_candles(asset, "15m", 30),
+                        hyperliquid.get_candles(asset, "5m",  20),
+                    )
                     asset_prices[asset] = current_price
                     if asset not in price_history:
                         price_history[asset] = deque(maxlen=60)
                     price_history[asset].append({"t": datetime.now(timezone.utc).isoformat(), "mid": round_or_none(current_price, 2)})
-                    oi = await hyperliquid.get_open_interest(asset)
-                    funding = await hyperliquid.get_funding_rate(asset)
-
-                    # Fetch candles — 1h for intraday signals, 4h for structure, 15m/5m for entry precision
-                    candles_1h  = await hyperliquid.get_candles(asset, "1h",  60)
-                    candles_4h  = await hyperliquid.get_candles(asset, "4h",  60)
-                    candles_15m = await hyperliquid.get_candles(asset, "15m", 30)
-                    candles_5m  = await hyperliquid.get_candles(asset, "5m",  20)
                     ind_15m = compute_all(candles_15m)
                     ind_5m  = compute_all(candles_5m)
 
@@ -584,7 +587,13 @@ def main():
             ])
             context = json.dumps(context_payload, default=json_default)
             add_event(f"Combined prompt length: {len(context)} chars for {len(args.assets)} assets")
-            with open("prompts.log", "a") as f:
+            _prompts_log = "prompts.log"
+            try:
+                if os.path.exists(_prompts_log) and os.path.getsize(_prompts_log) > 10 * 1024 * 1024:
+                    os.replace(_prompts_log, _prompts_log + ".old")
+            except Exception:
+                pass
+            with open(_prompts_log, "a") as f:
                 f.write(f"\n\n--- {datetime.now()} - ALL ASSETS ---\n{json.dumps(context_payload, indent=2, default=json_default)}\n")
 
             def _is_failed_outputs(outs):
@@ -787,8 +796,12 @@ def main():
                                     fc_oid = fc.get('oid') or fc.get('orderId')
                                     if not (entry_oid and fc_oid and str(fc_oid) == str(entry_oid)):
                                         continue
-                                    # Deduplicate by trade ID so re-appearing fills aren't summed twice
-                                    fc_tid = str(fc.get('tid') or fc.get('tradeId') or fc.get('hash') or id(fc))
+                                    # Deduplicate by trade ID — use stable composite key as fallback
+                                    # (id(fc) is NOT stable across poll iterations and causes double-counting)
+                                    fc_tid = str(
+                                        fc.get('tid') or fc.get('tradeId') or fc.get('hash')
+                                        or f"{fc_oid}_{fc.get('sz') or fc.get('size')}_{fc.get('time') or fc.get('timestamp')}"
+                                    )
                                     if fc_tid in _seen_fill_tids:
                                         continue
                                     _seen_fill_tids.add(fc_tid)

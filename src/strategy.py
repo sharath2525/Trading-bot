@@ -103,7 +103,7 @@ def entry_confirmed(asset_data: dict, direction: str) -> bool:
     t5  = asset_data.get("trigger_5m", {})
 
     if not s15 or not t5:
-        return True  # missing data → do not block
+        return False  # missing data → block entry until indicators are available
 
     macd_15m = float(s15.get("macd_histogram") or 0)
     near_ema  = s15.get("near_ema", True)
@@ -111,16 +111,21 @@ def entry_confirmed(asset_data: dict, direction: str) -> bool:
     macd_5m  = float(t5.get("macd_histogram") or 0)
     bull_5m  = t5.get("candle_bullish", True)
 
+    # Price-relative threshold: 0.1% of current price.
+    # A fixed ±50 is meaningless for BTC ($95k MACD swings in hundreds).
+    current_price = float(asset_data.get("current_price") or 0)
+    macd_threshold = current_price * 0.001 if current_price > 0 else 50.0
+
     if direction == "buy":
         # 15m: price near EMA20 (pullback) AND MACD recovering
         # 5m: bullish candle OR positive histogram (trigger)
-        setup_ok   = near_ema and macd_15m > -50
+        setup_ok   = near_ema and macd_15m > -macd_threshold
         trigger_ok = bull_5m or macd_5m > 0
         return setup_ok and trigger_ok
 
     if direction == "sell":
         # Mirror logic for shorts
-        setup_ok   = near_ema and macd_15m < 50
+        setup_ok   = near_ema and macd_15m < macd_threshold
         trigger_ok = (not bull_5m) or macd_5m < 0
         return setup_ok and trigger_ok
 
