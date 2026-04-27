@@ -708,33 +708,50 @@ def main():
                         else:
                             order = await hyperliquid.place_buy_order(asset, amount) if is_buy else await hyperliquid.place_sell_order(asset, amount)
 
-                        # Confirm fill — retry up to 3 times with 1s intervals
+                        # Extract the OID from the entry order response for precise fill matching
+                        entry_oids = hyperliquid.extract_oids(order) if order else []
+                        entry_oid = entry_oids[0] if entry_oids else None
+
+                        # Confirm fill — match only fills with the exact entry OID and sum
+                        # partial fills to get the true filled quantity.
+                        filled_qty = 0.0
                         filled = False
                         for _attempt in range(3):
                             await asyncio.sleep(1)
                             try:
-                                fills_check = await hyperliquid.get_recent_fills(limit=20)
-                                for fc in reversed(fills_check):
-                                    if fc.get('coin') == asset or fc.get('asset') == asset:
+                                fills_check = await hyperliquid.get_recent_fills(limit=30)
+                                for fc in fills_check:
+                                    fc_oid = fc.get('oid') or fc.get('orderId')
+                                    if entry_oid and fc_oid and str(fc_oid) == str(entry_oid):
+                                        filled_qty += float(fc.get('sz') or fc.get('size') or 0)
                                         filled = True
-                                        break
                             except Exception:
                                 pass
                             if filled:
                                 break
-                        trade_log.append({"type": action, "price": current_price, "amount": amount, "exit_plan": output["exit_plan"], "filled": filled})
+
+                        # Use actual filled quantity for TP/SL sizing.
+                        # Fall back to the requested amount for resting limit orders
+                        # that haven't filled yet, or when OID matching found nothing.
+                        tp_sl_size = filled_qty if filled_qty > 0 else amount
+                        logging.info(
+                            "[FILL] %s entry_oid=%s filled_qty=%.6f requested=%.6f tp_sl_size=%.6f",
+                            asset, entry_oid, filled_qty, amount, tp_sl_size,
+                        )
+
+                        trade_log.append({"type": action, "price": current_price, "amount": tp_sl_size, "exit_plan": output["exit_plan"], "filled": filled})
                         tp_oid = None
                         sl_oid = None
                         if output.get("tp_price"):
-                            tp_order = await hyperliquid.place_take_profit(asset, is_buy, amount, output["tp_price"])
+                            tp_order = await hyperliquid.place_take_profit(asset, is_buy, tp_sl_size, output["tp_price"])
                             tp_oids = hyperliquid.extract_oids(tp_order)
                             tp_oid = tp_oids[0] if tp_oids else None
-                            add_event(f"TP placed {asset} at {output['tp_price']}")
+                            add_event(f"TP placed {asset} at {output['tp_price']} size={tp_sl_size:.6f}")
                         if output.get("sl_price"):
-                            sl_order = await hyperliquid.place_stop_loss(asset, is_buy, amount, output["sl_price"])
+                            sl_order = await hyperliquid.place_stop_loss(asset, is_buy, tp_sl_size, output["sl_price"])
                             sl_oids = hyperliquid.extract_oids(sl_order)
                             sl_oid = sl_oids[0] if sl_oids else None
-                            add_event(f"SL placed {asset} at {output['sl_price']}")
+                            add_event(f"SL placed {asset} at {output['sl_price']} size={tp_sl_size:.6f}")
                         # Reconcile: if opposite-side position exists or TP/SL just filled, clear stale active_trades for this asset
                         for existing in active_trades[:]:
                             if existing.get('asset') == asset:
@@ -745,7 +762,7 @@ def main():
                         active_trades.append({
                             "asset": asset,
                             "is_long": is_buy,
-                            "amount": amount,
+                            "amount": tp_sl_size,
                             "entry_price": current_price,
                             "tp_oid": tp_oid,
                             "sl_oid": sl_oid,
@@ -765,7 +782,9 @@ def main():
                                 "order_type": order_type,
                                 "limit_price": limit_price,
                                 "allocation_usd": alloc_usd,
-                                "amount": amount,
+                                "amount": tp_sl_size,
+                                "filled_qty": filled_qty,
+                                "requested_qty": amount,
                                 "entry_price": current_price,
                                 "tp_price": output.get("tp_price"),
                                 "tp_oid": tp_oid,
