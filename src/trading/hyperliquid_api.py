@@ -531,7 +531,17 @@ class HyperliquidAPI:
             size = float(pos.get("szi", 0) or 0)
             side = "long" if size > 0 else "short"
             current_px = await self.get_current_price(pos["coin"]) if entry_px and size else 0.0
-            pnl = (current_px - entry_px) * abs(size) if side == "long" else (entry_px - current_px) * abs(size)
+            if current_px > 0:
+                pnl = (current_px - entry_px) * abs(size) if side == "long" else (entry_px - current_px) * abs(size)
+            else:
+                # Price lookup returned 0 — coin name from assetPositions may lack the
+                # dex prefix (e.g. "GOLD" instead of "xyz:GOLD"). Computing PnL against
+                # price=0 produces a 100% notional loss that triggers a false force-close.
+                pnl = 0.0
+                logging.warning(
+                    "[BALANCE] %s price lookup returned 0 — skipping PnL enrichment to avoid false force-close",
+                    pos["coin"],
+                )
             pos["pnl"] = pnl
             pos["notional_entry"] = abs(size) * entry_px
             enriched_positions.append(pos)

@@ -5,10 +5,17 @@ The LLM cannot override these limits — they are hard-coded checks
 applied before every trade execution.
 """
 
+import json
 import logging
+import os
 from datetime import datetime, timezone
 
 from src.config_loader import CONFIG
+
+_RISK_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "risk_state.json",
+)
 
 
 class RiskManager:
@@ -29,6 +36,51 @@ class RiskManager:
         self.daily_high_date = None
         self.circuit_breaker_active = False
         self.circuit_breaker_date = None
+        self._state_file = _RISK_STATE_FILE
+        self._load_circuit_state()
+
+    # ── Circuit-breaker persistence ──────────────────────────────────────────
+
+    def _save_circuit_state(self) -> None:
+        """Atomically persist circuit breaker and daily high watermark to disk."""
+        payload = {
+            "circuit_breaker_active": self.circuit_breaker_active,
+            "circuit_breaker_date": str(self.circuit_breaker_date) if self.circuit_breaker_date else None,
+            "daily_high_value": self.daily_high_value,
+            "daily_high_date": str(self.daily_high_date) if self.daily_high_date else None,
+        }
+        tmp = self._state_file + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, self._state_file)
+        except Exception as e:
+            logging.warning("[RISK] failed to persist circuit state: %s", e)
+
+    def _load_circuit_state(self) -> None:
+        """Restore circuit breaker state from disk on startup."""
+        if not os.path.exists(self._state_file):
+            return
+        try:
+            with open(self._state_file, "r") as f:
+                payload = json.load(f)
+            self.circuit_breaker_active = bool(payload.get("circuit_breaker_active", False))
+            self.daily_high_value = payload.get("daily_high_value")
+            from datetime import date
+            date_str = payload.get("daily_high_date")
+            if date_str:
+                self.daily_high_date = date.fromisoformat(date_str)
+            cb_date_str = payload.get("circuit_breaker_date")
+            if cb_date_str:
+                self.circuit_breaker_date = date.fromisoformat(cb_date_str)
+            logging.info(
+                "[RISK] restored circuit state: breaker=%s daily_high=%s",
+                self.circuit_breaker_active, self.daily_high_value,
+            )
+        except Exception as e:
+            logging.warning("[RISK] failed to load risk_state.json: %s — starting fresh", e)
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _reset_daily_if_needed(self, account_value: float):
         """Reset daily high watermark at UTC day boundary."""
@@ -38,8 +90,10 @@ class RiskManager:
             self.daily_high_date = today
             self.circuit_breaker_active = False
             self.circuit_breaker_date = None
-        elif account_value > self.daily_high_value:
+            self._save_circuit_state()
+        elif account_value > (self.daily_high_value or 0):
             self.daily_high_value = account_value
+            self._save_circuit_state()
 
     # ------------------------------------------------------------------
     # Individual checks — each returns (allowed: bool, reason: str)
@@ -95,6 +149,7 @@ class RiskManager:
             if drawdown_pct > self.daily_loss_circuit_breaker_pct:
                 self.circuit_breaker_active = True
                 self.circuit_breaker_date = datetime.now(timezone.utc).date()
+                self._save_circuit_state()
                 return False, (
                     f"Daily drawdown {drawdown_pct:.2f}% exceeds circuit breaker "
                     f"threshold of {self.daily_loss_circuit_breaker_pct}%"

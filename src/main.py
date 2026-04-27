@@ -19,7 +19,7 @@ import json
 from aiohttp import web
 from src.utils.formatting import format_number as fmt, format_size as fmt_sz
 from src.utils.prompt_utils import json_default, round_or_none, round_series
-from src.strategy import entry_confirmed
+from src.strategy import entry_confirmed, market_filter
 from src.trade_state import TradeStateMachine
 
 load_dotenv()
@@ -173,10 +173,10 @@ def main():
                     is_long = ptc["is_long"]
                     add_event(f"RISK FORCE-CLOSE: {coin} at {ptc['loss_pct']}% loss (PnL: ${ptc['pnl']})")
                     try:
-                        if is_long:
-                            await hyperliquid.place_sell_order(coin, size)
-                        else:
-                            await hyperliquid.place_buy_order(coin, size)
+                        # Use market_close — bypasses _order_retry's idempotency pre-flight
+                        # which would otherwise find the SL trigger order and silently skip
+                        # the force-close, leaving the position open past the loss threshold.
+                        await hyperliquid.market_close(coin)
                         await hyperliquid.cancel_all_orders(coin)
                         # Remove from active trades
                         for tr in active_trades[:]:
@@ -206,8 +206,10 @@ def main():
                 pass
 
             open_orders_struct = []
+            open_orders_ok = False  # only True when fetch succeeded — gates the guardian
             try:
                 open_orders = await hyperliquid.get_open_orders()
+                open_orders_ok = True
                 for o in open_orders[:50]:
                     open_orders_struct.append({
                         "coin": o.get('coin'),
@@ -273,6 +275,11 @@ def main():
             # TP/SL are placed once at entry; if the exchange dropped the order (rate-limit,
             # connection reset, race), the position runs naked until this catches it.
             for _g_asset in list(args.assets):
+                if not open_orders_ok:
+                    # open_orders fetch failed — stale [] would make every ENTERED asset
+                    # appear to have no TP/SL, triggering mass duplicate order placement.
+                    logging.warning("[GUARDIAN] skipping all assets — open_orders fetch failed, cannot safely re-place")
+                    break
                 if state_mgr.get_state(_g_asset) != "ENTERED":
                     continue
                 # Only act if the position still exists on the exchange
@@ -722,13 +729,15 @@ def main():
                             raise ValueError(f"INVERSION BUG DETECTED: {asset} trend=BULLISH but action=sell")
                         if trend_4h == "BEARISH" and action == "buy":
                             raise ValueError(f"INVERSION BUG DETECTED: {asset} trend=BEARISH but action=buy")
-                        # FIX 2: Spread filter
                         asset_ctx = next((m for m in market_sections if m.get("asset") == asset), {})
-                        _sp = asset_ctx.get("spread_pct", 0)
-                        if _sp and float(_sp) > 0.15:
-                            add_event(f"[SPREAD] {asset} blocked — spread {float(_sp):.3f}% too wide")
+                        # ATR spike + spread pre-flight — market_filter() was dead code (only
+                        # called from make_decision() which is never invoked); wire it directly.
+                        _mf_pass, _mf_reason = market_filter(asset_ctx)
+                        if not _mf_pass:
+                            logging.warning("[MARKET FILTER] %s %s blocked — %s", asset, action, _mf_reason)
+                            add_event(f"[MARKET FILTER] {asset} {action} blocked — {_mf_reason}")
                             continue
-                        # FIX 1: Entry confirmation (15m/5m layers)
+                        # Entry confirmation (15m/5m layers)
                         if not entry_confirmed(asset_ctx, action):
                             logging.info(
                                 "[ENTRY] %s direction=%s blocked — "
@@ -823,16 +832,25 @@ def main():
                         trade_log.append({"type": action, "price": current_price, "amount": tp_sl_size, "exit_plan": output["exit_plan"], "filled": filled})
                         tp_oid = None
                         sl_oid = None
-                        if output.get("tp_price"):
-                            tp_order = await hyperliquid.place_take_profit(asset, is_buy, tp_sl_size, output["tp_price"])
-                            tp_oids = hyperliquid.extract_oids(tp_order)
-                            tp_oid = tp_oids[0] if tp_oids else None
-                            add_event(f"TP placed {asset} at {output['tp_price']} size={tp_sl_size:.6f}")
-                        if output.get("sl_price"):
-                            sl_order = await hyperliquid.place_stop_loss(asset, is_buy, tp_sl_size, output["sl_price"])
-                            sl_oids = hyperliquid.extract_oids(sl_order)
-                            sl_oid = sl_oids[0] if sl_oids else None
-                            add_event(f"SL placed {asset} at {output['sl_price']} size={tp_sl_size:.6f}")
+                        # For resting limit orders (filled_qty=0), skip TP/SL entirely.
+                        # Reduce-only orders submitted against a non-existent position are
+                        # silently rejected by Hyperliquid. The guardian places them next
+                        # cycle once the position is confirmed open on the exchange.
+                        _can_place_tpsl = filled_qty > 0 or order_type != "limit"
+                        if _can_place_tpsl:
+                            if output.get("tp_price"):
+                                tp_order = await hyperliquid.place_take_profit(asset, is_buy, tp_sl_size, output["tp_price"])
+                                tp_oids = hyperliquid.extract_oids(tp_order)
+                                tp_oid = tp_oids[0] if tp_oids else None
+                                add_event(f"TP placed {asset} at {output['tp_price']} size={tp_sl_size:.6f}")
+                            if output.get("sl_price"):
+                                sl_order = await hyperliquid.place_stop_loss(asset, is_buy, tp_sl_size, output["sl_price"])
+                                sl_oids = hyperliquid.extract_oids(sl_order)
+                                sl_oid = sl_oids[0] if sl_oids else None
+                                add_event(f"SL placed {asset} at {output['sl_price']} size={tp_sl_size:.6f}")
+                        else:
+                            logging.info("[LIMIT] %s TP/SL deferred — limit order not yet filled, guardian covers next cycle", asset)
+                            add_event(f"[LIMIT] {asset} TP/SL deferred — position not confirmed (guardian places next cycle)")
                         # Reconcile: if opposite-side position exists or TP/SL just filled, clear stale active_trades for this asset
                         for existing in active_trades[:]:
                             if existing.get('asset') == asset:

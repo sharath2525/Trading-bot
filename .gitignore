@@ -38,6 +38,8 @@ decisions.jsonl
 prompts.log
 state.json
 state.json.tmp
+risk_state.json
+risk_state.json.tmp
 
 # Private notes — local only, not for server or GitHub
 DEVNOTES.md
