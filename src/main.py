@@ -128,8 +128,16 @@ def main():
             invocation_count += 1
             minutes_since_start = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
 
-            # Global account state
-            state = await hyperliquid.get_user_state()
+            # Global account state — wrap so a sustained API outage skips the cycle
+            # instead of propagating an unhandled exception out of run_loop() and
+            # killing the process while positions remain open on the exchange.
+            try:
+                state = await hyperliquid.get_user_state()
+            except Exception as _state_err:
+                logging.error("[LOOP] get_user_state failed — skipping cycle %d: %s", invocation_count, _state_err)
+                add_event(f"[LOOP] API error, skipping cycle: {_state_err}")
+                await asyncio.sleep(get_interval_seconds(args.interval))
+                continue
             total_value = state.get('total_value') or (state.get('balance', 0) + sum(p.get('pnl', 0) for p in state.get('positions', [])))
             sharpe = calculate_sharpe(trade_log)
 
@@ -230,6 +238,11 @@ def main():
                     if asset not in assets_with_positions and asset not in assets_with_orders:
                         add_event(f"Reconciling stale active trade for {asset} (no position, no orders)")
                         active_trades.remove(tr)
+                        # Reset state machine so the asset can trade again next cycle.
+                        # Without this, the state stays ENTERED indefinitely and the
+                        # state gate blocks all future entries for up to 13 hours.
+                        state_mgr.start_cooldown(asset, interval_seconds=3600)
+                        logging.info("[RECONCILE] %s — position closed naturally, cooldown started", asset)
                         with open(diary_path, "a") as f:
                             f.write(json.dumps({
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -268,6 +281,11 @@ def main():
                     for p in state.get('positions', [])
                 )
                 if not _g_pos_exists:
+                    # Position gone but state still ENTERED — reset it now.
+                    # This covers any path the reconciler missed (e.g. first cycle after restart).
+                    logging.info("[GUARDIAN] %s state=ENTERED but no live position — resetting to COOLDOWN", _g_asset)
+                    add_event(f"[GUARDIAN] {_g_asset} position gone, resetting state to COOLDOWN")
+                    state_mgr.start_cooldown(_g_asset, interval_seconds=3600)
                     continue
                 # Classify existing trigger orders for this asset
                 _g_has_tp = False
@@ -587,7 +605,9 @@ def main():
                     return True
 
             try:
-                outputs = agent.decide_trade(args.assets, context)
+                # Run the blocking Anthropic SDK call in a thread so the asyncio
+                # event loop (and the aiohttp server + force-close checks) remain live.
+                outputs = await asyncio.to_thread(agent.decide_trade, args.assets, context)
                 if not isinstance(outputs, dict):
                     add_event(f"Invalid output format (expected dict): {outputs}")
                     outputs = {}
@@ -606,7 +626,7 @@ def main():
                 ])
                 context_retry = json.dumps(context_retry_payload, default=json_default)
                 try:
-                    outputs = agent.decide_trade(args.assets, context_retry)
+                    outputs = await asyncio.to_thread(agent.decide_trade, args.assets, context_retry)
                     if not isinstance(outputs, dict):
                         add_event(f"Retry invalid format: {outputs}")
                         outputs = {}
@@ -675,6 +695,17 @@ def main():
                             logging.info("[STATE GATE] %s skipped — state=%s", asset, _sm_state)
                             add_event(f"[STATE GATE] {asset} skipped — state={_sm_state}, no new entry")
                             continue
+                        # Block entirely when 4h EMA data is unavailable — UNKNOWN means
+                        # insufficient candle history (startup or exchange gap). Both
+                        # inversion guards below evaluate to False for UNKNOWN, so without
+                        # this check Claude's action passes through with no validation.
+                        if trend_4h == "UNKNOWN":
+                            logging.warning(
+                                "[TREND GUARD] %s blocked — trend_4h=UNKNOWN (insufficient 4h candle data)",
+                                asset,
+                            )
+                            add_event(f"[TREND GUARD] {asset} {action} blocked — trend_4h=UNKNOWN, candle data insufficient")
+                            continue
                         # Inversion assertion — fires if trend and order direction are opposite.
                         # BULLISH (EMA20>EMA50) must produce buy; BEARISH must produce sell.
                         # If this raises, an inversion is still present somewhere in the signal chain.
@@ -741,23 +772,31 @@ def main():
                         entry_oids = hyperliquid.extract_oids(order) if order else []
                         entry_oid = entry_oids[0] if entry_oids else None
 
-                        # Confirm fill — match only fills with the exact entry OID and sum
-                        # partial fills to get the true filled quantity.
+                        # Confirm fill — poll all 3 attempts regardless of whether fills
+                        # were found in an earlier attempt. Each poll may return new
+                        # partial fills for the same OID. A seen-tid set prevents
+                        # double-counting when the same fill appears in multiple polls.
                         filled_qty = 0.0
                         filled = False
+                        _seen_fill_tids: set = set()
                         for _attempt in range(3):
                             await asyncio.sleep(1)
                             try:
                                 fills_check = await hyperliquid.get_recent_fills(limit=30)
                                 for fc in fills_check:
                                     fc_oid = fc.get('oid') or fc.get('orderId')
-                                    if entry_oid and fc_oid and str(fc_oid) == str(entry_oid):
-                                        filled_qty += float(fc.get('sz') or fc.get('size') or 0)
-                                        filled = True
+                                    if not (entry_oid and fc_oid and str(fc_oid) == str(entry_oid)):
+                                        continue
+                                    # Deduplicate by trade ID so re-appearing fills aren't summed twice
+                                    fc_tid = str(fc.get('tid') or fc.get('tradeId') or fc.get('hash') or id(fc))
+                                    if fc_tid in _seen_fill_tids:
+                                        continue
+                                    _seen_fill_tids.add(fc_tid)
+                                    filled_qty += float(fc.get('sz') or fc.get('size') or 0)
+                                    filled = True
                             except Exception:
                                 pass
-                            if filled:
-                                break
+                        # No early break — always complete all 3 polls to capture partial fills
 
                         # Use actual filled quantity for TP/SL sizing.
                         # Fall back to the requested amount for resting limit orders
