@@ -36,6 +36,8 @@ nohup.out
 diary.jsonl
 decisions.jsonl
 prompts.log
+state.json
+state.json.tmp
 
 # Private notes — local only, not for server or GitHub
 DEVNOTES.md
