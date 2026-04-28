@@ -100,14 +100,22 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def check_position_size(self, alloc_usd: float, account_value: float) -> tuple[bool, str]:
-        """Single position cannot exceed max_position_pct of account."""
+        """Single position cannot exceed max_position_pct of leverage-adjusted buying power.
+
+        Buying power = account_value × max_leverage.
+        Max position  = buying_power × max_position_pct / 100.
+
+        Example: $100 account, 5× leverage, 15% cap → $500 buying power → $75 max.
+        The old formula ($100 × 15% = $15) ignored leverage entirely.
+        """
         if account_value <= 0:
             return False, "Account value is zero or negative"
-        max_alloc = account_value * (self.max_position_pct / 100.0)
+        buying_power = account_value * self.max_leverage
+        max_alloc = buying_power * (self.max_position_pct / 100.0)
         if alloc_usd > max_alloc:
             return False, (
                 f"Allocation ${alloc_usd:.2f} exceeds {self.max_position_pct}% "
-                f"of account (${max_alloc:.2f})"
+                f"of buying power ${buying_power:.2f} (max ${max_alloc:.2f})"
             )
         return True, ""
 
@@ -128,11 +136,15 @@ class RiskManager:
             )
         return True, ""
 
-    def check_leverage(self, alloc_usd: float, balance: float) -> tuple[bool, str]:
-        """Effective leverage of new trade cannot exceed max_leverage."""
-        if balance <= 0:
-            return False, "Balance is zero or negative"
-        effective_lev = alloc_usd / balance
+    def check_leverage(self, alloc_usd: float, account_value: float) -> tuple[bool, str]:
+        """Effective leverage of new trade cannot exceed max_leverage.
+
+        effective_leverage = allocation / account_value (equity denominator).
+        Using balance (same as account_value here) was previously named misleadingly.
+        """
+        if account_value <= 0:
+            return False, "Account value is zero or negative"
+        effective_lev = alloc_usd / account_value
         if effective_lev > self.max_leverage:
             return False, (
                 f"Effective leverage {effective_lev:.1f}x exceeds max {self.max_leverage}x"
@@ -184,11 +196,23 @@ class RiskManager:
     TAKER_FEE_PCT = 0.045
 
     def enforce_stop_loss(self, sl_price: float | None, entry_price: float,
-                           is_buy: bool) -> float:
-        """Ensure every trade has a stop-loss. Auto-set if missing."""
+                           is_buy: bool, atr14: float | None = None) -> float:
+        """Ensure every trade has a stop-loss. Auto-set if missing.
+
+        SL distance = max(mandatory_sl_pct% of price, 1.0 × ATR14).
+        A flat-percentage SL can be tighter than actual volatility; using the
+        larger of the two prevents the SL from sitting inside normal price noise.
+        atr14 is optional — falls back to percentage-only when not provided.
+        """
         if sl_price is not None:
             return sl_price
-        sl_distance = entry_price * (self.mandatory_sl_pct / 100.0)
+        pct_distance = entry_price * (self.mandatory_sl_pct / 100.0)
+        atr_distance = float(atr14) if atr14 and atr14 > 0 else 0.0
+        sl_distance = max(pct_distance, atr_distance)
+        logging.info(
+            "RISK: Auto-SL — pct_dist=%.4f atr_dist=%.4f chosen=%.4f",
+            pct_distance, atr_distance, sl_distance,
+        )
         if is_buy:
             return round(entry_price - sl_distance, 2)
         else:
@@ -307,12 +331,11 @@ class RiskManager:
         if not ok:
             return False, reason, trade
 
-        # 3. Position size limit
+        # 3. Position size limit (leverage-aware cap)
         ok, reason = self.check_position_size(alloc_usd, account_value)
         if not ok:
-            # Cap allocation instead of rejecting
-            max_alloc = account_value * (self.max_position_pct / 100.0)
-            # But never below Hyperliquid's $10 minimum
+            # Cap to the leverage-adjusted maximum instead of rejecting outright
+            max_alloc = account_value * self.max_leverage * (self.max_position_pct / 100.0)
             if max_alloc < 11.0:
                 max_alloc = 11.0
             logging.warning("RISK: Capping allocation from $%.2f to $%.2f", alloc_usd, max_alloc)
@@ -324,8 +347,8 @@ class RiskManager:
         if not ok:
             return False, reason, trade
 
-        # 5. Leverage check
-        ok, reason = self.check_leverage(alloc_usd, balance)
+        # 5. Leverage check — uses account_value (equity) as denominator
+        ok, reason = self.check_leverage(alloc_usd, account_value)
         if not ok:
             return False, reason, trade
 
@@ -338,14 +361,14 @@ class RiskManager:
         if not ok:
             return False, reason, trade
 
-        # 7. Enforce mandatory stop-loss
+        # 7. Enforce mandatory stop-loss (ATR-aware minimum distance)
         current_price = float(trade.get("current_price", 0))
         entry_price = current_price if current_price > 0 else 1.0
+        atr14 = trade.get("atr14")  # injected by main.py from asset_ctx long_term_4h
         sl_price = trade.get("sl_price")
-        enforced_sl = self.enforce_stop_loss(sl_price, entry_price, is_buy)
+        enforced_sl = self.enforce_stop_loss(sl_price, entry_price, is_buy, atr14)
         if sl_price is None:
-            logging.info("RISK: Auto-setting SL at %.6f (%.1f%% from entry)",
-                        enforced_sl, self.mandatory_sl_pct)
+            logging.info("RISK: Auto-setting SL at %.6f (atr14=%s)", enforced_sl, atr14)
 
         # 8. Enforce fee-aware take-profit minimum
         tp_price = trade.get("tp_price")

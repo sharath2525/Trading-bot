@@ -749,6 +749,9 @@ def main():
 
                         # --- RISK: Validate trade before execution ---
                         output["current_price"] = current_price
+                        # Inject ATR14 from 4h data so enforce_stop_loss can use
+                        # max(pct_floor, 1×ATR) instead of a flat percentage only.
+                        output["atr14"] = asset_ctx.get("long_term_4h", {}).get("atr14")
                         allowed, reason, output = risk_mgr.validate_trade(
                             output, state, initial_account_value or 0
                         )
