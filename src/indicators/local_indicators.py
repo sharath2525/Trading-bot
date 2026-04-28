@@ -362,35 +362,34 @@ def compute_all(candles: list[dict]) -> dict:
     if not candles:
         return {}
 
-    closes = _closes(candles)
+    closes       = _closes(candles)
     ema20_series = ema(closes, 20)
     ema50_series = ema(closes, 50)
-    rsi7_series = rsi(candles, 7)
     rsi14_series = rsi(candles, 14)
-    macd_data = macd(candles)
-    atr3_series = atr(candles, 3)
+    macd_data    = macd(candles)
     atr14_series = atr(candles, 14)
-    bbands_data = bbands(candles)
-    adx_series = adx(candles)
-    obv_series = obv(candles)
-    vwap_series = vwap(candles)
+    bbands_data  = bbands(candles)
+    adx_series   = adx(candles)
+    obv_series   = obv(candles)
+    vwap_series  = vwap(candles)
+    stoch_data   = stoch_rsi(candles)
 
     return {
-        "ema20": ema20_series,
-        "ema50": ema50_series,
-        "rsi7": rsi7_series,
-        "rsi14": rsi14_series,
-        "macd": macd_data["macd"],
-        "macd_signal": macd_data["signal"],
-        "macd_histogram": macd_data["histogram"],
-        "atr3": atr3_series,
-        "atr14": atr14_series,
-        "bbands_upper": bbands_data["upper"],
+        "ema20":         ema20_series,
+        "ema50":         ema50_series,
+        "rsi14":         rsi14_series,
+        "macd":          macd_data["macd"],
+        "macd_signal":   macd_data["signal"],
+        "macd_histogram":macd_data["histogram"],
+        "atr14":         atr14_series,
+        "bbands_upper":  bbands_data["upper"],
         "bbands_middle": bbands_data["middle"],
-        "bbands_lower": bbands_data["lower"],
-        "adx": adx_series,
-        "obv": obv_series,
-        "vwap": vwap_series,
+        "bbands_lower":  bbands_data["lower"],
+        "adx":           adx_series,
+        "obv":           obv_series,
+        "vwap":          vwap_series,
+        "stoch_rsi_k":   stoch_data["k"],
+        "stoch_rsi_d":   stoch_data["d"],
     }
 
 

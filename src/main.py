@@ -2,25 +2,28 @@
 
 import sys
 import argparse
+import asyncio
+import json
+import logging
+import math
+import os
 import pathlib
+import traceback
 sys.path.append(str(pathlib.Path(__file__).parent.parent))
+
+from aiohttp import web
+from collections import deque
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+
 from src.agent.decision_maker import TradingAgent
+from src.config_loader import CONFIG
 from src.indicators.local_indicators import compute_all, last_n, latest
 from src.risk_manager import RiskManager
-from src.trading.hyperliquid_api import HyperliquidAPI
-import asyncio
-import logging
-from collections import deque, OrderedDict
-from datetime import datetime, timezone
-import math  # For Sharpe
-from dotenv import load_dotenv
-import os
-import json
-from aiohttp import web
-from src.utils.formatting import format_number as fmt, format_size as fmt_sz
-from src.utils.prompt_utils import json_default, round_or_none, round_series
 from src.strategy import entry_confirmed, market_filter
 from src.trade_state import TradeStateMachine
+from src.trading.hyperliquid_api import HyperliquidAPI
+from src.utils.prompt_utils import json_default, round_or_none, round_series
 
 load_dotenv()
 
@@ -71,7 +74,6 @@ def main():
     args = parser.parse_args()
 
     # Allow assets/interval via .env (CONFIG) if CLI not provided
-    from src.config_loader import CONFIG
     assets_env = CONFIG.get("assets")
     interval_env = CONFIG.get("interval")
     if (not args.assets or len(args.assets) == 0) and assets_env:
@@ -91,12 +93,10 @@ def main():
     risk_mgr = RiskManager()
     state_mgr = TradeStateMachine()
 
-
     start_time = datetime.now(timezone.utc)
     invocation_count = 0
-    trade_log = []  # For Sharpe: list of returns
+    trade_log = []   # For Sharpe ratio: list of trade result dicts
     active_trades = []  # {'asset','is_long','amount','entry_price','tp_oid','sl_oid','exit_plan'}
-    recent_events = deque(maxlen=200)
     diary_path = "diary.jsonl"
     decisions_path = "decisions.jsonl"
     initial_account_value = None
@@ -106,7 +106,6 @@ def main():
     print(f"Starting trading agent for assets: {args.assets} at interval: {args.interval}")
 
     def add_event(msg: str):
-        """Log an informational event and push it into the recent events deque."""
         logging.info(msg)
 
     async def run_loop():
@@ -169,8 +168,6 @@ def main():
                 positions_to_close = risk_mgr.check_losing_positions(state.get('positions', []))
                 for ptc in positions_to_close:
                     coin = ptc["coin"]
-                    size = ptc["size"]
-                    is_long = ptc["is_long"]
                     add_event(f"RISK FORCE-CLOSE: {coin} at {ptc['loss_pct']}% loss (PnL: ${ptc['pnl']})")
                     try:
                         # Use market_close — bypasses _order_retry's idempotency pre-flight
@@ -578,20 +575,20 @@ def main():
                     continue
 
             # Single LLM call with all assets
-            context_payload = OrderedDict([
-                ("invocation", {
+            context_payload = {
+                "invocation": {
                     "minutes_since_start": round(minutes_since_start, 2),
                     "current_time": datetime.now(timezone.utc).isoformat(),
-                    "invocation_count": invocation_count
-                }),
-                ("account", dashboard),
-                ("risk_limits", risk_mgr.get_risk_summary()),
-                ("market_data", market_sections),
-                ("instructions", {
+                    "invocation_count": invocation_count,
+                },
+                "account": dashboard,
+                "risk_limits": risk_mgr.get_risk_summary(),
+                "market_data": market_sections,
+                "instructions": {
                     "assets": args.assets,
-                    "requirement": "Decide actions for all assets and return a strict JSON object matching the schema."
-                })
-            ])
+                    "requirement": "Decide actions for all assets and return a strict JSON object matching the schema.",
+                },
+            }
             context = json.dumps(context_payload, default=json_default)
             add_event(f"Combined prompt length: {len(context)} chars for {len(args.assets)} assets")
             _prompts_log = "prompts.log"
@@ -628,7 +625,6 @@ def main():
                     add_event(f"Invalid output format (expected dict): {outputs}")
                     outputs = {}
             except Exception as e:
-                import traceback
                 add_event(f"Agent error: {e}")
                 add_event(f"Traceback: {traceback.format_exc()}")
                 outputs = {}
@@ -636,18 +632,17 @@ def main():
             # Retry once on failure/parse error with a stricter instruction prefix
             if _is_failed_outputs(outputs):
                 add_event("Retrying LLM once due to invalid/parse-error output")
-                context_retry_payload = OrderedDict([
-                    ("retry_instruction", "Return ONLY the JSON array per schema with no prose."),
-                    ("original_context", context_payload)
-                ])
-                context_retry = json.dumps(context_retry_payload, default=json_default)
+                context_retry = json.dumps(
+                    {"retry_instruction": "Return ONLY the JSON array per schema with no prose.",
+                     "original_context": context_payload},
+                    default=json_default,
+                )
                 try:
                     outputs = await asyncio.to_thread(agent.decide_trade, args.assets, context_retry)
                     if not isinstance(outputs, dict):
                         add_event(f"Retry invalid format: {outputs}")
                         outputs = {}
                 except Exception as e:
-                    import traceback
                     add_event(f"Retry agent error: {e}")
                     add_event(f"Retry traceback: {traceback.format_exc()}")
                     outputs = {}
@@ -899,7 +894,6 @@ def main():
                     else:
                         add_event(f"Hold {asset}: {output.get('rationale', '')}")
                 except Exception as e:
-                    import traceback
                     add_event(f"Execution error {asset}: {e}")
                     add_event(f"Traceback: {traceback.format_exc()}")
 
@@ -1061,11 +1055,10 @@ def main():
         # Pass cors_middleware here so every response gets CORS headers
         app = web.Application(middlewares=[cors_middleware])
         await start_api(app)
-        from src.config_loader import CONFIG as CFG
         runner = web.AppRunner(app)
         await runner.setup()
-        port = int(CFG.get("api_port"))
-        site = web.TCPSite(runner, CFG.get("api_host"), port)
+        port = int(CONFIG.get("api_port"))
+        site = web.TCPSite(runner, CONFIG.get("api_host"), port)
         await site.start()
         logging.info(f"API server started at http://localhost:{port}")
         await run_loop()

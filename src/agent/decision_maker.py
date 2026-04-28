@@ -382,8 +382,13 @@ class TradingAgent:
                     from src.indicators.local_indicators import atr as _atr
                     series = _atr(candles, period)
                     result = {"latest": latest(series), "series": last_n(series, 10), "period": period}
+                elif indicator == "stoch_rsi":
+                    result = {
+                        "k": {"latest": latest(all_indicators.get("stoch_rsi_k", [])), "series": last_n(all_indicators.get("stoch_rsi_k", []), 10)},
+                        "d": {"latest": latest(all_indicators.get("stoch_rsi_d", [])), "series": last_n(all_indicators.get("stoch_rsi_d", []), 10)},
+                    }
                 else:
-                    key_map = {"adx": "adx", "obv": "obv", "vwap": "vwap", "stoch_rsi": "stoch_rsi"}
+                    key_map = {"adx": "adx", "obv": "obv", "vwap": "vwap"}
                     mapped = key_map.get(indicator, indicator)
                     series = all_indicators.get(mapped, [])
                     result = {"latest": latest(series) if isinstance(series, list) else series,

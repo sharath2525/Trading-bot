@@ -109,7 +109,4 @@ CONFIG = {
     "max_trade_hours": _get_int("MAX_TRADE_HOURS", 12),
     "min_trade_score": _get_int("MIN_TRADE_SCORE", 7),
 
-    # Legacy / optional
-    "taapi_api_key": _get_env("TAAPI_API_KEY"),
-    "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),
 }
