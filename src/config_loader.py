@@ -82,6 +82,7 @@ CONFIG = {
     "sanitize_model": _get_env("SANITIZE_MODEL", "claude-haiku-4-5-20251001"),
     "max_tokens": _get_int("MAX_TOKENS", 4096),
     "enable_tool_calling": _get_bool("ENABLE_TOOL_CALLING", False),
+    "max_tool_iterations": _get_int("MAX_TOOL_ITERATIONS", 3),
 
     # Extended thinking (Claude)
     "thinking_enabled": _get_bool("THINKING_ENABLED", False),
@@ -102,11 +103,31 @@ CONFIG = {
     "min_balance_reserve_pct": _get_env("MIN_BALANCE_RESERVE_PCT", "10"),
 
     # API server
-    "api_host": _get_env("API_HOST", "0.0.0.0"),
+    "api_host": _get_env("API_HOST", "127.0.0.1"),
     "api_port": _get_env("APP_PORT") or _get_env("API_PORT") or "3000",
 
     # Time-based exit and scoring thresholds
     "max_trade_hours": _get_int("MAX_TRADE_HOURS", 12),
-    "min_trade_score": _get_int("MIN_TRADE_SCORE", 7),
+    "min_trade_score": _get_int("MIN_TRADE_SCORE", 3),    # 0-5 scale used by entry_confirmed()
+    "min_signal_score": _get_int("MIN_SIGNAL_SCORE", 7),  # 0-10 weighted pre-gate in main.py
+
+    # Execution reality + frequency control
+    "taker_fee_pct": float(_get_env("TAKER_FEE_PCT", "0.00045")),  # 0.045% per side
+    "cooldown_minutes": _get_int("COOLDOWN_MINUTES", 60),           # minutes blocked after SL hit
+    "max_daily_trades": _get_int("MAX_DAILY_TRADES", 10),           # hard cap per UTC day
+
+    # AI analysis controls — THREE separate score keys, never merge
+    # MIN_TRADE_SCORE (0-5 int): entry_confirmed() gate in strategy.py
+    # MIN_SIGNAL_SCORE (0-10 float): main loop pre-gate
+    # MIN_AI_SCORE (0-10 float): Claude market analysis trigger — this key
+    "min_ai_score": float(_get_env("MIN_AI_SCORE", "7")),                       # Score threshold to trigger Claude analysis
+    "news_fetch_enabled": _get_bool("NEWS_FETCH_ENABLED", True),                # Toggle macro RSS fetching
+    "ai_max_tokens": _get_int("AI_MAX_TOKENS", 4000),                           # Max tokens for Claude full market analysis
+    "ai_approve_cache_minutes": _get_int("AI_APPROVE_CACHE_MINUTES", 60),       # Minutes an APPROVE verdict is cached
+    "ai_reject_cache_minutes": _get_int("AI_REJECT_CACHE_MINUTES", 30),         # Minutes a REJECT verdict is cached (shorter)
+    "confluence_require_30m": _get_bool("CONFLUENCE_REQUIRE_30M", True),        # Require 30m TF in confluence gate
+    "ai_stale_tf_minutes": _get_int("AI_STALE_TF_MINUTES", 55),                # Max age of higher-TF data for inner ticks
+    "min_ai_call_gap_minutes": _get_int("MIN_AI_CALL_GAP_MINUTES", 30),        # Hard minimum gap between Claude calls per asset
+    "adx_half_size_threshold": _get_int("ADX_HALF_SIZE_THRESHOLD", 20),        # ADX below this → position size halved when score < 9
 
 }

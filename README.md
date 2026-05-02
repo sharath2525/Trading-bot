@@ -1,30 +1,43 @@
 # Hyperliquid AI Trading Agent
 
-An AI-powered perpetual futures trading bot that uses Claude (Haiku) to analyze markets and execute trades on Hyperliquid. Runs on a 1-hour decision cycle trading BTC and ETH.
+> **Architecture: CODE-FIRST HYBRID** — Technical analysis signals drive all decisions. Claude AI is called only as a final sanity check on the highest-confidence (score = 10/10) setups. All direction, sizing, TP, and SL are set by code.
+>
+> All 22 fixes applied as of 2026-04-30. Permanent architecture rules: see `MASTER_RULES.md`.
+
+A code-first perpetual futures trading bot on Hyperliquid with a 1h outer loop / 5m inner loop. Claude Haiku is called only when the weighted signal score == 10 and returns a single word (APPROVE or REJECT).
 
 ## What It Does
 
-1. Fetches 1h + 4h + **15m + 5m** candle data and computes all technical indicators locally
+1. **Outer loop (every 1h):** fetches account state, 4h/1h/15m/5m candles, computes all indicators locally
 2. Computes trend labels locally: `EMA20 > EMA50` on 4h = BULLISH, `EMA20 < EMA50` = BEARISH
-3. Sends compact market context to Claude, which decides buy/sell/hold for each asset
-4. **Spread filter** blocks entry if bid/ask spread > 0.15% (illiquid market protection)
-5. **15m/5m entry confirmation** blocks overextended entries — waits for pullback to EMA20 and 5m trigger
-6. Executes trades with take-profit and stop-loss trigger orders placed immediately after entry
-7. **Time-based exit** force-closes trades open > 12h with no progress (prevents capital lock)
-8. Hard-coded safety guards enforce position limits, leverage caps, and loss protection
+3. **Inner loop (every 5m × 12):** refreshes 5m candles, re-runs the full scoring pipeline
+4. **4h hard gate:** direction must align with `trend_4h` — counter-trend trades never happen
+5. **Weighted score gate (0–10):** score < 7 → HOLD; score 7–8.5 → execute directly; score == 10 → Claude APPROVE/REJECT
+6. **Code computes all trade parameters:** direction, TP = entry + 2×ATR, SL = entry − 1×ATR, size = 1% risk rule
+7. **Claude (score == 10 only):** receives a ~150-token context, returns APPROVE or REJECT — nothing else
+8. Executes trades with take-profit and stop-loss trigger orders placed immediately after entry
+9. **Time-based exit** force-closes trades open > 12h with no progress (prevents capital lock)
+10. Hard-coded safety guards enforce position limits, leverage caps, daily cap, and loss protection
 
-## Signal Logic
+## Signal Logic (Code-First, 0–10 Weighted Score)
 
-Trend direction is determined locally before Claude sees the data:
+Direction is determined entirely by code. Claude never sets direction.
 
 | Signal | BULLISH | BEARISH |
 |--------|---------|---------|
-| `trend_4h` (primary) | EMA20 > EMA50 on 4h | EMA20 < EMA50 on 4h |
-| `trend_1h` (confirmation) | EMA20 > EMA50 on 1h | EMA20 < EMA50 on 1h |
-| `momentum_4h` | MACD histogram > 0 | MACD histogram < 0 |
-| RSI14 | > 50 | < 50 |
+| `trend_4h` (hard gate + weight 3.0) | EMA20 > EMA50 on 4h | EMA20 < EMA50 on 4h |
+| `trend_1h` (weight 2.0) | EMA20 > EMA50 on 1h | EMA20 < EMA50 on 1h |
+| `MACD_15m` (weight 2.0) | histogram > 0.1% of price | histogram < -0.1% of price |
+| `near_ema` (weight 1.5) | price within 0.3% of 15m EMA20 | same |
+| `trigger_5m` (weight 1.5) | bullish candle OR macd_5m > 0 | bearish OR macd_5m < 0 |
 
-Both 4h trend and 1h trend must agree to enter. Counter-trend trades require strong contrary evidence.
+**Score tiers:** `< 7.0` → HOLD (no trade, no Claude) · `7.0–8.5` → execute directly · `== 10.0` → Claude APPROVE/REJECT first
+
+**4h hard gate:** if `trend_4h` conflicts with intended direction → HOLD immediately (score not even computed).
+
+**Score 9 is mathematically unreachable** with the above weights. Achievable values: 0, 1.5, 2, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8, 8.5, 10.
+
+**Allocation scales with score:** `size = 1%-risk-rule × (score / 10)` — score-7 → 70%, score-10 → 100%.
 
 ## Safety Guards
 
@@ -37,7 +50,7 @@ All enforced in code before execution. Configured via `.env`:
 | Total Exposure | 50% | All positions combined capped at 50% |
 | Daily Circuit Breaker | 12% | Stops new trades at 12% daily drawdown |
 | Mandatory Stop-Loss | 3% | Auto-set SL if LLM omits one |
-| Force Close | 20% | Auto-close positions at 20% loss |
+| Force Close | 8% | Auto-close positions at 8% loss (`MAX_LOSS_PER_POSITION_PCT`) |
 | Max Positions | 2 | Concurrent position limit |
 | Balance Reserve | 20% | Don't trade below 20% of initial balance |
 
@@ -66,21 +79,30 @@ Required environment variables:
 
 Recommended `.env` for a small account:
 ```env
-ASSETS="BTC ETH"
+ASSETS="BTC ETH SOL"
 INTERVAL=1h
 LLM_MODEL=claude-haiku-4-5-20251001
 MAX_TOKENS=1200
 ENABLE_TOOL_CALLING=false
-ENABLE_CLAUDE_COMMENTARY=false
-MIN_TRADE_SCORE=7
 MAX_TRADE_HOURS=12
+
+# Score system (two separate keys — do not merge)
+MIN_TRADE_SCORE=3        # Used ONLY by entry_confirmed() — old 0-5 integer system
+MIN_SIGNAL_SCORE=7       # Used ONLY by main loop pre-gate — new 0-10 weighted float system
+
+# Execution controls (new)
+TAKER_FEE_PCT=0.00045    # 0.045% per side (Hyperliquid taker fee)
+COOLDOWN_MINUTES=60      # Minutes to block re-entry after SL hit on any asset
+MAX_DAILY_TRADES=10      # Hard cap: max executed trades per UTC calendar day
+
+# Risk management
 MAX_POSITION_PCT=15
 MAX_LEVERAGE=3
 MAX_TOTAL_EXPOSURE_PCT=50
 MAX_LOSS_PER_POSITION_PCT=8
 DAILY_LOSS_CIRCUIT_BREAKER_PCT=12
 MANDATORY_SL_PCT=3
-MAX_CONCURRENT_POSITIONS=2
+MAX_CONCURRENT_POSITIONS=3
 MIN_BALANCE_RESERVE_PCT=20
 ```
 
@@ -127,19 +149,33 @@ src/
 
 ## Trading Loop
 
-Each 1h iteration:
-1. Fetch account state (balance, positions, PnL)
-2. Force-close any position at ≥ 8% loss
-3. **Time-based exit**: force-close any trade open > 12h with no TP hit
-4. Fetch 1h + 4h + **15m + 5m** candles, compute indicators locally
-5. Calculate spread from cached metadata (no extra API call)
-6. Send compact context to Claude (≈1,000 tokens, cached system prompt)
-7. Claude returns buy/sell/hold with allocation, TP/SL
-8. **Spread filter**: block if spread > 0.15%
-9. **Entry confirmation**: block if 15m/5m don't confirm the 1h direction
-10. Risk manager validates each trade (caps allocation, enforces SL/TP)
-11. Execute approved trades (limit orders preferred, TP+SL placed immediately)
-12. Record entry time in state machine for timeout tracking
+### Outer Loop (every 1 hour)
+1. Fetch account state (balance, positions, fills)
+2. Force-close any position at ≥ MAX_LOSS_PER_POSITION_PCT loss
+3. TP/SL guardian — re-place missing trigger orders for ENTERED positions
+4. Time-based exit — force-close trades open > MAX_TRADE_HOURS (12h)
+5. Fetch 1d + 4h + 1h + 15m + 5m candles per asset, compute all indicators locally
+6. Reset daily trade counter at UTC midnight
+
+### Inner Loop (runs 11 more times at 5m intervals = 12 ticks/hour total)
+For each asset on every 5m tick:
+1. **4h hard gate** (`_code_decide_direction`) — HOLD if trend_4h conflicts or UNKNOWN
+2. **Weighted score gate** (`compute_signal_score`) — HOLD if score < MIN_SIGNAL_SCORE (7)
+3. **Daily cap** — HOLD if `_daily_trade_count >= MAX_DAILY_TRADES`
+4. **SL cooldown** — HOLD if asset is within COOLDOWN_MINUTES of last stop-loss hit
+5. **Market filter** — HOLD if ATR spike > 5% or spread > 0.15%
+6. **Entry confirmation** — HOLD if 15m/5m don't confirm (RSI, ADX, volume, MIN_TRADE_SCORE)
+7. **Code computes parameters** — TP = entry + 2×ATR, SL = entry − 1×ATR, size = 1%-risk × (score/10)
+8. **Claude confirm** (score == 10 ONLY) — calls `confirm_trade()`, must return APPROVE
+9. **Risk manager** — validates all 8 guards via `validate_trade()`
+10. **Execute** — market order + TP trigger + SL trigger
+
+### Execution Order (strict)
+```
+4h hard gate → score gate → daily cap → SL cooldown → market_filter
+  → entry_confirmed → code computes params → [score==10] Claude APPROVE/REJECT
+    → risk_manager.validate_trade → execute_trade
+```
 
 ## API Endpoints
 
@@ -151,11 +187,13 @@ When running, serves a local HTTP API on port 3000:
 
 ## API Cost
 
-- Model: `claude-haiku-4-5-20251001`
-- Tokens per call: ~1,000 input (with prompt cache hit), ~400 output
-- Cost per call: ~$0.0016
-- Cost at 1h interval, 2 assets: ~$0.03/day (~$1/month)
-- System prompt is cached (ephemeral cache_control) — effective from 2nd call onward
+**Before redesign (Claude every cycle, all assets):**
+- ~720 calls/month at ~$0.005/call = **~$3.60–7.20/month**
+
+**After redesign (Claude only for score == 10):**
+- ~5–20 confirmations/month at ~$0.00016/call = **~$0.003/month**
+- Model: `claude-haiku-4-5-20251001`, `max_tokens=10`
+- If monthly API cost exceeds $1, something is calling Claude every cycle — check main.py
 
 ## License
 

@@ -48,7 +48,9 @@ class HyperliquidAPI:
                 configuration.
         """
         self._meta_cache = None
-        self._hip3_meta_cache = {}  # {dex_name: meta_response}
+        self._meta_cache_ts: float = 0.0
+        self._hip3_meta_cache: dict = {}  # {dex_name: meta_response}
+        self._hip3_meta_cache_ts: dict = {}  # {dex_name: fetch timestamp}
         if "hyperliquid_private_key" in CONFIG and CONFIG["hyperliquid_private_key"]:
             self.wallet = Account.from_key(CONFIG["hyperliquid_private_key"])
         elif "mnemonic" in CONFIG and CONFIG["mnemonic"]:
@@ -171,19 +173,12 @@ class HyperliquidAPI:
     async def _order_retry(self, fn, asset: str, is_buy: bool):
         """Retry-safe order placement with idempotency guard.
 
-        On the first attempt the order is placed normally.  After any connection
-        or timeout failure, ``_check_order_landed`` queries open orders and
-        recent fills before attempting again.  If the original order is already
-        on the exchange the retry is skipped and ``{"status": "already_placed"}``
-        is returned so the caller can treat it as a successful no-op.
+        On the first attempt the order is placed without any pre-flight check.
+        After any connection or timeout failure, ``_check_order_landed`` queries
+        open orders and recent fills before retrying.  If the original order is
+        already on the exchange the retry is skipped and
+        ``{"status": "already_placed"}`` is returned.
         """
-        # BUG 3 FIX: Pre-flight check before attempt 0 — if already on exchange, skip entirely
-        if await self._check_order_landed(asset, is_buy):
-            logging.info(
-                "[IDEMPOTENT] pre-flight: %s %s already on exchange — skipping",
-                "BUY" if is_buy else "SELL", asset,
-            )
-            return {"status": "already_placed"}
         last_err = None
         for attempt in range(3):
             try:
@@ -232,11 +227,12 @@ class HyperliquidAPI:
         # Check HIP-3 dex cache
         if ":" in asset:
             dex = asset.split(":")[0]
+            asset_short = asset.split(":")[-1]  # API returns short name e.g. "GOLD" not "xyz:GOLD"
             dex_data = self._hip3_meta_cache.get(dex) if hasattr(self, '_hip3_meta_cache') else None
             if dex_data and isinstance(dex_data, list) and len(dex_data) >= 1:
                 dex_meta = dex_data[0]  # [meta_dict, asset_ctxs_list]
                 universe = dex_meta.get("universe", [])
-                asset_info = next((u for u in universe if u.get("name") == asset), None)
+                asset_info = next((u for u in universe if u.get("name") == asset_short), None)
                 if asset_info:
                     decimals = asset_info.get("szDecimals", 8)
                     return round(amount, decimals)
@@ -383,8 +379,49 @@ class HyperliquidAPI:
         return await self._trigger_order_retry(lambda: self.exchange.order(asset, not is_buy, amount, sl_price, order_type, True), asset, tpsl_type="sl")
 
     async def market_close(self, asset: str, slippage: float = 0.01):
-        """Close the entire open position for asset at market price."""
-        return await self._retry(lambda: self.exchange.market_close(asset, None, slippage))
+        """Close the entire open position for asset at market price.
+
+        Idempotency-aware: checks whether the position is already flat before
+        each retry so a lost response never triggers a reverse position.
+        """
+        last_err = None
+        for attempt in range(3):
+            try:
+                return await asyncio.to_thread(
+                    lambda: self.exchange.market_close(asset, None, slippage)
+                )
+            except (WebSocketConnectionClosedException, aiohttp.ClientError,
+                    ConnectionError, TimeoutError, socket.timeout) as e:
+                last_err = e
+                logging.warning("[CLOSE] %s attempt %d/3 failed: %s", asset, attempt + 1, e)
+                self._reset_clients()
+                try:
+                    raw = await asyncio.to_thread(
+                        lambda: self.info.user_state(self.query_address)
+                    )
+                    pos_flat = not any(
+                        abs(float((p.get("position") or p).get("szi", 0) or 0)) > 1e-8
+                        and (p.get("position") or p).get("coin") == asset
+                        for p in raw.get("assetPositions", [])
+                    )
+                    if pos_flat:
+                        logging.info(
+                            "[CLOSE] %s already flat after attempt %d — treating as closed",
+                            asset, attempt + 1,
+                        )
+                        return {"status": "already_closed"}
+                except Exception as _ce:
+                    logging.warning("[CLOSE] position check failed for %s: %s — will retry", asset, _ce)
+                await asyncio.sleep(0.5 * (2 ** attempt))
+            except (RuntimeError, ValueError, KeyError, AttributeError) as e:
+                last_err = e
+                logging.warning("[CLOSE] unexpected error attempt %d/3: %s", attempt + 1, e)
+                if attempt == 0:
+                    self._reset_clients()
+                    await asyncio.sleep(0.5)
+                    continue
+                break
+        raise last_err if last_err else RuntimeError(f"market_close({asset}) failed after retries")
 
     async def cancel_order(self, asset, oid):
         """Cancel a single order by identifier for a given asset.
@@ -453,7 +490,12 @@ class HyperliquidAPI:
             else:
                 return []
             if isinstance(fills, list):
-                return fills[-limit:]
+                fills_sorted = sorted(
+                    fills,
+                    key=lambda x: x.get("time") or x.get("timestamp") or 0,
+                    reverse=True,
+                )
+                return fills_sorted[:limit]
             return []
         except (RuntimeError, ValueError, KeyError, ConnectionError, AttributeError) as e:
             logging.error("Get recent fills error: %s", e)
@@ -512,11 +554,12 @@ class HyperliquidAPI:
         except Exception as e:
             logging.warning("spot balance fetch failed: %s", e)
 
-        # spot_user_state "total" includes USDC locked in isolated positions,
-        # so perps_value (isolated margin equity) is already counted inside spot_usdc.
-        # Adding both would double-count. Use spot_usdc as the primary; fall back
-        # to perps_value only when spot is empty (cross-margin-only accounts).
-        total_value = spot_usdc if spot_usdc > 0 else perps_value
+        # Prefer marginSummary.accountValue (perps_value) as the primary balance
+        # because it includes unrealized PnL from open perp positions.
+        # For cross-margin accounts, spot_usdc alone omits in-flight PnL and
+        # would cause the risk manager to undersize follow-on trades.
+        # Fall back to spot_usdc only when perps shows zero (spot-only accounts).
+        total_value = perps_value if perps_value > 0 else spot_usdc
 
         logging.info(
             "[BALANCE] perps=%.2f spot_usdc=%.2f total=%.2f",
@@ -578,8 +621,10 @@ class HyperliquidAPI:
             mids = await self._retry(self.info.all_mids)
         return float(mids.get(asset, 0.0))
 
+    _META_CACHE_TTL = 6 * 3600  # refresh contract specs every 6 hours
+
     async def get_meta_and_ctxs(self, dex=None):
-        """Return cached meta/context information, fetching once per lifecycle.
+        """Return cached meta/context information with a 6-hour TTL.
 
         Args:
             dex: Optional HIP-3 dex name (e.g. "xyz"). None for main dex.
@@ -587,19 +632,21 @@ class HyperliquidAPI:
         Returns:
             Cached metadata response.
         """
+        now = time.time()
         if dex:
-            if dex not in self._hip3_meta_cache:
+            age = now - self._hip3_meta_cache_ts.get(dex, 0)
+            if dex not in self._hip3_meta_cache or age > self._META_CACHE_TTL:
                 response = await self._retry(
                     lambda: self.info.post("/info", {"type": "metaAndAssetCtxs", "dex": dex})
                 )
                 if isinstance(response, list) and len(response) >= 2:
                     self._hip3_meta_cache[dex] = response
-                    # Also cache the meta separately for round_size
-                    # Store as {dex: {"universe": [...]}}
+                    self._hip3_meta_cache_ts[dex] = now
             return self._hip3_meta_cache.get(dex)
-        if not self._meta_cache:
+        if not self._meta_cache or (now - self._meta_cache_ts) > self._META_CACHE_TTL:
             response = await self._retry(self.info.meta_and_asset_ctxs)
             self._meta_cache = response
+            self._meta_cache_ts = now
         return self._meta_cache
 
     async def get_open_interest(self, asset):

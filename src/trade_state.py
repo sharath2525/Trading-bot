@@ -17,6 +17,29 @@ _STATE_FILE = os.path.join(
     "state.json",
 )
 
+ACTIVE_TRADES_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "active_trades.json",
+)
+
+
+def save_active_trades(active_trades: list) -> None:
+    try:
+        with open(ACTIVE_TRADES_FILE, "w") as f:
+            json.dump(active_trades, f, default=str)
+    except Exception as e:
+        logging.warning("[STATE] failed to save active_trades.json: %s", e)
+
+
+def load_active_trades() -> list:
+    if os.path.exists(ACTIVE_TRADES_FILE):
+        try:
+            with open(ACTIVE_TRADES_FILE) as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning("[STATE] failed to load active_trades.json: %s — starting fresh", e)
+    return []
+
 
 class TradeStateMachine:
     """Per-asset state tracking for the trading bot."""

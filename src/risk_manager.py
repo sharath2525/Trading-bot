@@ -128,7 +128,7 @@ class RiskManager:
             entry = float(pos.get("entry_price") or pos.get("entryPx") or 0)
             current_exposure += qty * entry
         total = current_exposure + new_alloc
-        max_exposure = account_value * (self.max_total_exposure_pct / 100.0)
+        max_exposure = account_value * self.max_leverage * (self.max_total_exposure_pct / 100.0)
         if total > max_exposure:
             return False, (
                 f"Total exposure ${total:.2f} would exceed {self.max_total_exposure_pct}% "
@@ -188,6 +188,24 @@ class RiskManager:
             )
         return True, ""
 
+    def atr_position_size(self, account_value: float, entry_price: float,
+                           sl_price: float, risk_pct: float = 1.0) -> float:
+        """Compute maximum position size using the fixed-risk (1% rule) method.
+
+        Maximum dollar loss if SL is hit = account_value * risk_pct / 100.
+        That loss divided by the SL distance per unit gives the notional size.
+
+        Returns float('inf') when inputs are invalid so callers can skip the
+        ATR cap without a special-case branch.
+        """
+        if entry_price <= 0 or sl_price <= 0:
+            return float("inf")
+        sl_distance_pct = abs(entry_price - sl_price) / entry_price
+        if sl_distance_pct <= 0:
+            return float("inf")
+        risk_usd = account_value * (risk_pct / 100.0)
+        return risk_usd / sl_distance_pct
+
     # ------------------------------------------------------------------
     # Stop-loss / Take-profit enforcement
     # ------------------------------------------------------------------
@@ -219,22 +237,32 @@ class RiskManager:
             return round(entry_price + sl_distance, 2)
 
     def enforce_take_profit(self, tp_price: float | None, entry_price: float,
-                             is_buy: bool) -> float:
-        """Ensure TP covers round-trip fees plus a minimum net profit (3× fees)."""
-        # round-trip fee = 2 × taker_fee; require at least 3× to clear fees with profit
-        min_profit_pct = self.TAKER_FEE_PCT * 2 * 3  # = 0.27 %
-        min_distance = entry_price * (min_profit_pct / 100.0)
+                             is_buy: bool, atr14: float | None = None) -> float:
+        """Ensure TP covers fees AND is at least 1.5×ATR from entry for a real R:R ratio.
+
+        min_distance = max(0.27% fee floor, 1.5 × ATR14).
+        A flat fee-only floor produces R:R of ~1:0.09 on BTC; the ATR floor
+        ensures TP sits outside normal noise and gives a meaningful reward target.
+        """
+        min_profit_pct = self.TAKER_FEE_PCT * 2 * 3  # 0.27% fee floor
+        fee_distance = entry_price * (min_profit_pct / 100.0)
+        atr_distance = float(atr14) * 1.5 if atr14 and atr14 > 0 else 0.0
+        min_distance = max(fee_distance, atr_distance)
         if is_buy:
             min_tp = round(entry_price + min_distance, 6)
             if tp_price is None or tp_price < min_tp:
-                logging.info("RISK: TP adjusted to %.6f to cover fees (min %.4f%% from entry)",
-                             min_tp, min_profit_pct)
+                logging.info(
+                    "RISK: TP adjusted to %.6f (fee_dist=%.4f atr_dist=%.4f chosen=%.4f)",
+                    min_tp, fee_distance, atr_distance, min_distance,
+                )
                 return min_tp
         else:
             max_tp = round(entry_price - min_distance, 6)
             if tp_price is None or tp_price > max_tp:
-                logging.info("RISK: TP adjusted to %.6f to cover fees (min %.4f%% from entry)",
-                             max_tp, min_profit_pct)
+                logging.info(
+                    "RISK: TP adjusted to %.6f (fee_dist=%.4f atr_dist=%.4f chosen=%.4f)",
+                    max_tp, fee_distance, atr_distance, min_distance,
+                )
                 return max_tp
         return tp_price
 
@@ -321,6 +349,13 @@ class RiskManager:
         positions = account_state.get("positions", [])
         is_buy = action == "buy"
 
+        # Extract prices early — needed for ATR-based sizing before the pct cap check.
+        # sl_price may already be set by the ATR pre-processor in main.py; if not, it
+        # will be enforced at step 7 and the ATR sizing falls back to the pct cap only.
+        current_price = float(trade.get("current_price", 0))
+        entry_price = current_price if current_price > 0 else 1.0
+        sl_price_early = trade.get("sl_price")
+
         # 1. Daily drawdown circuit breaker
         ok, reason = self.check_daily_drawdown(account_value)
         if not ok:
@@ -331,14 +366,38 @@ class RiskManager:
         if not ok:
             return False, reason, trade
 
-        # 3. Position size limit (leverage-aware cap)
-        ok, reason = self.check_position_size(alloc_usd, account_value)
-        if not ok:
-            # Cap to the leverage-adjusted maximum instead of rejecting outright
-            max_alloc = account_value * self.max_leverage * (self.max_position_pct / 100.0)
+        # 3. ATR-based sizing + leverage-adjusted percentage cap — most restrictive wins.
+        #    ATR sizing: risk exactly 1% of account if SL is hit, regardless of volatility.
+        #    Pct cap: hard ceiling from MAX_POSITION_PCT × buying power.
+        #    Claude's proposal is also a candidate — we take the minimum of all three.
+        buying_power = account_value * self.max_leverage
+        pct_cap = buying_power * (self.max_position_pct / 100.0)
+
+        if sl_price_early is not None and entry_price > 0:
+            atr_sized = self.atr_position_size(account_value, entry_price, float(sl_price_early))
+            max_alloc = min(pct_cap, atr_sized)
+            sizing_label = f"pct_cap=${pct_cap:.2f} atr_sized=${atr_sized:.2f}"
+        elif entry_price > 0:
+            # LLM omitted SL — compute provisional SL so we can apply 1% risk rule
+            if is_buy:
+                provisional_sl = entry_price * (1 - self.mandatory_sl_pct / 100)
+            else:
+                provisional_sl = entry_price * (1 + self.mandatory_sl_pct / 100)
+            atr_sized = self.atr_position_size(account_value, entry_price, provisional_sl)
+            max_alloc = min(pct_cap, atr_sized)
+            sizing_label = f"pct_cap=${pct_cap:.2f} atr_sized=${atr_sized:.2f} (provisional SL at {provisional_sl:.4f})"
+            logging.info("No SL from LLM — sized using provisional SL at %.4f", provisional_sl)
+        else:
+            max_alloc = pct_cap
+            sizing_label = f"pct_cap=${pct_cap:.2f} (no sl_price, no entry_price — pct only)"
+
+        if alloc_usd > max_alloc:
             if max_alloc < 11.0:
                 max_alloc = 11.0
-            logging.warning("RISK: Capping allocation from $%.2f to $%.2f", alloc_usd, max_alloc)
+            logging.warning(
+                "RISK: Capping allocation from $%.2f to $%.2f (%s)",
+                alloc_usd, max_alloc, sizing_label,
+            )
             alloc_usd = max_alloc
             trade = {**trade, "allocation_usd": alloc_usd}
 
@@ -362,17 +421,16 @@ class RiskManager:
             return False, reason, trade
 
         # 7. Enforce mandatory stop-loss (ATR-aware minimum distance)
-        current_price = float(trade.get("current_price", 0))
-        entry_price = current_price if current_price > 0 else 1.0
+        # entry_price already extracted above; re-read sl_price in case step 3 mutated trade
         atr14 = trade.get("atr14")  # injected by main.py from asset_ctx long_term_4h
         sl_price = trade.get("sl_price")
         enforced_sl = self.enforce_stop_loss(sl_price, entry_price, is_buy, atr14)
         if sl_price is None:
             logging.info("RISK: Auto-setting SL at %.6f (atr14=%s)", enforced_sl, atr14)
 
-        # 8. Enforce fee-aware take-profit minimum
+        # 8. Enforce ATR-aware take-profit minimum (falls back to fee floor when atr14 absent)
         tp_price = trade.get("tp_price")
-        enforced_tp = self.enforce_take_profit(tp_price, entry_price, is_buy)
+        enforced_tp = self.enforce_take_profit(tp_price, entry_price, is_buy, atr14)
 
         trade = {**trade, "sl_price": enforced_sl, "tp_price": enforced_tp}
 

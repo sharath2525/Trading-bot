@@ -229,12 +229,14 @@ def stoch_rsi(candles: list[dict], rsi_period: int = 14, stoch_period: int = 14,
     valid_k_smoothed = [v for v in k_line if v is not None]
     d_line = sma(valid_k_smoothed, d_smooth) if len(valid_k_smoothed) >= d_smooth else [None] * len(valid_k_smoothed)
 
-    # Pad to original length
-    pad = len(rsi_vals) - len(valid_rsi)
-    full_k: list[float | None] = [None] * (pad + (len(valid_rsi) - len(valid_k)) + (len(valid_k) - len(k_line)))
-    full_k.extend(k_line)
-    full_d: list[float | None] = [None] * (len(rsi_vals) - len(d_line))
-    full_d.extend(d_line)
+    # Pad to original length with hard trims to prevent length mismatches
+    pad_k = max(0, len(rsi_vals) - len(k_line))
+    full_k: list[float | None] = ([None] * pad_k) + k_line
+    full_k = full_k[:len(rsi_vals)]  # hard trim
+
+    pad_d = max(0, len(rsi_vals) - len(d_line))
+    full_d: list[float | None] = ([None] * pad_d) + d_line
+    full_d = full_d[:len(rsi_vals)]  # hard trim
 
     return {"k": full_k, "d": full_d}
 
@@ -331,18 +333,37 @@ def obv(candles: list[dict]) -> list[float]:
 # ---------------------------------------------------------------------------
 
 def vwap(candles: list[dict]) -> list[float | None]:
-    """Cumulative VWAP (resets not implemented — suitable for intraday)."""
-    cum_vol = 0.0
+    """Session-anchored VWAP that resets at UTC midnight each day.
+
+    Candle dicts use keys: t (epoch ms), high, low, close, volume.
+    Resetting per session makes VWAP meaningful as intraday support/resistance
+    rather than an ever-drifting cumulative from the first fetched candle.
+    Falls back to typical price when volume is zero.
+    """
+    from datetime import datetime, timezone as _tz
     cum_tp_vol = 0.0
+    cum_vol = 0.0
+    prev_date = None
     result: list[float | None] = []
     for c in candles:
+        # Parse UTC date from candle timestamp (milliseconds)
+        try:
+            dt = datetime.fromtimestamp(c["t"] / 1000.0, tz=_tz.utc)
+            current_date = dt.date()
+        except (KeyError, TypeError, OSError):
+            current_date = None
+
+        # Reset accumulators at each new UTC day
+        if current_date is not None and prev_date is not None and current_date != prev_date:
+            cum_tp_vol = 0.0
+            cum_vol = 0.0
+        prev_date = current_date
+
         tp = (c["high"] + c["low"] + c["close"]) / 3.0
-        cum_vol += c["volume"]
-        cum_tp_vol += tp * c["volume"]
-        if cum_vol > 0:
-            result.append(round(cum_tp_vol / cum_vol, 6))
-        else:
-            result.append(None)
+        vol = c["volume"]
+        cum_tp_vol += tp * vol
+        cum_vol += vol
+        result.append(round(cum_tp_vol / cum_vol if cum_vol > 0 else tp, 6))
     return result
 
 
