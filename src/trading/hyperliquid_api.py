@@ -490,6 +490,10 @@ class HyperliquidAPI:
             else:
                 return []
             if isinstance(fills, list):
+                for f in fills:
+                    if "is_buy" not in f and "isBuy" not in f:
+                        side = f.get("side") or f.get("dir", "")
+                        f["is_buy"] = side == "B"
                 fills_sorted = sorted(
                     fills,
                     key=lambda x: x.get("time") or x.get("timestamp") or 0,

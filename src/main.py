@@ -630,6 +630,7 @@ def main():
                         # Without this, the state stays ENTERED indefinitely and the
                         # state gate blocks all future entries for up to 13 hours.
                         state_mgr.start_cooldown(asset, interval_seconds=3600)
+                        state_mgr.clear_entry(asset)
                         logging.info("[RECONCILE] %s — position closed naturally, cooldown started", asset)
                         # Use pending_exit_type if the timeout handler set it; otherwise
                         # let _log_trade_close resolve tp/sl from the fill price.

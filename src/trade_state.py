@@ -126,6 +126,13 @@ class TradeStateMachine:
         logging.info("[STATE] %s → ENTERED", asset)
         self._save()
 
+    def clear_entry(self, asset: str) -> None:
+        """Remove stale entry_time for an asset without changing its state."""
+        if asset in self._entry_time:
+            del self._entry_time[asset]
+            self._save()
+            logging.info("[STATE] %s stale entry_time cleared", asset)
+
     def is_trade_expired(self, asset: str, max_hours: int = 12) -> bool:
         """Return True if trade has been open > max_hours with no TP hit."""
         t = self._entry_time.get(asset)
