@@ -45,6 +45,10 @@ risk_state.json.tmp
 DEVNOTES.md
 STRATEGY.md
 
+# Bug council reports and internal analysis docs
+trading-bot-bug-council-report*.md
+*-bug-council-*.md
+
 # Node artifacts (not a Node project — safe to ignore)
 package-lock.json
 node_modules/
