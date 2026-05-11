@@ -547,18 +547,31 @@ class HyperliquidAPI:
     async def get_user_state(self):
         """Retrieve wallet state with correct unified account balance.
 
-        TRUE total = perps_value (marginSummary.accountValue, includes unrealised PnL)
-                   + spot_usdc  (USDC held in the spot/unified wallet).
+        Hyperliquid returns two margin objects in the user state response:
+          crossMarginSummary: total cross-margin portfolio equity.
+                              accountValue = deposited USDC + all unrealised PnL.
+                              This is the correct "Account Value" to show.
+          marginSummary:      can return only the isolated margin allocated to a
+                              position (~$13) rather than full portfolio equity
+                              (~$102) when a cross-margin position is open.
 
-        The old code only fell back to spot when perps showed zero — it missed the
-        case where a trade is open and marginSummary.accountValue contains only the
-        isolated margin (~$1), not the full portfolio value (~$101).
+        CRITICAL: crossMarginSummary MUST be preferred. Using marginSummary first
+        caused the dashboard to show $13.90 (margin used) instead of $102.67
+        (true total equity) when a cross-margin BTC position was open.
+
+        TRUE total = perps_value (crossMarginSummary.accountValue, includes PnL)
+                   + spot_usdc  (USDC in the spot/unified wallet).
         """
         state = await self._retry(lambda: self.info.user_state(self.query_address))
         positions = state.get("assetPositions", [])
-        margin = state.get("marginSummary") or state.get("crossMarginSummary") or {}
 
-        # Perps value — includes unrealised PnL on all open positions
+        # crossMarginSummary MUST come first — it holds total cross-margin portfolio
+        # equity (deposited capital + unrealised PnL across all positions).
+        # marginSummary can return only the isolated margin used by a single position
+        # which is far smaller than the real account value on cross-margin accounts.
+        margin = state.get("crossMarginSummary") or state.get("marginSummary") or {}
+
+        # Perps value — total cross-margin equity including all unrealised PnL
         perps_value = float(margin.get("accountValue") or state.get("accountValue") or 0.0)
         withdrawable = float(state.get("withdrawable", 0.0))
 
@@ -576,8 +589,8 @@ class HyperliquidAPI:
         except Exception as e:
             logging.warning("spot balance fetch failed: %s", e)
 
-        # TRUE total = perps equity + spot USDC (they are separate wallets on Hyperliquid).
-        # perps_value = marginSummary.accountValue (cross-margin equity + unrealized PnL).
+        # TRUE total = cross-margin equity + spot USDC (separate wallets on Hyperliquid).
+        # perps_value = crossMarginSummary.accountValue (cross-margin equity + unrealized PnL).
         # spot_usdc   = USDC held in the spot wallet (needs manual transfer to use for perps).
         # Always sum both — never choose one over the other.
         total_value = perps_value + spot_usdc
@@ -613,9 +626,9 @@ class HyperliquidAPI:
         return {
             "balance":      total_value,    # TRUE unified total — used by risk manager
             "total_value":  total_value,    # alias kept for compatibility
-            "perps_value":  perps_value,    # perps-only — for dashboard breakdown
-            "spot_usdc":    spot_usdc,      # spot USDC — for dashboard breakdown
-            "withdrawable": withdrawable,
+            "perps_value":  perps_value,    # crossMarginSummary.accountValue — for dashboard
+            "spot_usdc":    spot_usdc,      # USDC in spot wallet — for dashboard breakdown
+            "withdrawable": withdrawable,   # amount available to withdraw without closing positions
             "positions":    enriched_positions,
         }
 

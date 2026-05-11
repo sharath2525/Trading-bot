@@ -2091,16 +2091,20 @@ def main():
                     })
             except Exception:
                 pass
+            _live_av = state.get('total_value') or 0.0
+            _live_init = _load_initial_balance()
+            _live_ret = round(((_live_av - _live_init) / _live_init * 100.0), 2) if _live_init and _live_av else None
             return web.json_response({
-                "account_value": round_or_none(state.get('total_value'), 2),
-                "balance":       round_or_none(state.get('balance'), 2),
-                "perps_value":   round_or_none(state.get('perps_value'), 2),
-                "spot_usdc":     round_or_none(state.get('spot_usdc'), 2),
-                "withdrawable":  round_or_none(state.get('withdrawable'), 2),
-                "positions": positions,
-                "open_orders": open_orders,
-                "recent_fills": recent_fills,
-                "timestamp": datetime.now(timezone.utc).isoformat()
+                "account_value":    round_or_none(_live_av, 2),
+                "balance":          round_or_none(state.get('balance'), 2),
+                "perps_value":      round_or_none(state.get('perps_value'), 2),
+                "spot_usdc":        round_or_none(state.get('spot_usdc'), 2),
+                "withdrawable":     round_or_none(state.get('withdrawable'), 2),
+                "total_return_pct": _live_ret,   # server-authoritative return vs initial deposit
+                "positions":        positions,
+                "open_orders":      open_orders,
+                "recent_fills":     recent_fills,
+                "timestamp":        datetime.now(timezone.utc).isoformat()
             })
         except Exception as e:
             logging.error("handle_live error: %s", e)

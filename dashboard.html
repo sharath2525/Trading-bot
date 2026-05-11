@@ -81,8 +81,8 @@ tr:last-child td { border-bottom: none; }
 
 <!-- Stats -->
 <div class="stat-grid">
-  <div class="stat"><div class="stat-lbl">Account Value</div><div class="stat-val" id="sVal">—</div></div>
-  <div class="stat"><div class="stat-lbl">Free Margin</div><div class="stat-val" id="sBal">—</div><div class="stat-sub" id="sBalSub" style="font-size:0.72rem;color:#888;margin-top:2px"></div></div>
+  <div class="stat"><div class="stat-lbl">Account Value</div><div class="stat-val" id="sVal">—</div><div class="stat-sub" id="sValSub" style="font-size:0.72rem;color:#888;margin-top:2px"></div></div>
+  <div class="stat"><div class="stat-lbl">Withdrawable</div><div class="stat-val" id="sBal">—</div><div class="stat-sub" id="sBalSub" style="font-size:0.72rem;color:#888;margin-top:2px"></div></div>
   <div class="stat"><div class="stat-lbl">Total Return</div><div class="stat-val" id="sRet">—</div></div>
   <div class="stat"><div class="stat-lbl">Open Positions</div><div class="stat-val" id="sPos">—</div></div>
   <div class="stat"><div class="stat-lbl">Unrealized PnL</div><div class="stat-val" id="sUpnl">—</div></div>
@@ -256,10 +256,17 @@ function renderStatsFast() {
   const pos = Array.isArray(latest.positions)?latest.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
 
   document.getElementById('sVal').textContent = fu(av);
+  // Sub-line: show perps equity + spot breakdown under Account Value
+  const _perps=parseFloat(latest.perps_value||0);
+  const _spotF=parseFloat(latest.spot_usdc||0);
+  const _valSub=document.getElementById('sValSub');
+  if(_valSub){
+    if(_spotF>0) _valSub.textContent='perps '+fu(_perps)+' + spot '+fu(_spotF);
+    else if(_perps>0) _valSub.textContent='perps equity';
+  }
   const _w=parseFloat(latest.withdrawable||0);
-  const _spot=parseFloat(latest.spot_usdc||0);
   document.getElementById('sBal').textContent=_w>0?fu(_w):'$0.00';
-  if(_spot>0) document.getElementById('sBalSub').textContent='+ '+fu(_spot)+' spot';
+  document.getElementById('sBalSub').textContent='avail. to withdraw';
   document.getElementById('sPos').textContent = latest.positions_count||pos.length||'0';
 
   let upnl=0; pos.forEach(p=>{const v=parseFloat(p.unrealized_pnl||0);if(!isNaN(v))upnl+=v;});
@@ -282,23 +289,42 @@ function renderStatsFast() {
   }
 }
 
-// Update with fresh live values
+// Update with fresh live values (called after /live API responds)
 function renderStatsLive() {
   const av  = parseFloat(live.account_value||0);
   const pos = Array.isArray(live.positions)?live.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
 
   if(av>0) document.getElementById('sVal').textContent=fu(av);
-  const _lw=parseFloat(live.withdrawable||0);
+
+  // Sub-line under Account Value: perps equity + spot breakdown
+  const _lp=parseFloat(live.perps_value||0);
   const _ls=parseFloat(live.spot_usdc||0);
+  const _valSub=document.getElementById('sValSub');
+  if(_valSub){
+    if(_ls>0) _valSub.textContent='perps '+fu(_lp)+' + spot '+fu(_ls);
+    else if(_lp>0) _valSub.textContent='cross-margin equity';
+  }
+
+  // Withdrawable — amount available without closing positions
+  const _lw=parseFloat(live.withdrawable||0);
   document.getElementById('sBal').textContent=_lw>0?fu(_lw):'$0.00';
-  if(_ls>0) document.getElementById('sBalSub').textContent='+ '+fu(_ls)+' spot';
+  document.getElementById('sBalSub').textContent='avail. to withdraw';
+
   document.getElementById('sPos').textContent=pos.length;
 
   let upnl=0; pos.forEach(p=>{const v=parseFloat(p.unrealized_pnl||0);if(!isNaN(v))upnl+=v;});
   const uel=document.getElementById('sUpnl'); uel.textContent=fpnl(upnl); uel.className='stat-val '+(upnl>=0?'g':'r');
 
-  const first=entries.find(e=>parseFloat(e.account_value)>0);
-  if(first&&av>0){ const ret=((av-parseFloat(first.account_value))/parseFloat(first.account_value))*100; const re=document.getElementById('sRet'); re.textContent=fpct(ret); re.className='stat-val '+pc(ret); }
+  // Total Return: prefer server-computed value (based on initial_balance.json, not diary).
+  // Diary-based fallback can show wrong % if early diary entries had corrupted account_value.
+  const re=document.getElementById('sRet');
+  if(live.total_return_pct!=null){
+    const ret=parseFloat(live.total_return_pct);
+    re.textContent=fpct(ret); re.className='stat-val '+pc(ret);
+  } else {
+    const first=entries.find(e=>parseFloat(e.account_value)>0);
+    if(first&&av>0){ const ret=((av-parseFloat(first.account_value))/parseFloat(first.account_value))*100; re.textContent=fpct(ret); re.className='stat-val '+pc(ret); }
+  }
 }
 
 // ── P&L (V4-MEDIUM-3: label clarifies unrealized is included) ─────────────────
