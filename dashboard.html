@@ -82,7 +82,7 @@ tr:last-child td { border-bottom: none; }
 <!-- Stats -->
 <div class="stat-grid">
   <div class="stat"><div class="stat-lbl">Account Value</div><div class="stat-val" id="sVal">—</div></div>
-  <div class="stat"><div class="stat-lbl">Free Balance</div><div class="stat-val" id="sBal">—</div></div>
+  <div class="stat"><div class="stat-lbl">Free Margin</div><div class="stat-val" id="sBal">—</div><div class="stat-sub" id="sBalSub" style="font-size:0.72rem;color:#888;margin-top:2px"></div></div>
   <div class="stat"><div class="stat-lbl">Total Return</div><div class="stat-val" id="sRet">—</div></div>
   <div class="stat"><div class="stat-lbl">Open Positions</div><div class="stat-val" id="sPos">—</div></div>
   <div class="stat"><div class="stat-lbl">Unrealized PnL</div><div class="stat-val" id="sUpnl">—</div></div>
@@ -257,8 +257,9 @@ function renderStatsFast() {
 
   document.getElementById('sVal').textContent = fu(av);
   const _w=parseFloat(latest.withdrawable||0);
-  const _bal=parseFloat(latest.spot_usdc||latest.balance||0);
-  document.getElementById('sBal').textContent=_w>0?fu(_w):(_bal>0?fu(_bal):'—');
+  const _spot=parseFloat(latest.spot_usdc||0);
+  document.getElementById('sBal').textContent=_w>0?fu(_w):'$0.00';
+  if(_spot>0) document.getElementById('sBalSub').textContent='+ '+fu(_spot)+' spot';
   document.getElementById('sPos').textContent = latest.positions_count||pos.length||'0';
 
   let upnl=0; pos.forEach(p=>{const v=parseFloat(p.unrealized_pnl||0);if(!isNaN(v))upnl+=v;});
@@ -288,8 +289,9 @@ function renderStatsLive() {
 
   if(av>0) document.getElementById('sVal').textContent=fu(av);
   const _lw=parseFloat(live.withdrawable||0);
-  const _ls=parseFloat(live.spot_usdc||live.balance||0);
-  document.getElementById('sBal').textContent=_lw>0?fu(_lw):(_ls>0?fu(_ls):'—');
+  const _ls=parseFloat(live.spot_usdc||0);
+  document.getElementById('sBal').textContent=_lw>0?fu(_lw):'$0.00';
+  if(_ls>0) document.getElementById('sBalSub').textContent='+ '+fu(_ls)+' spot';
   document.getElementById('sPos').textContent=pos.length;
 
   let upnl=0; pos.forEach(p=>{const v=parseFloat(p.unrealized_pnl||0);if(!isNaN(v))upnl+=v;});

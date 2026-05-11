@@ -576,12 +576,11 @@ class HyperliquidAPI:
         except Exception as e:
             logging.warning("spot balance fetch failed: %s", e)
 
-        # Prefer marginSummary.accountValue (perps_value) as the primary balance
-        # because it includes unrealized PnL from open perp positions.
-        # For cross-margin accounts, spot_usdc alone omits in-flight PnL and
-        # would cause the risk manager to undersize follow-on trades.
-        # Fall back to spot_usdc only when perps shows zero (spot-only accounts).
-        total_value = perps_value if perps_value > 0 else spot_usdc
+        # TRUE total = perps equity + spot USDC (they are separate wallets on Hyperliquid).
+        # perps_value = marginSummary.accountValue (cross-margin equity + unrealized PnL).
+        # spot_usdc   = USDC held in the spot wallet (needs manual transfer to use for perps).
+        # Always sum both — never choose one over the other.
+        total_value = perps_value + spot_usdc
 
         logging.info(
             "[BALANCE] perps=%.2f spot_usdc=%.2f total=%.2f",

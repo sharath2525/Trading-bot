@@ -1760,7 +1760,10 @@ def main():
                     if _ie <= 0 or _iatr <= 0:
                         continue
                     _itp, _isl = _code_compute_tpsl(_ie, _iatr, _idir)
-                    _ialloc = risk_mgr.atr_position_size(account_value, _ie, _isl) * (_iscr / 10.0)
+                    _i_buying_power = account_value * float(CONFIG.get("max_leverage") or 5)
+                    _i_pct_cap = _i_buying_power * (float(CONFIG.get("max_position_pct") or 15) / 100.0)
+                    _i_atr_sized = risk_mgr.atr_position_size(account_value, _ie, _isl)
+                    _ialloc = min(_i_pct_cap, _i_atr_sized) * (_iscr / 10.0)
                     # ADX ranging market guard (inner loop)
                     _iadx_1h = float(_iac.get("intraday_1h", {}).get("adx") or 25)
                     _iadx_thr = float(CONFIG.get("adx_half_size_threshold") or 20)
