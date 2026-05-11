@@ -9,6 +9,7 @@ import math
 import os
 import pathlib
 import signal
+import socket as _socket
 import time
 import traceback
 sys.path.append(str(pathlib.Path(__file__).parent.parent))
@@ -36,6 +37,80 @@ _log_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - 
 logging.getLogger().addHandler(_log_file_handler)
 
 _shutdown = False  # Set to True by SIGTERM/SIGINT handler for clean loop exit
+
+# ── C-5: Instance lock — prevents two simultaneous bot instances ──────────────
+_INSTANCE_LOCK_SOCK: _socket.socket | None = None
+_INSTANCE_LOCK_PORT = 47293  # arbitrary loopback-only port used as a process mutex
+
+def _acquire_instance_lock() -> None:
+    """Bind a loopback socket as a process-level mutex. Exits if already bound."""
+    global _INSTANCE_LOCK_SOCK
+    _INSTANCE_LOCK_SOCK = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    _INSTANCE_LOCK_SOCK.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 0)
+    try:
+        _INSTANCE_LOCK_SOCK.bind(("127.0.0.1", _INSTANCE_LOCK_PORT))
+        logging.info("[LOCK] Instance lock acquired (port %d)", _INSTANCE_LOCK_PORT)
+    except OSError:
+        logging.critical(
+            "[LOCK] Port %d already bound — another bot instance is running. Exiting.",
+            _INSTANCE_LOCK_PORT,
+        )
+        print(
+            f"ERROR: Another bot instance is already running "
+            f"(lock port {_INSTANCE_LOCK_PORT} in use).\n"
+            "Stop the other instance first, or change INSTANCE_LOCK_PORT in .env."
+        )
+        sys.exit(1)
+
+def _release_instance_lock() -> None:
+    if _INSTANCE_LOCK_SOCK:
+        try:
+            _INSTANCE_LOCK_SOCK.close()
+        except OSError:
+            pass
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── E-4: Bounded log rotation for append-only JSONL files ────────────────────
+_LOG_ROTATION_MAX_MB = 50
+
+def _rotate_if_needed(path: str, max_mb: int = _LOG_ROTATION_MAX_MB) -> None:
+    """Rotate path → path.old when it exceeds max_mb. Prevents unbounded disk growth."""
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > max_mb * 1024 * 1024:
+            os.replace(path, path + ".old")
+            logging.info("[ROTATE] %s exceeded %dMB — rotated to %s.old", path, max_mb, path)
+    except Exception as _re:
+        logging.warning("[ROTATE] %s failed: %s", path, _re)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── FL-4: Persist initial account value across restarts ──────────────────────
+_INITIAL_BALANCE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "initial_balance.json"
+)
+
+def _load_initial_balance() -> float | None:
+    """Return the persisted initial account value, or None if not yet set."""
+    try:
+        p = os.path.normpath(_INITIAL_BALANCE_FILE)
+        if os.path.exists(p):
+            with open(p) as _f:
+                val = float(json.load(_f).get("initial_account_value", 0))
+                return val if val > 0 else None
+    except Exception as _e:
+        logging.warning("[INIT] failed to load initial_balance.json: %s", _e)
+    return None
+
+def _save_initial_balance(value: float) -> None:
+    try:
+        p = os.path.normpath(_INITIAL_BALANCE_FILE)
+        with open(p + ".tmp", "w") as _f:
+            json.dump({"initial_account_value": value,
+                       "set_at": __import__("datetime").datetime.utcnow().isoformat()}, _f)
+        os.replace(p + ".tmp", p)
+        logging.info("[INIT] initial_account_value=%.2f persisted to disk", value)
+    except Exception as _e:
+        logging.warning("[INIT] failed to save initial_balance.json: %s", _e)
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def clear_terminal():
@@ -202,7 +277,7 @@ async def _fetch_macro_context() -> dict:
 # ── CORS middleware ───────────────────────────────────────────────────────────
 @web.middleware
 async def cors_middleware(request, handler):
-    """Restrict CORS to the dashboard origin only (localhost on the configured port)."""
+    """Allow same-origin requests (served from the bot itself) and localhost."""
     if request.method == "OPTIONS":
         response = web.Response()
     else:
@@ -211,15 +286,42 @@ async def cors_middleware(request, handler):
         except web.HTTPException as ex:
             response = ex
     _port = CONFIG.get("api_port") or "3000"
-    response.headers["Access-Control-Allow-Origin"] = f"http://localhost:{_port}"
+    # Reflect request origin only for exact localhost/127.0.0.1 origins — substring
+    # matching would allow crafted domains like "localhost.attacker.com" to pass.
+    _origin = request.headers.get("Origin", "")
+    _allowed_origins = {f"http://localhost:{_port}", f"http://127.0.0.1:{_port}"}
+    _allowed = _origin if _origin in _allowed_origins else f"http://localhost:{_port}"
+    response.headers["Access-Control-Allow-Origin"] = _allowed
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── Auth middleware (V4-HIGH-1) ───────────────────────────────────────────────
+@web.middleware
+async def auth_middleware(request, handler):
+    """Bearer-token gate for all non-OPTIONS routes.
+
+    Set DASHBOARD_TOKEN in .env to enable. Unset = no auth (backward compatible).
+    The dashboard HTML reads the token from localStorage and sends it as
+    'Authorization: Bearer <token>' on every API request.
+    The root '/' route (dashboard HTML itself) is always allowed so operators
+    can load the page to enter their token.
+    """
+    _token = CONFIG.get("dashboard_token")
+    if not _token or request.method == "OPTIONS" or request.path == "/":
+        return await handler(request)
+    _auth = request.headers.get("Authorization", "")
+    if _auth == f"Bearer {_token}":
+        return await handler(request)
+    return web.json_response({"error": "Unauthorized"}, status=401)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def main():
     """Parse CLI args, bootstrap dependencies, and launch the trading loop."""
+    _acquire_instance_lock()  # C-5: exits if another instance is running
     clear_terminal()
     _network = os.getenv("HYPERLIQUID_NETWORK", "").strip().lower()
     if _network not in ("mainnet", "testnet"):
@@ -246,6 +348,33 @@ def main():
     if not args.assets or not args.interval:
         parser.error("Please provide --assets and --interval, or set ASSETS and INTERVAL in .env")
 
+    # H-3: Validate that risk parameters are explicitly configured, not relying on permissive defaults.
+    _risk_defaults = {
+        "MAX_LEVERAGE": ("max_leverage", 5, 5),
+        "MAX_POSITION_PCT": ("max_position_pct", 15, 15),
+        "MAX_LOSS_PER_POSITION_PCT": ("max_loss_per_position_pct", 8, 8),
+        "MAX_TOTAL_EXPOSURE_PCT": ("max_total_exposure_pct", 50, 50),
+        "DAILY_LOSS_CIRCUIT_BREAKER_PCT": ("daily_loss_circuit_breaker_pct", 12, 12),
+        "MAX_CONCURRENT_POSITIONS": ("max_concurrent_positions", 2, 2),
+        "MIN_BALANCE_RESERVE_PCT": ("min_balance_reserve_pct", 20, 20),
+    }
+    _using_dangerous_defaults = []
+    for _env_key, (_cfg_key, _code_default, _safe_value) in _risk_defaults.items():
+        # BUG-6 FIX: Check os.getenv(), not CONFIG.get().
+        # config_loader always returns a default string — CONFIG.get() is never None,
+        # so the old check never fired even when .env was missing or incomplete.
+        if os.getenv(_env_key) is None:
+            _using_dangerous_defaults.append(
+                f"  {_env_key} not set — using code default {_code_default} (recommended: {_safe_value})"
+            )
+    if _using_dangerous_defaults:
+        logging.critical(
+            "[CONFIG] DANGEROUS: The following risk parameters are not set in .env and use "
+            "permissive code defaults:\n%s\nSet these in .env before live trading.",
+            "\n".join(_using_dangerous_defaults),
+        )
+        print("WARNING: Permissive risk defaults active. See bot.log for details.")
+
     hyperliquid = HyperliquidAPI()
     agent = TradingAgent(hyperliquid=hyperliquid)
     risk_mgr = RiskManager()
@@ -253,7 +382,7 @@ def main():
 
     start_time = datetime.now(timezone.utc)
     invocation_count = 0
-    trade_log = []   # For Sharpe ratio: list of trade result dicts
+    trade_log = deque(maxlen=200)  # BUG-7 FIX: bounded — was an unbounded list, never read (Sharpe uses diary.jsonl)
     active_trades = load_active_trades()  # {'asset','is_long','amount','entry_price','tp_oid','sl_oid','exit_plan'}
     diary_path = "diary.jsonl"
     decisions_path = "decisions.jsonl"
@@ -268,6 +397,8 @@ def main():
 
     async def run_loop():
         """Main trading loop that gathers data, calls the agent, and executes trades."""
+        global _shutdown  # V3-CRITICAL-1 FIX: without this, `_shutdown = True` inside the inner loop
+        # creates a local variable, making every `if _shutdown` check raise UnboundLocalError.
         nonlocal invocation_count, initial_account_value
 
         # Pre-load meta cache for correct order sizing
@@ -280,6 +411,18 @@ def main():
         for dex in hip3_dexes:
             await hyperliquid.get_meta_and_ctxs(dex=dex)
             add_event(f"Loaded HIP-3 meta for dex: {dex}")
+
+        # FL-1 FIX: Set exchange-side leverage for every asset before any order is placed.
+        # MAX_LEVERAGE in .env only affected risk calculations — not the actual exchange leverage.
+        _configured_leverage = int(float(CONFIG.get("max_leverage") or 5))
+        for _lev_asset in args.assets:
+            try:
+                await hyperliquid.set_leverage(_lev_asset, _configured_leverage)
+                add_event(f"[LEVERAGE] {_lev_asset} set to {_configured_leverage}x on exchange")
+            except Exception as _lev_err:
+                logging.error("[LEVERAGE] Failed to set leverage for %s: %s — ABORTING to avoid uncontrolled leverage", _lev_asset, _lev_err)
+                add_event(f"[LEVERAGE] CRITICAL: could not set leverage for {_lev_asset} — bot halted. Fix and restart.")
+                return  # Fail closed: do not trade with unknown leverage
 
         # ── Score-pipeline state (persist across cycles) ──────────────────────────
         _daily_trade_count: int = 0           # resets at UTC midnight
@@ -296,7 +439,7 @@ def main():
         _stats_lock = asyncio.Lock()
 
         async def _update_stats(realized_pnl: float | None, exit_price: float | None,
-                                qty: float | None) -> None:
+                                qty: float | None, entry_price: float | None = None) -> None:
             """Atomically update stats.json after every trade close."""
             stats_path = "stats.json"
             async with _stats_lock:
@@ -316,9 +459,12 @@ def main():
                             stats["losses"] = stats.get("losses", 0) + 1
                         total = stats["total_trades"]
                         stats["win_rate"] = round(stats["wins"] / total, 4) if total > 0 else 0.0
+                    # H-2 FIX: count both entry and exit fee legs (old code only counted exit).
                     if exit_price and qty:
+                        _exit_fee = exit_price * qty * 0.00045
+                        _entry_fee = (entry_price or exit_price) * qty * 0.00045
                         stats["total_fees"] = round(
-                            stats.get("total_fees", 0.0) + exit_price * qty * 0.00045, 4
+                            stats.get("total_fees", 0.0) + _exit_fee + _entry_fee, 4
                         )
                     _tmp = stats_path + ".tmp"
                     with open(_tmp, "w") as _sf:
@@ -475,7 +621,7 @@ def main():
             except Exception as _we:
                 logging.error("[PNL] diary write failed: %s", _we)
 
-            await _update_stats(realized_pnl, exit_price, qty)
+            await _update_stats(realized_pnl, exit_price, qty, entry_price)
             logging.info(
                 "[TRADE CLOSE] %s exit_type=%s exit_px=%s pnl=%s duration=%smin",
                 asset, exit_type, exit_price, realized_pnl, duration_minutes,
@@ -486,14 +632,37 @@ def main():
         _interval_seconds = get_interval_seconds(args.interval)
         _consecutive_failures = 0
         _MAX_CONSECUTIVE_FAILURES = 5
+        _KILLSWITCH_FILE = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "KILLSWITCH"
+        )
         while True:
             if _shutdown:
                 logging.info("[SHUTDOWN] Signal received — exiting loop cleanly")
                 break
+            # C-7 FIX: File-based remote kill switch — create a file named KILLSWITCH
+            # in the project root to halt all trading without SSH access.
+            if os.path.exists(os.path.normpath(_KILLSWITCH_FILE)):
+                logging.critical("[KILLSWITCH] KILLSWITCH file detected — halting all trading. Remove the file to re-enable.")
+                add_event("[KILLSWITCH] Trading halted by KILLSWITCH file. Remove it to restart.")
+                break
             cycle_start = time.monotonic()
             _outer_cycle_timestamp = cycle_start  # inner ticks read this to check higher-TF freshness
-            _ai_verdict_cache.clear()              # fresh outer cycle data → invalidate all verdict caches
+            # C-2 FIX: Do NOT clear the entire AI verdict cache on every outer cycle.
+            # Cache entries already carry `expires_at` timestamps and expire naturally.
+            # Clearing here negated the 60-minute APPROVE cache, doubling Claude call frequency.
+            # _ai_verdict_cache.clear()  ← REMOVED
             invocation_count += 1
+
+            # V6-LOW-2: Re-assert exchange leverage once per outer cycle (hourly).
+            # Guards against an operator manually raising leverage in the Hyperliquid
+            # web UI mid-session — the risk_manager notional check would still pass
+            # but the exchange multiplier would be wrong until restart.
+            _lev_cycle = int(float(CONFIG.get("max_leverage") or 5))
+            for _lv_asset in args.assets:
+                try:
+                    await hyperliquid.set_leverage(_lv_asset, _lev_cycle)
+                except Exception as _lv_err:
+                    logging.warning("[LEVERAGE] re-verify failed for %s: %s — will retry next cycle", _lv_asset, _lv_err)
 
             # UTC midnight reset of daily trade counter
             _today_utc = datetime.now(timezone.utc).date()
@@ -532,9 +701,24 @@ def main():
             sharpe = calculate_sharpe_from_diary(diary_path)
 
             account_value = total_value
+            # FL-4 FIX: Persist initial_account_value across restarts.
+            # Old code: re-initialized to current balance on every restart, silently lowering
+            # the reserve floor after a loss cycle. Now loads from disk and never resets downward.
             if initial_account_value is None:
-                initial_account_value = account_value
+                _loaded = _load_initial_balance()
+                if _loaded is not None:
+                    initial_account_value = _loaded
+                    logging.info("[INIT] Loaded initial_account_value=%.2f from disk", initial_account_value)
+                else:
+                    initial_account_value = account_value
+                    _save_initial_balance(initial_account_value)
             total_return_pct = ((account_value - initial_account_value) / initial_account_value * 100.0) if initial_account_value else 0.0
+
+            # E-4 / V3-HIGH-1 FIX: Rotate unbounded log files before they fill the disk.
+            _rotate_if_needed(diary_path)
+            _rotate_if_needed(decisions_path)
+            _rotate_if_needed("llm_requests.log")   # V3-HIGH-1: was missed in E-4 fix
+            _rotate_if_needed("prompts.log")
 
             positions = []
             for pos_wrap in state.get('positions', []):
@@ -636,8 +820,12 @@ def main():
                         # let _log_trade_close resolve tp/sl from the fill price.
                         _recon_exit_type = tr.get('pending_exit_type', 'unknown')
                         await _log_trade_close(tr, _recon_exit_type)
-            except Exception:
-                pass
+            except Exception as _rec_err:
+                # C-6 FIX: Log reconcile errors instead of silently swallowing them.
+                # A bare `pass` left stale ENTERED state that blocked future entries for 13h.
+                logging.error("[RECONCILE] exception — stale state may persist: %s\n%s",
+                              _rec_err, traceback.format_exc())
+                add_event(f"[RECONCILE] ERROR: {_rec_err} — check bot.log, may need manual state.json edit")
 
             # Time-based exit — force-close trades stuck beyond max_trade_hours
             for _asset_name in list(args.assets):
@@ -650,6 +838,10 @@ def main():
                         )
                         try:
                             await hyperliquid.market_close(_asset_name)
+                            # BUG-3 FIX: Cancel orphaned TP/SL trigger orders after timeout close.
+                            # Without this, trigger orders kept the asset in assets_with_orders,
+                            # preventing the reconciler from clearing stale active_trade entries.
+                            await hyperliquid.cancel_all_orders(_asset_name)
                             state_mgr.start_cooldown(_asset_name, interval_seconds=3600)
                             # Flag so the reconciler logs the close with the right exit_type
                             for _tr in active_trades:
@@ -839,7 +1031,7 @@ def main():
                                  len(_macro_context_cache.get("events", [])),
                                  len(_macro_context_cache.get("headlines", [])))
             except Exception as _mce:
-                logging.debug("[MACRO] outer cycle fetch error: %s", _mce)
+                logging.warning("[MACRO] outer cycle fetch error — Claude will use technicals only: %s", _mce)
 
             # Gather data for ALL assets first (using Hyperliquid candles + local indicators)
             market_sections = []
@@ -947,10 +1139,14 @@ def main():
                         spread_pct = 0.0
 
                     ema20_15m = latest(ind_15m.get("ema20", []))
+                    # BUG-4 FIX: Default to False when EMA is unavailable (startup warmup / data gap).
+                    # Previously defaulted to True, silently bypassing the near_ema gate when EMA
+                    # data was missing — the E-1 fix in strategy.py never fired because this always
+                    # wrote the key with a value, and it was True on unavailable data.
                     near_ema_15m = (
                         abs(current_price - ema20_15m) / current_price < 0.003
                         if (ema20_15m is not None and current_price > 0)
-                        else True
+                        else False
                     )
 
                     # Pre-compute ADX and Bollinger Band values for both timeframes
@@ -1033,31 +1229,12 @@ def main():
                     add_event(f"Data gather error {asset}: {e}")
                     continue
 
-            # Single LLM call with all assets
-            context_payload = {
-                "invocation": {
-                    "minutes_since_start": round(minutes_since_start, 2),
-                    "current_time": datetime.now(timezone.utc).isoformat(),
-                    "invocation_count": invocation_count,
-                },
-                "account": dashboard,
-                "risk_limits": risk_mgr.get_risk_summary(),
-                "market_data": market_sections,
-                "instructions": {
-                    "assets": args.assets,
-                    "requirement": "Decide actions for all assets and return a strict JSON object matching the schema.",
-                },
-            }
-            context = json.dumps(context_payload, default=json_default)
-            add_event(f"Combined prompt length: {len(context)} chars for {len(args.assets)} assets")
-            _prompts_log = "prompts.log"
-            try:
-                if os.path.exists(_prompts_log) and os.path.getsize(_prompts_log) > 10 * 1024 * 1024:
-                    os.replace(_prompts_log, _prompts_log + ".old")
-            except Exception:
-                pass
-            with open(_prompts_log, "a") as f:
-                f.write(f"\n\n--- {datetime.now()} - ALL ASSETS ---\n{json.dumps(context_payload, indent=2, default=json_default)}\n")
+            # V3-HIGH-2 FIX: Removed dead `context_payload` build block.
+            # The old code built a large JSON dict and serialized it every cycle, but it was
+            # never sent to Claude — it was a remnant of the pre-2026-04-30 full-context design.
+            # `confirm_trade()` writes its own prompts.log entry with the actual Claude input.
+            # The misleading "Combined prompt length: X chars" log line is also removed.
+            add_event(f"[CYCLE {invocation_count}] scoring {len(market_sections)} asset(s) — code-first pipeline")
 
             # ── Score-gated code-first pipeline (replaces unconditional Claude call) ──
             # Claude is called when score >= MIN_AI_SCORE and multi-timeframe confluence is confirmed.
@@ -1114,8 +1291,12 @@ def main():
                     continue
 
                 _tp, _sl = _code_compute_tpsl(_entry, _atr, _direction)
-                # 1% risk rule — allocation sized so SL hit = 1% account loss
-                _alloc = risk_mgr.atr_position_size(account_value, _entry, _sl)
+                # Position sizing: target = 15% of buying_power (account × leverage).
+                # ATR 1% risk rule acts as a safety ceiling — reduces size when SL is distant.
+                _buying_power = account_value * float(CONFIG.get("max_leverage") or 5)
+                _pct_cap = _buying_power * (float(CONFIG.get("max_position_pct") or 15) / 100.0)
+                _atr_sized = risk_mgr.atr_position_size(account_value, _entry, _sl)
+                _alloc = min(_pct_cap, _atr_sized)
                 # Scale allocation by signal strength (score/10): score-7 → 70%, score-10 → 100%
                 _alloc = _alloc * (_score / 10.0)
                 # ADX ranging market guard: half-size if ADX weak and score not at maximum
@@ -1301,7 +1482,7 @@ def main():
                         # or shorts would unnecessarily suppress valid intraday setups.
                         _trend_1d = asset_trends_1d.get(asset, "UNKNOWN")
                         _adx_1d = asset_adx_1d.get(asset)
-                        _macro_trending = _adx_1d is None or float(_adx_1d) > 20
+                        _macro_trending = _adx_1d is not None and float(_adx_1d) > 20
                         if _macro_trending:
                             if _trend_1d == "BEARISH" and action == "buy":
                                 logging.info(
@@ -1518,6 +1699,15 @@ def main():
             for _tick in range(11):
                 await asyncio.sleep(300)  # 5 minutes
 
+                # BUG-5 FIX: Check KILLSWITCH inside the inner loop.
+                # Without this, operator creates KILLSWITCH expecting immediate halt but bot
+                # continues trading for up to 55 more minutes (11 ticks × 5 min).
+                if os.path.exists(os.path.normpath(_KILLSWITCH_FILE)):
+                    logging.critical("[KILLSWITCH] detected inside inner loop tick %d — halting", _tick + 1)
+                    add_event("[KILLSWITCH] Trading halted by KILLSWITCH file (inner loop).")
+                    _shutdown = True
+                    break
+
                 if risk_mgr.circuit_breaker_active:
                     logging.info("[INNER] circuit breaker active — skipping tick %d", _tick + 1)
                     continue
@@ -1562,7 +1752,10 @@ def main():
                     _iscr = compute_signal_score(_iac, _idir)
                     if _iscr < float(CONFIG.get("min_signal_score") or 7):
                         continue
-                    _ie = float(_iac.get("current_price") or 0)
+                    # BUG-2 FIX: Use the fresh price already refreshed by the C-3/C-4 block above,
+                    # not the stale outer-loop price. TP/SL were anchored to an old price, placing
+                    # the SL up to 1 full ATR away from the actual fill price during volatile moves.
+                    _ie = float(asset_prices.get(_i_asset) or _iac.get("current_price") or 0)
                     _iatr = float(_iac.get("long_term_4h", {}).get("atr14") or 0)
                     if _ie <= 0 or _iatr <= 0:
                         continue
@@ -1643,6 +1836,28 @@ def main():
                         "rationale": f"inner score={_iscr:.1f}",
                     })
 
+                # C-3 + C-4 FIX: Refresh account state and prices before inner-loop execution.
+                # Old code used stale outer-loop values (up to 55 min old) for risk checks and
+                # TP/SL calculation, defeating total-exposure and concurrent-position guards.
+                try:
+                    _istate_fresh = await hyperliquid.get_user_state()
+                    _iaccval_fresh = float(_istate_fresh.get("total_value", 0))
+                    if _iaccval_fresh > 0:
+                        account_value = _iaccval_fresh
+                        state = _istate_fresh
+                    for _ri_asset in args.assets:
+                        try:
+                            _rip = await hyperliquid.get_current_price(_ri_asset)
+                            if _rip > 0:
+                                asset_prices[_ri_asset] = _rip
+                                for _rms in market_sections:
+                                    if _rms.get("asset") == _ri_asset:
+                                        _rms["current_price"] = _rip
+                        except Exception:
+                            pass
+                except Exception as _ire:
+                    logging.warning("[INNER tick %d] state/price refresh failed: %s", _tick + 1, _ire)
+
                 # Execute inner-loop trades (state gate + market_filter + entry_confirmed + risk)
                 for _iout in _inner_outputs.get("trade_decisions", []):
                     _ia = _iout.get("asset")
@@ -1652,13 +1867,14 @@ def main():
                         _ism = state_mgr.get_state(_ia)
                         if _ism in ("ENTERED", "COOLDOWN"):
                             continue
+                        # C-4: use refreshed price (updated above for this tick)
                         _iprice = asset_prices.get(_ia, 0)
                         if not _iprice or _iprice <= 0:
                             continue
                         _iact_ctx = next((m for m in market_sections if m.get("asset") == _ia), {})
                         _itrend_1d = asset_trends_1d.get(_ia, "UNKNOWN")
                         _iadx_1d = asset_adx_1d.get(_ia)
-                        _imacro_trending = _iadx_1d is None or float(_iadx_1d) > 20
+                        _imacro_trending = _iadx_1d is not None and float(_iadx_1d) > 20
                         if _imacro_trending:
                             if _itrend_1d == "BEARISH" and _iout["action"] == "buy":
                                 logging.info("[INNER DAILY FILTER] %s BUY blocked — daily BEARISH", _ia)
@@ -1684,20 +1900,42 @@ def main():
                         _iorder = await (hyperliquid.place_buy_order(_ia, _iamt)
                                          if _iout["action"] == "buy"
                                          else hyperliquid.place_sell_order(_ia, _iamt))
-                        await asyncio.sleep(1)
+                        # H-5 FIX: Poll fills to get confirmed quantity before placing TP/SL.
+                        # Old code used requested _iamt directly; partial fills left remainder unprotected.
+                        _i_entry_oids = hyperliquid.extract_oids(_iorder) if _iorder else []
+                        _i_entry_oid = _i_entry_oids[0] if _i_entry_oids else None
+                        _i_filled_qty = 0.0
+                        _i_seen_tids: set = set()
+                        for _iap in range(3):
+                            await asyncio.sleep(1)
+                            try:
+                                _i_fills = await hyperliquid.get_recent_fills(limit=20)
+                                for _ifc in _i_fills:
+                                    _ifc_oid = _ifc.get('oid') or _ifc.get('orderId')
+                                    if not (_i_entry_oid and _ifc_oid and str(_ifc_oid) == str(_i_entry_oid)):
+                                        continue
+                                    _ifc_tid = str(_ifc.get('tid') or _ifc.get('tradeId') or
+                                                   f"{_ifc_oid}_{_ifc.get('sz')}_{_ifc.get('time')}")
+                                    if _ifc_tid in _i_seen_tids:
+                                        continue
+                                    _i_seen_tids.add(_ifc_tid)
+                                    _i_filled_qty += float(_ifc.get('sz') or _ifc.get('size') or 0)
+                            except Exception:
+                                pass
+                        _itp_sl_size = _i_filled_qty if _i_filled_qty > 0 else _iamt
                         _itp_oid = None
                         _isl_oid = None
                         if _iout.get("tp_price"):
                             _itp_res = await hyperliquid.place_take_profit(
-                                _ia, _iout["action"] == "buy", _iamt, _iout["tp_price"])
+                                _ia, _iout["action"] == "buy", _itp_sl_size, _iout["tp_price"])
                             _itp_oid = (hyperliquid.extract_oids(_itp_res) or [None])[0]
                         if _iout.get("sl_price"):
                             _isl_res = await hyperliquid.place_stop_loss(
-                                _ia, _iout["action"] == "buy", _iamt, _iout["sl_price"])
+                                _ia, _iout["action"] == "buy", _itp_sl_size, _iout["sl_price"])
                             _isl_oid = (hyperliquid.extract_oids(_isl_res) or [None])[0]
                         active_trades.append({
                             "asset": _ia, "is_long": _iout["action"] == "buy",
-                            "amount": _iamt, "entry_price": _iprice,
+                            "amount": _itp_sl_size, "entry_price": _iprice,
                             "tp_price": _iout.get("tp_price"), "sl_price": _iout.get("sl_price"),
                             "tp_oid": _itp_oid, "sl_oid": _isl_oid,
                             "exit_plan": _iout.get("exit_plan", ""),
@@ -1707,13 +1945,13 @@ def main():
                         save_active_trades(active_trades)
                         state_mgr.record_entry(_ia)
                         _daily_trade_count += 1
-                        add_event(f"[INNER] {_iout['action'].upper()} {_ia} amt={_iamt:.4f} score={_iout.get('rationale','')} daily={_daily_trade_count}")
+                        add_event(f"[INNER] {_iout['action'].upper()} {_ia} amt={_itp_sl_size:.4f} filled={_i_filled_qty:.4f} score={_iout.get('rationale','')} daily={_daily_trade_count}")
                         with open(diary_path, "a") as _idf:
                             _idf.write(json.dumps({
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
                                 "asset": _ia, "action": _iout["action"],
                                 "order_type": "market", "allocation_usd": float(_iout["allocation_usd"]),
-                                "amount": _iamt, "entry_price": _iprice,
+                                "amount": _itp_sl_size, "filled_qty": _i_filled_qty, "entry_price": _iprice,
                                 "tp_price": _iout.get("tp_price"), "sl_price": _iout.get("sl_price"),
                                 "exit_plan": _iout.get("exit_plan", ""),
                                 "rationale": _iout.get("rationale", ""),
@@ -1726,7 +1964,7 @@ def main():
     async def handle_diary(request):
         """Return diary entries as JSON — reads from decisions.jsonl for rich data."""
         try:
-            limit = int(request.query.get('limit', '200'))
+            limit = min(int(request.query.get('limit', '200')), 5000)  # V6-LOW-4: cap prevents OOM on large diary files
 
             entries = []
 
@@ -1882,13 +2120,42 @@ def main():
         """Serve the trading dashboard HTML."""
         dashboard = pathlib.Path(__file__).parent.parent / 'dashboard.html'
         try:
-            return web.Response(text=dashboard.read_text(encoding='utf-8'), content_type='text/html')
+            resp = web.Response(text=dashboard.read_text(encoding='utf-8'), content_type='text/html')
         except FileNotFoundError:
-            return web.Response(text=f'<h1>dashboard.html not found at {dashboard}</h1>', content_type='text/html', status=404)
+            resp = web.Response(text=f'<h1>dashboard.html not found at {dashboard}</h1>', content_type='text/html', status=404)
+        # V6-LOW-3: Defensive security headers — low-risk given 127.0.0.1 default bind,
+        # but important if API_HOST is ever set to expose the dashboard on a network interface.
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["X-Frame-Options"] = "DENY"
+        resp.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "style-src 'unsafe-inline'; "
+            "connect-src 'self'; "
+            "img-src 'self' data:; "
+            "font-src 'self';"
+        )
+        return resp
+
+    async def handle_meta(request):
+        """Return bot metadata: start date, auth enabled flag."""
+        _meta_path = pathlib.Path(__file__).parent.parent / "bot_started.json"
+        _started = None
+        try:
+            if _meta_path.exists():
+                _started = json.loads(_meta_path.read_text())
+        except Exception:
+            pass
+        return web.json_response({
+            "bot_started": _started.get("started_at") if _started else None,
+            "auth_enabled": bool(CONFIG.get("dashboard_token")),
+            "network": (CONFIG.get("hyperliquid_network") or "mainnet").upper(),
+        })
 
     async def start_api(app):
         """Register HTTP endpoints for observing diary entries and logs."""
         app.router.add_get('/', handle_index)
+        app.router.add_get('/meta', handle_meta)
         app.router.add_get('/diary', handle_diary)
         app.router.add_get('/live', handle_live)
         app.router.add_get('/fills', handle_fills)
@@ -1897,8 +2164,18 @@ def main():
 
     async def main_async():
         """Start the aiohttp server and kick off the trading loop."""
-        # Pass cors_middleware here so every response gets CORS headers
-        app = web.Application(middlewares=[cors_middleware])
+        # Persist bot start date once (survives diary rotation — used by dashboard "Active Since")
+        _started_path = pathlib.Path(__file__).parent.parent / "bot_started.json"
+        if not _started_path.exists():
+            try:
+                _tmp = str(_started_path) + ".tmp"
+                with open(_tmp, "w", encoding="utf-8") as _sf:
+                    json.dump({"started_at": datetime.now(timezone.utc).isoformat()}, _sf)
+                os.replace(_tmp, str(_started_path))
+            except Exception as _se:
+                logging.warning("[BOOT] could not write bot_started.json: %s", _se)
+
+        app = web.Application(middlewares=[cors_middleware, auth_middleware])
         await start_api(app)
         runner = web.AppRunner(app)
         await runner.setup()
@@ -1939,11 +2216,15 @@ def main():
     def _handle_signal(signum, frame):
         global _shutdown
         _shutdown = True
+        _release_instance_lock()
         logging.info("[SHUTDOWN] Signal %d received", signum)
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
-    asyncio.run(main_async())
+    try:
+        asyncio.run(main_async())
+    finally:
+        _release_instance_lock()
 
 
 if __name__ == "__main__":

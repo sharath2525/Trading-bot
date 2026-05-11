@@ -344,6 +344,24 @@ class HyperliquidAPI:
                 break
         raise last_err if last_err else RuntimeError(f"Trigger {tpsl_type} placement failed after retries")
 
+    async def set_leverage(self, asset: str, leverage: int, is_cross: bool = True) -> dict:
+        """Set exchange-side leverage for asset before placing any order.
+
+        FL-1 FIX: Without this call, Hyperliquid uses whatever leverage the user
+        last set in the web UI — MAX_LEVERAGE in .env has no effect on actual positions.
+        Fails closed: any exception is logged and re-raised so the caller can abort
+        order placement rather than trade at unknown leverage.
+        """
+        try:
+            result = await self._retry(
+                lambda: self.exchange.update_leverage(leverage, asset, is_cross)
+            )
+            logging.info("[LEVERAGE] %s set to %dx (cross=%s)", asset, leverage, is_cross)
+            return result or {}
+        except Exception as e:
+            logging.error("[LEVERAGE] failed to set %dx for %s: %s", leverage, asset, e)
+            raise
+
     async def place_take_profit(self, asset, is_buy, amount, tp_price):
         """Create a reduce-only trigger order that executes a take-profit exit.
 

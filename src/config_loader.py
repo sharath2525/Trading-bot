@@ -77,34 +77,31 @@ CONFIG = {
     "hyperliquid_vault_address": _get_env("HYPERLIQUID_VAULT_ADDRESS"),  # Main wallet address (agent signs on behalf)
 
     # LLM — Anthropic Claude API (primary)
+    # NOTE: model and token settings for confirm_trade() are set directly in
+    # decision_maker.py (haiku, ai_max_tokens). LLM_MODEL / MAX_TOKENS / ENABLE_TOOL_CALLING
+    # / THINKING_ENABLED are NOT active — removed to avoid operator confusion.
     "anthropic_api_key": _get_env("ANTHROPIC_API_KEY", required=True),
-    "llm_model": _get_env("LLM_MODEL", "claude-haiku-4-5-20251001"),
-    "sanitize_model": _get_env("SANITIZE_MODEL", "claude-haiku-4-5-20251001"),
-    "max_tokens": _get_int("MAX_TOKENS", 4096),
-    "enable_tool_calling": _get_bool("ENABLE_TOOL_CALLING", False),
-    "max_tool_iterations": _get_int("MAX_TOOL_ITERATIONS", 3),
-
-    # Extended thinking (Claude)
-    "thinking_enabled": _get_bool("THINKING_ENABLED", False),
-    "thinking_budget_tokens": _get_int("THINKING_BUDGET_TOKENS", 10000),
 
     # Runtime controls
     "assets": _get_env("ASSETS"),  # e.g., "BTC ETH SOL OIL GOLD SPX"
     "interval": _get_env("INTERVAL"),  # e.g., "5m", "1h"
 
-    # Risk management
-    "max_position_pct": _get_env("MAX_POSITION_PCT", "20"),
-    "max_loss_per_position_pct": _get_env("MAX_LOSS_PER_POSITION_PCT", "20"),
-    "max_leverage": _get_env("MAX_LEVERAGE", "10"),
-    "max_total_exposure_pct": _get_env("MAX_TOTAL_EXPOSURE_PCT", "80"),
-    "daily_loss_circuit_breaker_pct": _get_env("DAILY_LOSS_CIRCUIT_BREAKER_PCT", "25"),
-    "mandatory_sl_pct": _get_env("MANDATORY_SL_PCT", "5"),
-    "max_concurrent_positions": _get_env("MAX_CONCURRENT_POSITIONS", "10"),
-    "min_balance_reserve_pct": _get_env("MIN_BALANCE_RESERVE_PCT", "10"),
+    # Risk management — defaults are conservative safe values, not permissive ones.
+    # If .env is missing or incomplete, the bot warns via H-3 in main.py and uses these.
+    # All values here should match the "recommended" column in the H-3 _risk_defaults dict.
+    "max_position_pct": _get_env("MAX_POSITION_PCT", "15"),           # was 20 (permissive)
+    "max_loss_per_position_pct": _get_env("MAX_LOSS_PER_POSITION_PCT", "8"),  # was 20 (permissive)
+    "max_leverage": _get_env("MAX_LEVERAGE", "5"),
+    "max_total_exposure_pct": _get_env("MAX_TOTAL_EXPOSURE_PCT", "50"),       # was 80 (permissive)
+    "daily_loss_circuit_breaker_pct": _get_env("DAILY_LOSS_CIRCUIT_BREAKER_PCT", "12"),  # was 25
+    "mandatory_sl_pct": _get_env("MANDATORY_SL_PCT", "3"),            # was 5
+    "max_concurrent_positions": _get_env("MAX_CONCURRENT_POSITIONS", "2"),    # was 10 (permissive)
+    "min_balance_reserve_pct": _get_env("MIN_BALANCE_RESERVE_PCT", "20"),     # was 10 (permissive)
 
     # API server
     "api_host": _get_env("API_HOST", "127.0.0.1"),
     "api_port": _get_env("APP_PORT") or _get_env("API_PORT") or "3000",
+    "dashboard_token": _get_env("DASHBOARD_TOKEN"),  # Bearer token for dashboard auth; unset = no auth
 
     # Time-based exit and scoring thresholds
     "max_trade_hours": _get_int("MAX_TRADE_HOURS", 12),

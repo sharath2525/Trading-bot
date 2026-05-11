@@ -24,9 +24,11 @@ ACTIVE_TRADES_FILE = os.path.join(
 
 
 def save_active_trades(active_trades: list) -> None:
+    tmp = ACTIVE_TRADES_FILE + ".tmp"
     try:
-        with open(ACTIVE_TRADES_FILE, "w") as f:
+        with open(tmp, "w") as f:
             json.dump(active_trades, f, default=str)
+        os.replace(tmp, ACTIVE_TRADES_FILE)
     except Exception as e:
         logging.warning("[STATE] failed to save active_trades.json: %s", e)
 

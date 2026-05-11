@@ -22,13 +22,13 @@ class RiskManager:
     """Enforces risk limits on every trade before execution."""
 
     def __init__(self):
-        self.max_position_pct = float(CONFIG.get("max_position_pct") or 10)
-        self.max_loss_per_position_pct = float(CONFIG.get("max_loss_per_position_pct") or 20)
-        self.max_leverage = float(CONFIG.get("max_leverage") or 10)
+        self.max_position_pct = float(CONFIG.get("max_position_pct") or 15)
+        self.max_loss_per_position_pct = float(CONFIG.get("max_loss_per_position_pct") or 8)
+        self.max_leverage = float(CONFIG.get("max_leverage") or 5)
         self.max_total_exposure_pct = float(CONFIG.get("max_total_exposure_pct") or 50)
-        self.daily_loss_circuit_breaker_pct = float(CONFIG.get("daily_loss_circuit_breaker_pct") or 10)
-        self.mandatory_sl_pct = float(CONFIG.get("mandatory_sl_pct") or 5)
-        self.max_concurrent_positions = int(CONFIG.get("max_concurrent_positions") or 10)
+        self.daily_loss_circuit_breaker_pct = float(CONFIG.get("daily_loss_circuit_breaker_pct") or 12)
+        self.mandatory_sl_pct = float(CONFIG.get("mandatory_sl_pct") or 3)
+        self.max_concurrent_positions = int(CONFIG.get("max_concurrent_positions") or 2)
         self.min_balance_reserve_pct = float(CONFIG.get("min_balance_reserve_pct") or 20)
 
         # Daily tracking
@@ -137,17 +137,20 @@ class RiskManager:
         return True, ""
 
     def check_leverage(self, alloc_usd: float, account_value: float) -> tuple[bool, str]:
-        """Effective leverage of new trade cannot exceed max_leverage.
+        """Final backstop: allocation must not exceed total buying power (equity × max_leverage).
 
-        effective_leverage = allocation / account_value (equity denominator).
-        Using balance (same as account_value here) was previously named misleadingly.
+        FL-2 NOTE: This check is belt-and-suspenders after step 3 (pct_cap). Step 3 already
+        limits allocation to buying_power × max_position_pct, which is always under
+        buying_power. This guard only fires if step 3 somehow fails or is bypassed.
+        It does NOT enforce exchange-side leverage — that is done by set_leverage() (FL-1 fix).
         """
         if account_value <= 0:
             return False, "Account value is zero or negative"
-        effective_lev = alloc_usd / account_value
-        if effective_lev > self.max_leverage:
+        buying_power = account_value * self.max_leverage
+        if alloc_usd > buying_power:
             return False, (
-                f"Effective leverage {effective_lev:.1f}x exceeds max {self.max_leverage}x"
+                f"Allocation ${alloc_usd:.2f} exceeds total buying power "
+                f"${buying_power:.2f} ({self.max_leverage}x leverage on ${account_value:.2f})"
             )
         return True, ""
 
@@ -295,7 +298,11 @@ class RiskManager:
             if notional == 0:
                 continue
 
-            loss_pct = abs(pnl / notional) * 100 if pnl < 0 else 0
+            # FL-3 FIX: Use margin-based loss, not notional-based.
+            # At 5x leverage: notional=$1000, margin=$200. A $16 loss is 8% of margin
+            # but only 1.6% of notional — the old formula would never trigger force-close.
+            margin = notional / self.max_leverage if self.max_leverage > 0 else notional
+            loss_pct = abs(pnl / margin) * 100 if pnl < 0 else 0
 
             if loss_pct >= self.max_loss_per_position_pct:
                 logging.warning(

@@ -135,9 +135,9 @@ def entry_confirmed(asset_data: dict, direction: str) -> bool:
         return False
 
     macd_15m = float(s15.get("macd_histogram") or 0)
-    near_ema  = s15.get("near_ema", True)
+    near_ema  = bool(s15.get("near_ema", False))  # E-1 FIX: default False — missing data blocks entry
     macd_5m   = float(t5.get("macd_histogram") or 0)
-    bull_5m   = t5.get("candle_bullish", True)
+    bull_5m   = t5.get("candle_bullish", False)  # V3-MEDIUM-1 FIX: default False — missing data blocks entry
 
     # Price-relative MACD threshold (0.1% of price).
     # A fixed ±50 is meaningless for high-priced assets where MACD swings in hundreds.
@@ -160,12 +160,14 @@ def entry_confirmed(asset_data: dict, direction: str) -> bool:
                 trigger_vol, avg_vol,
             )
     else:
-        vol_ok = True  # not enough candles to judge, allow through
+        vol_ok = False  # insufficient candle history — block entry rather than allow with no volume data
 
     if direction == "buy":
         return vol_ok and (near_ema and macd_15m > -macd_threshold) and (bull_5m or macd_5m > 0)
 
+    # H-1 FIX: sell requires genuinely negative MACD (< -threshold), not just below positive threshold.
+    # Old code used `< macd_threshold` (positive number) which passed on neutral/mildly-positive MACD.
     if direction == "sell":
-        return vol_ok and (near_ema and macd_15m < macd_threshold) and ((not bull_5m) or macd_5m < 0)
+        return vol_ok and (near_ema and macd_15m < -macd_threshold) and ((not bull_5m) or macd_5m < 0)
 
     return True

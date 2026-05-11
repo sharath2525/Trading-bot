@@ -74,6 +74,7 @@ tr:last-child td { border-bottom: none; }
   <h1>Trading Desk</h1>
   <div class="header-sub">
     <span><span class="dot" id="dot1"></span><span id="s1">Connecting...</span></span>
+    <span id="sNet" style="font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;display:none;"></span>
     <span id="upd">—</span>
   </div>
 </div>
@@ -147,8 +148,51 @@ tr:last-child td { border-bottom: none; }
 
 </div><!-- /container -->
 <script>
-// Auto-detect: relative when served from server, absolute when opened locally
-const API = window.location.protocol === 'file:' ? 'http://209.38.120.100:3000' : '';
+// Dashboard is always served from the bot's own HTTP server at '/'.
+// Open it via http://localhost:3000 (or SSH tunnel for remote servers).
+const API = '';
+
+// ── Auth (V4-HIGH-1) ──────────────────────────────────────────────────────────
+// If DASHBOARD_TOKEN is set in .env the server requires "Authorization: Bearer <token>".
+// The token is stored in localStorage so it persists across page reloads.
+let _tok = localStorage.getItem('dash_token') || '';
+function authHeaders() { return _tok ? {'Authorization': 'Bearer '+_tok} : {}; }
+function apiFetch(url, opts={}) {
+  return fetch(API+url, {...opts, headers: {...authHeaders(), ...(opts.headers||{})}});
+}
+
+// Prompt for token on 401 — only shown when server has auth enabled.
+async function checkAuth() {
+  try {
+    const r = await apiFetch('/meta');
+    if (r.status === 401) {
+      const t = prompt('Dashboard token required (set DASHBOARD_TOKEN in .env):', '');
+      if (t) { localStorage.setItem('dash_token', t); _tok = t; }
+    } else {
+      const m = await r.json();
+      if (m.bot_started) {
+        const el = document.getElementById('sAct');
+        if (el) {
+          const d = new Date(m.bot_started);
+          if (!isNaN(d.getTime()))
+            el.textContent = d.toLocaleDateString([], {month:'short', day:'numeric', year:'numeric'});
+        }
+      }
+      // Network indicator — prominent warning when on testnet
+      if (m.network) {
+        const netEl = document.getElementById('sNet');
+        if (netEl) {
+          netEl.textContent = m.network;
+          const isTestnet = m.network === 'TESTNET';
+          netEl.style.background = isTestnet ? '#854d0e' : '#14532d';
+          netEl.style.color = isTestnet ? '#fef08a' : '#bbf7d0';
+          netEl.style.display = 'inline-block';
+        }
+      }
+    }
+  } catch(e) { /* offline */ }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 let entries = [];   // diary entries
 let live    = {};   // /live data
@@ -161,12 +205,15 @@ const fpnl = n => { const x=parseFloat(n); return isNaN(x)?'—':(x>=0?'+':'')+f
 const fpct = n => { const x=parseFloat(n); return isNaN(x)?'—':(x>=0?'+':'')+f2(x,2)+'%'; };
 const pc   = n => parseFloat(n)>=0?'g':'r';
 const lev  = l => { if(!l) return '—'; if(typeof l==='number') return l+'x'; if(typeof l==='object') return (l.value||'')+'x'+(l.type?' '+l.type:''); return l; };
+// V4-LOW-4: safe date — returns '—' for null/invalid timestamps
+const safeDate = (ts, fmt) => { if(!ts) return '—'; const d=new Date(ts); return isNaN(d.getTime())?'—':fmt(d); };
 
 // ── Load diary first — shows data immediately ─────────────────────────────────
 async function loadDiary() {
   try {
-    const r = await fetch(`${API}/diary?limit=5000`);
-    if (!r.ok) throw new Error('HTTP '+r.status);
+    // V4-MEDIUM-2: reduced from 5000 to 200 entries — prevents 25MB payloads blocking the event loop
+    const r = await apiFetch('/diary?limit=200');
+    if (!r.ok) { if(r.status===401){await checkAuth();} throw new Error('HTTP '+r.status); }
     const d = await r.json();
     entries = Array.isArray(d) ? d : (d.entries||[]);
 
@@ -186,7 +233,7 @@ async function loadDiary() {
 // ── Load live data in background (slower, makes HL API call) ─────────────────
 async function loadLive() {
   try {
-    const r = await fetch(`${API}/live`);
+    const r = await apiFetch('/live');
     if (!r.ok) return;
     live = await r.json();
     if (live.error) return;
@@ -199,7 +246,6 @@ async function loadLive() {
 
 // Show last-known values from diary immediately
 function renderStatsFast() {
-  // find latest diary entry with a valid account value
   let latest = null;
   for (let i=entries.length-1;i>=0;i--) {
     if (parseFloat(entries[i].account_value)>0) { latest=entries[i]; break; }
@@ -207,7 +253,6 @@ function renderStatsFast() {
   if (!latest) return;
 
   const av  = parseFloat(latest.account_value);
-  const bal = parseFloat(latest.balance||0);
   const pos = Array.isArray(latest.positions)?latest.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
 
   document.getElementById('sVal').textContent = fu(av);
@@ -225,13 +270,20 @@ function renderStatsFast() {
   let b=0,s=0; entries.forEach(e=>(e.decisions||[]).forEach(d=>{const a=(d.action||'').toLowerCase();if(a==='buy')b++;else if(a==='sell')s++;}));
   document.getElementById('sCyc').textContent=entries.length;
   document.getElementById('sTrd').textContent=b+s;
-  if(entries.length) document.getElementById('sAct').textContent=new Date(entries[0].timestamp).toLocaleDateString([],{month:'short',day:'numeric',year:'numeric'});
+  // V4-LOW-3: "Active Since" is set from /meta (bot_started.json) in checkAuth().
+  // Fall back to first diary entry only if meta hasn't loaded yet.
+  if(entries.length) {
+    const el=document.getElementById('sAct');
+    if(el && el.textContent==='—') {
+      const d=new Date(entries[0].timestamp);
+      if(!isNaN(d.getTime())) el.textContent=d.toLocaleDateString([],{month:'short',day:'numeric',year:'numeric'});
+    }
+  }
 }
 
 // Update with fresh live values
 function renderStatsLive() {
   const av  = parseFloat(live.account_value||0);
-  const bal = parseFloat(live.balance||0);
   const pos = Array.isArray(live.positions)?live.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
 
   if(av>0) document.getElementById('sVal').textContent=fu(av);
@@ -243,12 +295,11 @@ function renderStatsLive() {
   let upnl=0; pos.forEach(p=>{const v=parseFloat(p.unrealized_pnl||0);if(!isNaN(v))upnl+=v;});
   const uel=document.getElementById('sUpnl'); uel.textContent=fpnl(upnl); uel.className='stat-val '+(upnl>=0?'g':'r');
 
-  // update return with live value
   const first=entries.find(e=>parseFloat(e.account_value)>0);
   if(first&&av>0){ const ret=((av-parseFloat(first.account_value))/parseFloat(first.account_value))*100; const re=document.getElementById('sRet'); re.textContent=fpct(ret); re.className='stat-val '+pc(ret); }
 }
 
-// ── P&L ───────────────────────────────────────────────────────────────────────
+// ── P&L (V4-MEDIUM-3: label clarifies unrealized is included) ─────────────────
 function renderPnL() {
   const curAV = parseFloat(live.account_value) || (() => { for(let i=entries.length-1;i>=0;i--){const v=parseFloat(entries[i].account_value);if(v>0)return v;} return 0; })();
   if(!curAV) return;
@@ -258,7 +309,7 @@ function renderPnL() {
     if(!base) return;
     const usd=curAV-base, pct=(usd/base)*100;
     const u=document.getElementById(uid),p=document.getElementById(pid);
-    u.textContent=(usd>=0?'+':'')+fu(usd); u.style.color=usd>=0?'#22c55e':'#ef4444';
+    u.textContent=(usd>=0?'+':'')+fu(usd)+' *'; u.style.color=usd>=0?'#22c55e':'#ef4444';
     p.textContent=fpct(pct); p.style.color=pct>=0?'#22c55e':'#ef4444';
   };
 
@@ -272,6 +323,18 @@ function renderPnL() {
   set('p7','p7p',ago7);
   set('p30','p30p',ago30);
   set('pa','pap',first);
+
+  // Footnote: * = includes unrealized mark-to-market PnL from open positions.
+  // Appended to .pnl-row (the grid container), not #p0 (which gets its textContent
+  // cleared on every render call — the closest('div[id]') bug returned #p0 itself).
+  const pnlRow = document.querySelector('.pnl-row');
+  if(pnlRow && !pnlRow.querySelector('.pnl-note')) {
+    const note = document.createElement('div');
+    note.className='pnl-note';
+    note.style.cssText='font-size:10px;color:#aaa;margin-top:6px;grid-column:1/-1;text-align:center;padding:0 14px 8px;';
+    note.textContent='* Includes unrealized mark-to-market P&L from open positions';
+    pnlRow.appendChild(note);
+  }
 }
 
 // ── Charts ────────────────────────────────────────────────────────────────────
@@ -286,9 +349,7 @@ function renderCharts() {
   const ms={'1d':864e5,'1w':7*864e5,'1m':30*864e5,'all':Infinity}[cRange]||Infinity;
   const cut=Date.now()-ms;
 
-  // Account value line chart
   let pts=entries.filter(e=>new Date(e.timestamp).getTime()>=cut&&parseFloat(e.account_value)>0);
-  // Add live value as last point if newer
   if(live.account_value&&live.timestamp){
     const liveT=new Date(live.timestamp).getTime();
     if(!pts.length||liveT>new Date(pts[pts.length-1].timestamp).getTime())
@@ -308,7 +369,6 @@ function renderCharts() {
     });
   }
 
-  // Daily P&L bar chart
   const byDay={};
   entries.forEach(e=>{
     if(!parseFloat(e.account_value)) return;
@@ -359,27 +419,38 @@ function renderFills() {
   const rows=Array.isArray(live.recent_fills)?[...live.recent_fills].reverse():[];
   const tb=document.getElementById('tFill');
   if(!rows.length){tb.innerHTML='<tr class="empty"><td colspan="6">No fills yet</td></tr>';return;}
+  // V4-LOW-4: guard against Invalid Date string in fills table
   tb.innerHTML=rows.map(f=>{
-    const buy=f.is_buy??f.isBuy,t=f.timestamp?new Date(f.timestamp).toLocaleString():'—',val=(parseFloat(f.size||0)*parseFloat(f.price||0))||null;
+    const buy=f.is_buy??f.isBuy;
+    const t=safeDate(f.timestamp, d=>d.toLocaleString());
+    const val=(parseFloat(f.size||0)*parseFloat(f.price||0))||null;
     return `<tr><td style="font-size:10px;color:#888;">${t}</td><td><strong>${f.coin||'—'}</strong></td><td><span class="badge ${buy?'buy':'sell'}">${buy!=null?(buy?'BUY':'SELL'):'—'}</span></td><td>${f2(f.size||0,4)||'—'}</td><td>${fu(f.price)}</td><td>${val?fu(val):'—'}</td></tr>`;
   }).join('');
 }
 
+// V4-MEDIUM-1: fixed togR — reasoning text stored in data-full (encodeURIComponent)
+// so double-quotes in Claude analysis no longer break the onclick attribute.
 function renderAI() {
   const cont=document.getElementById('aiCont');
   if(!entries.length){cont.innerHTML='<div style="color:#aaa;font-style:italic;">No decisions yet.</div>';return;}
   cont.innerHTML='';
   [...entries].reverse().slice(0,60).forEach((e,i)=>{
-    const decs=e.decisions||[],r=e.reasoning||'',t=e.timestamp?new Date(e.timestamp).toLocaleString():'—';
+    const decs=e.decisions||[],r=e.reasoning||'',t=safeDate(e.timestamp, d=>d.toLocaleString());
     const badges=decs.map(d=>{const a=(d.action||'hold').toLowerCase();return `<span class="badge ${a}" style="margin-right:4px;">${d.asset||'?'}: ${a.toUpperCase()}${d.allocation_usd>0?' $'+d.allocation_usd:''}</span>`;}).join('');
     const safe=r.replace(/</g,'&lt;').replace(/>/g,'&gt;'),preview=safe.slice(0,280),more=safe.length>280;
     const div=document.createElement('div'); div.className='dcard';
-    div.innerHTML=`<div class="dcard-hdr"><div>${badges||'<span style="color:#aaa;font-size:11px;">No decisions</span>'}</div><div class="dcard-time">${e.cycle?'Cycle #'+e.cycle+' · ':''}${t}</div></div>${r?`<div class="reason" id="rr${i}">${preview}${more?'...':''}</div>${more?`<button class="tog" onclick="togR(${i},this,${JSON.stringify(safe)})">Show more</button>`:''}`:``}`;
+    const showBtn=more?`<button class="tog" data-idx="${i}" data-full="${encodeURIComponent(safe)}" onclick="togR(this)">Show more</button>`:'';
+    div.innerHTML=`<div class="dcard-hdr"><div>${badges||'<span style="color:#aaa;font-size:11px;">No decisions</span>'}</div><div class="dcard-time">${e.cycle?'Cycle #'+e.cycle+' · ':''}${t}</div></div>${r?`<div class="reason" id="rr${i}">${preview}${more?'...':''}</div>${showBtn}`:``}`;
     cont.appendChild(div);
   });
 }
 
-function togR(i,btn,full){const el=document.getElementById('rr'+i);if(el.classList.contains('open')){el.innerHTML=full.slice(0,280)+'...';el.classList.remove('open');btn.textContent='Show more';}else{el.innerHTML=full;el.classList.add('open');btn.textContent='Show less';}}
+function togR(btn){
+  const full=decodeURIComponent(btn.dataset.full), i=btn.dataset.idx;
+  const el=document.getElementById('rr'+i);
+  if(el.classList.contains('open')){el.innerHTML=full.slice(0,280)+'...';el.classList.remove('open');btn.textContent='Show more';}
+  else{el.innerHTML=full;el.classList.add('open');btn.textContent='Show less';}
+}
 
 function show(name,btn){
   ['pos','fills','orders','ai'].forEach(t=>{document.getElementById('tab-'+t).style.display=t===name?'block':'none';});
@@ -388,8 +459,9 @@ function show(name,btn){
 }
 
 async function init() {
-  await loadDiary();        // fast — shows data immediately
-  loadLive();               // async — updates in background, no wait
+  await checkAuth();         // fetch /meta: bot start date + auth check
+  await loadDiary();         // fast — shows data immediately
+  loadLive();                // async — updates in background, no wait
 }
 
 setInterval(loadDiary, 60000);
