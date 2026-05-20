@@ -524,6 +524,18 @@ def main():
     def add_event(msg: str):
         logging.info(msg)
 
+    async def _interruptible_sleep(seconds: float) -> None:
+        """Sleep for `seconds` but wake within 5s if _shutdown is set by SIGTERM/SIGINT.
+
+        Replaces bare asyncio.sleep() in long waits so the bot shuts down quickly
+        instead of waiting up to 5 minutes for the inner-loop tick to complete.
+        """
+        elapsed = 0.0
+        while elapsed < seconds and not _shutdown:
+            chunk = min(5.0, seconds - elapsed)
+            await asyncio.sleep(chunk)
+            elapsed += chunk
+
     async def run_loop():
         """Main trading loop that gathers data, calls the agent, and executes trades."""
         global _shutdown  # V3-CRITICAL-1 FIX: without this, `_shutdown = True` inside the inner loop
@@ -831,10 +843,10 @@ def main():
                     )
                     add_event(f"[LOOP] Circuit breaker: sleeping 5 minutes after {_consecutive_failures} failures")
                     await send_alert(f"⚠️ API circuit breaker: {_consecutive_failures} consecutive failures — sleeping 5 min before retry.")
-                    await asyncio.sleep(300)
+                    await _interruptible_sleep(300)
                     _consecutive_failures = 0
                 else:
-                    await asyncio.sleep(_interval_seconds)
+                    await _interruptible_sleep(_interval_seconds)
                 continue
             total_value = state.get('total_value') or (state.get('balance', 0) + sum(p.get('pnl', 0) for p in state.get('positions', [])))
             sharpe = calculate_sharpe_from_diary(diary_path)
@@ -2147,7 +2159,7 @@ def main():
             # Runs 11 more ticks (outer loop already counted as tick 0).
             # Only re-fetches 5m candles — 4h trend/indicators stay from outer loop.
             for _tick in range(11):
-                await asyncio.sleep(300)  # 5 minutes
+                await _interruptible_sleep(300)  # 5 minutes — wakes within 5s on SIGTERM
 
                 # BUG-5 FIX: Check KILLSWITCH inside the inner loop.
                 # Without this, operator creates KILLSWITCH expecting immediate halt but bot
