@@ -21,10 +21,11 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 from src.agent.decision_maker import TradingAgent
+from src.alerts import send_alert
 from src.config_loader import CONFIG
 from src.indicators.local_indicators import compute_all, last_n, latest
 from src.risk_manager import RiskManager
-from src.strategy import entry_confirmed, market_filter, compute_signal_score
+from src.strategy import entry_confirmed, market_filter, compute_signal_score, is_trending_regime, oi_confirmed
 from src.trade_state import TradeStateMachine, load_active_trades, save_active_trades
 from src.trading.hyperliquid_api import HyperliquidAPI
 from src.utils.prompt_utils import json_default, round_or_none, round_series
@@ -68,6 +69,59 @@ def _release_instance_lock() -> None:
             _INSTANCE_LOCK_SOCK.close()
         except OSError:
             pass
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── CRITICAL-7: Daily trade count persistence across restarts ─────────────────
+_DAILY_COUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "daily_count.json")
+
+def _load_daily_count() -> tuple[int, str | None]:
+    """Return (count, date_str) from daily_count.json, or (0, None) if missing/corrupt."""
+    try:
+        p = os.path.normpath(_DAILY_COUNT_FILE)
+        if os.path.exists(p):
+            with open(p) as _f:
+                d = json.load(_f)
+                return int(d.get("count", 0)), d.get("date")
+    except Exception as _e:
+        logging.warning("[DAILY COUNT] load failed: %s", _e)
+    return 0, None
+
+def _save_daily_count(count: int, date: str) -> None:
+    """Atomically write daily trade count to disk."""
+    try:
+        p = os.path.normpath(_DAILY_COUNT_FILE)
+        tmp = p + ".tmp"
+        with open(tmp, "w") as _f:
+            json.dump({"count": count, "date": date}, _f)
+        os.replace(tmp, p)
+    except Exception as _e:
+        logging.warning("[DAILY COUNT] save failed: %s", _e)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── P3-M2: Diary index — compact per-asset index so guardian avoids full scan ──
+_DIARY_INDEX_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "diary_index.json")
+
+def _load_diary_index() -> dict:
+    """Return {asset: latest_trade_entry_dict} from diary_index.json."""
+    try:
+        p = os.path.normpath(_DIARY_INDEX_FILE)
+        if os.path.exists(p):
+            with open(p) as _f:
+                return json.load(_f)
+    except Exception as _e:
+        logging.warning("[DIARY INDEX] load failed: %s", _e)
+    return {}
+
+def _save_diary_index(index: dict) -> None:
+    """Atomically write the diary index."""
+    try:
+        p = os.path.normpath(_DIARY_INDEX_FILE)
+        tmp = p + ".tmp"
+        with open(tmp, "w") as _f:
+            json.dump(index, _f)
+        os.replace(tmp, p)
+    except Exception as _e:
+        logging.warning("[DIARY INDEX] save failed: %s", _e)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── E-4: Bounded log rotation for append-only JSONL files ────────────────────
@@ -131,28 +185,103 @@ def get_interval_seconds(interval_str):
 
 
 def _code_decide_direction(asset_data: dict) -> str | None:
-    """Return 'buy', 'sell', or None from 4h/1h trend alignment.
+    """Return 'buy', 'sell', or None from 4h/1h trend alignment plus regime gates.
 
-    Returns None when trend_4h is UNKNOWN or trends conflict.
-    Called before scoring — no counter-trend trades ever reach the score gate.
+    Gates (all must pass before any direction is returned):
+    1. 4h EMA20/50 trend alignment (existing, unchanged)
+    2. 1h ADX > 25 — must be trending, not ranging (MOVED from entry_confirmed)
+    3. Daily bias — 1d candle direction aligns with trade direction
+    4. BB width regime — BB width above 20-period median (not ranging)
+    Returns None when any gate fails.
     """
     trend_4h = asset_data.get("trend_4h", "UNKNOWN")
     trend_1h = asset_data.get("trend_1h", "UNKNOWN")
     if trend_4h == "UNKNOWN":
         return None
     if trend_4h == "BULLISH" and trend_1h in ("BULLISH", "UNKNOWN"):
-        return "buy"
-    if trend_4h == "BEARISH" and trend_1h in ("BEARISH", "UNKNOWN"):
-        return "sell"
-    return None  # conflicting trends — 4h and 1h disagree
+        _direction = "buy"
+    elif trend_4h == "BEARISH" and trend_1h in ("BEARISH", "UNKNOWN"):
+        _direction = "sell"
+    else:
+        return None  # conflicting trends
+
+    # ADX gate — must be trending (ADX > 25) on 1h BEFORE scoring (not downstream in entry_confirmed)
+    _adx_1h = asset_data.get("intraday_1h", {}).get("adx")
+    if _adx_1h is not None and float(_adx_1h) < 25:
+        logging.debug(
+            "[DIRECTION] %s blocked — 1h ADX %.1f < 25 (ranging, not trending)",
+            asset_data.get("asset", "?"), float(_adx_1h)
+        )
+        return None
+
+    # Daily bias — 1d candle should agree with direction
+    # A green daily candle (close > open) supports BUY; red supports SELL
+    _daily = asset_data.get("daily_1d", {})
+    _d_close = float(_daily.get("close") or 0)
+    _d_open  = float(_daily.get("open") or 0)
+    if _d_close > 0 and _d_open > 0:
+        _daily_bullish = _d_close > _d_open
+        if _direction == "buy" and not _daily_bullish:
+            logging.debug(
+                "[DIRECTION] %s BUY blocked — daily candle is bearish (close %.4f < open %.4f)",
+                asset_data.get("asset", "?"), _d_close, _d_open
+            )
+            return None
+        if _direction == "sell" and _daily_bullish:
+            logging.debug(
+                "[DIRECTION] %s SELL blocked — daily candle is bullish (close %.4f > open %.4f)",
+                asset_data.get("asset", "?"), _d_close, _d_open
+            )
+            return None
+
+    # BB width regime — only trade when BB width is above its 20-period median (trending)
+    if not is_trending_regime(asset_data):
+        logging.debug("[DIRECTION] %s blocked — BB width below median (ranging regime)",
+                      asset_data.get("asset", "?"))
+        return None
+
+    return _direction
 
 
-def _code_compute_tpsl(entry: float, atr: float, direction: str) -> tuple[float, float]:
-    """Return (tp_price, sl_price) using 2×ATR TP / 1×ATR SL with round-trip fee buffer baked in."""
-    fee_buffer = entry * float(CONFIG.get("taker_fee_pct") or 0.00045) * 2  # entry + exit fee
+def _code_compute_tpsl(entry: float, atr: float, direction: str, score: float = 7.0) -> tuple[float, float, float, float]:
+    """Return (tp1, tp2, sl, tp_main) — score-adaptive TP with partial-close levels.
+
+    tp1     = 1.0×ATR  — close 50% of position (lock profit)
+    tp2     = 3.0×ATR  — let remaining 50% run
+    tp_main = score-adaptive single TP level used for primary trigger order:
+              score >= 10.0 → 2.5×ATR  (perfect base + volume bonus — highest conviction)
+              score >= 9.0  → 2.2×ATR
+              score >= 8.0  → 2.0×ATR
+              score >= 7.0  → 1.8×ATR  (minimum passing setup)
+    sl      = 1.0×ATR from entry always (MASTER RULE 4)
+    Fee buffer baked into all levels. Code owns all TP/SL (MASTER RULE 2).
+    Score scale is 0–11; tiers anchored to updated scale (MASTER RULES 2026-05-20).
+    """
+    fee_buffer = entry * float(CONFIG.get("taker_fee_pct") or 0.00045) * 2
+
+    if score >= 10.0:
+        tp_mult = 2.5
+    elif score >= 9.0:
+        tp_mult = 2.2
+    elif score >= 8.0:
+        tp_mult = 2.0
+    elif score >= 7.0:
+        tp_mult = 1.8
+    else:
+        tp_mult = 2.0
+
     if direction == "buy":
-        return round(entry + 2.0 * atr + fee_buffer, 6), round(entry - 1.0 * atr - fee_buffer, 6)
-    return round(entry - 2.0 * atr - fee_buffer, 6), round(entry + 1.0 * atr + fee_buffer, 6)
+        tp1     = round(entry + 1.0 * atr + fee_buffer, 6)
+        tp2     = round(entry + 3.0 * atr + fee_buffer, 6)
+        tp_main = round(entry + tp_mult * atr + fee_buffer, 6)
+        sl      = round(entry - 1.0 * atr - fee_buffer, 6)
+    else:
+        tp1     = round(entry - 1.0 * atr - fee_buffer, 6)
+        tp2     = round(entry - 3.0 * atr - fee_buffer, 6)
+        tp_main = round(entry - tp_mult * atr - fee_buffer, 6)
+        sl      = round(entry + 1.0 * atr + fee_buffer, 6)
+
+    return tp1, tp2, sl, tp_main
 
 
 def multi_timeframe_confluence(asset_data: dict, direction: str, require_30m: bool = True) -> bool:
@@ -355,7 +484,7 @@ def main():
         "MAX_LOSS_PER_POSITION_PCT": ("max_loss_per_position_pct", 8, 8),
         "MAX_TOTAL_EXPOSURE_PCT": ("max_total_exposure_pct", 50, 50),
         "DAILY_LOSS_CIRCUIT_BREAKER_PCT": ("daily_loss_circuit_breaker_pct", 12, 12),
-        "MAX_CONCURRENT_POSITIONS": ("max_concurrent_positions", 2, 2),
+        "MAX_CONCURRENT_POSITIONS": ("max_concurrent_positions", 3, 3),
         "MIN_BALANCE_RESERVE_PCT": ("min_balance_reserve_pct", 20, 20),
     }
     _using_dangerous_defaults = []
@@ -425,11 +554,18 @@ def main():
                 return  # Fail closed: do not trade with unknown leverage
 
         # ── Score-pipeline state (persist across cycles) ──────────────────────────
-        _daily_trade_count: int = 0           # resets at UTC midnight
+        # CRITICAL-7: Load daily count from disk to survive process restarts
+        _today_init = datetime.now(timezone.utc).date()
+        _saved_count, _saved_date = _load_daily_count()
+        _daily_trade_count: int = _saved_count if _saved_date == str(_today_init) else 0
         _sl_cooldown_map: dict = {}           # asset -> datetime (blocked until)
-        _last_daily_reset = None              # date of last counter reset
+        _last_daily_reset = _today_init       # set now so midnight reset works correctly
+        # CRITICAL-2: Persistent OI history — last 3 readings per asset for oi_confirmed()
+        from collections import deque as _deque
+        _oi_history: dict = {}                # asset -> deque(maxlen=3) of OI float values
         _ai_verdict_cache: dict = {}          # asset → {verdict, fingerprint, expires_at}
         _macro_context_cache: dict = {}       # {events, headlines, fetched_at}
+        _diary_index: dict = _load_diary_index()  # P3-M2: {asset: latest diary entry} for guardian O(1) lookup
         _outer_cycle_timestamp: float = 0.0  # time.monotonic() at outer cycle data fetch
         _last_ai_call_time: dict = {}         # asset → unix timestamp of last Claude call
         # ─────────────────────────────────────────────────────────────────────────
@@ -644,6 +780,7 @@ def main():
             if os.path.exists(os.path.normpath(_KILLSWITCH_FILE)):
                 logging.critical("[KILLSWITCH] KILLSWITCH file detected — halting all trading. Remove the file to re-enable.")
                 add_event("[KILLSWITCH] Trading halted by KILLSWITCH file. Remove it to restart.")
+                await send_alert("\U0001f6a8 KILLSWITCH activated — all trading halted. Remove the KILLSWITCH file to restart.")
                 break
             cycle_start = time.monotonic()
             _outer_cycle_timestamp = cycle_start  # inner ticks read this to check higher-TF freshness
@@ -669,6 +806,7 @@ def main():
             if _last_daily_reset != _today_utc:
                 _daily_trade_count = 0
                 _last_daily_reset = _today_utc
+                _save_daily_count(0, str(_today_utc))
                 logging.info("[DAILY] trade counter reset for %s", _today_utc)
 
             minutes_since_start = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
@@ -692,6 +830,7 @@ def main():
                         _consecutive_failures,
                     )
                     add_event(f"[LOOP] Circuit breaker: sleeping 5 minutes after {_consecutive_failures} failures")
+                    await send_alert(f"⚠️ API circuit breaker: {_consecutive_failures} consecutive failures — sleeping 5 min before retry.")
                     await asyncio.sleep(300)
                     _consecutive_failures = 0
                 else:
@@ -888,20 +1027,25 @@ def main():
                             _g_has_sl = True
                 if _g_has_tp and _g_has_sl:
                     continue  # Both present — nothing to do
-                # Read TP/SL prices from the most recent buy/sell diary entry for this asset
-                _g_diary = None
-                try:
-                    with open(diary_path, 'r') as _gf:
-                        for _gl in reversed(_gf.readlines()):
-                            try:
-                                _ge = json.loads(_gl)
-                                if _ge.get('asset') == _g_asset and _ge.get('action') in ('buy', 'sell'):
-                                    _g_diary = _ge
-                                    break
-                            except Exception:
-                                continue
-                except Exception:
-                    pass
+                # P3-M2: Read TP/SL prices from the per-asset diary index (O(1), not O(n) full scan).
+                # Index is updated every time a trade is written to diary.jsonl. Falls back to
+                # a tail scan of diary.jsonl only if the index is missing (e.g. first run after upgrade).
+                _g_diary = _diary_index.get(_g_asset)
+                if not _g_diary:
+                    try:
+                        with open(diary_path, 'r') as _gf:
+                            for _gl in reversed(_gf.readlines()[-500:]):
+                                try:
+                                    _ge = json.loads(_gl)
+                                    if _ge.get('asset') == _g_asset and _ge.get('action') in ('buy', 'sell'):
+                                        _g_diary = _ge
+                                        _diary_index[_g_asset] = _ge  # back-fill index for next cycle
+                                        _save_diary_index(_diary_index)
+                                        break
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
                 if not _g_diary:
                     logging.warning("[GUARDIAN] %s: no diary entry — attempting fallback SL from live price", _g_asset)
                     if not _g_has_sl:
@@ -929,14 +1073,48 @@ def main():
                                 except Exception as _g_fb_err:
                                     add_event(f"[GUARDIAN] {_g_asset} fallback SL failed: {_g_fb_err}")
                     continue
-                _g_is_long = _g_diary.get('action') == 'buy'
-                _g_amount  = float(_g_diary.get('amount') or 0)
-                _g_tp_px   = _g_diary.get('tp_price')
-                _g_sl_px   = _g_diary.get('sl_price')
+                _g_is_long  = _g_diary.get('action') == 'buy'
+                _g_amount   = float(_g_diary.get('amount') or 0)
+                _g_tp_px    = _g_diary.get('tp_price')
+                _g_tp1_px   = _g_diary.get('tp1_price')
+                _g_tp2_px   = _g_diary.get('tp2_price')
+                _g_sl_px    = _g_diary.get('sl_price')
+                _g_half     = round(_g_amount / 2, 6)
                 if _g_amount <= 0:
                     logging.warning("[GUARDIAN] %s: zero amount in diary — cannot re-place", _g_asset)
                     continue
-                if not _g_has_tp and _g_tp_px:
+                # P3-M1: Re-place TP1/TP2 (two-stage exit) when both are missing from exchange
+                # Only re-place the two-stage pair when neither is present to avoid double-orders
+                _g_has_tp1 = any(
+                    o.get('coin') == _g_asset
+                    and isinstance(o.get('orderType'), dict)
+                    and (o.get('orderType', {}).get('trigger') or {}).get('tpsl') == 'tp'
+                    for o in (open_orders or [])
+                )
+                if not _g_has_tp1 and _g_tp1_px and _g_half > 0:
+                    try:
+                        _g_tp1_res = await hyperliquid.place_take_profit(_g_asset, _g_is_long, _g_half, float(_g_tp1_px))
+                        _g_tp1_oid = (hyperliquid.extract_oids(_g_tp1_res) or [None])[0]
+                        add_event(f"[GUARDIAN] {_g_asset} TP1 re-placed at {_g_tp1_px} size={_g_half:.6f} (oid={_g_tp1_oid})")
+                        for _gtr in active_trades:
+                            if _gtr.get('asset') == _g_asset:
+                                _gtr['tp1_oid'] = _g_tp1_oid
+                        save_active_trades(active_trades)
+                    except Exception as _g_tp1_err:
+                        add_event(f"[GUARDIAN] {_g_asset} TP1 re-place failed: {_g_tp1_err}")
+                if not _g_has_tp1 and _g_tp2_px and _g_half > 0:
+                    try:
+                        _g_tp2_res = await hyperliquid.place_take_profit(_g_asset, _g_is_long, _g_half, float(_g_tp2_px))
+                        _g_tp2_oid = (hyperliquid.extract_oids(_g_tp2_res) or [None])[0]
+                        add_event(f"[GUARDIAN] {_g_asset} TP2 re-placed at {_g_tp2_px} size={_g_half:.6f} (oid={_g_tp2_oid})")
+                        for _gtr in active_trades:
+                            if _gtr.get('asset') == _g_asset:
+                                _gtr['tp2_oid'] = _g_tp2_oid
+                        save_active_trades(active_trades)
+                    except Exception as _g_tp2_err:
+                        add_event(f"[GUARDIAN] {_g_asset} TP2 re-place failed: {_g_tp2_err}")
+                # Fallback: single TP (used when tp1/tp2 were never set)
+                if not _g_has_tp and not _g_tp1_px and _g_tp_px:
                     try:
                         _g_tp_res = await hyperliquid.place_take_profit(_g_asset, _g_is_long, _g_amount, float(_g_tp_px))
                         _g_tp_oid = (hyperliquid.extract_oids(_g_tp_res) or [None])[0]
@@ -958,6 +1136,74 @@ def main():
                         save_active_trades(active_trades)
                     except Exception as _g_err:
                         add_event(f"[GUARDIAN] {_g_asset} SL re-place failed: {_g_err}")
+
+            # ── Trailing stop guardian ─────────────────────────────────────────────
+            # Runs every outer loop tick for all ENTERED positions.
+            # +1.0×ATR from entry → move SL to breakeven
+            # +1.5×ATR from entry → trail SL at current_price − 0.5×ATR (buy) / + 0.5×ATR (sell)
+            for _tr in active_trades:
+                _tr_asset = _tr.get("asset")
+                _tr_entry = float(_tr.get("entry_price") or 0)
+                _tr_atr   = float(_tr.get("entry_atr") or 0)
+                _tr_long  = _tr.get("is_long", True)
+                _tr_size  = float(_tr.get("amount") or 0)
+
+                if not _tr_asset or _tr_entry <= 0 or _tr_atr <= 0 or _tr_size <= 0:
+                    continue
+
+                _cur_px = float(asset_prices.get(_tr_asset) or 0)
+                if _cur_px <= 0:
+                    continue
+
+                _move = (_cur_px - _tr_entry) if _tr_long else (_tr_entry - _cur_px)
+
+                # Stage 1: Breakeven — price moved +1×ATR from entry
+                if not _tr.get("trail_breakeven_done") and _move >= _tr_atr:
+                    _be_sl = _tr_entry  # move SL to entry price (breakeven)
+                    try:
+                        # P5-MEDIUM-2: place new SL BEFORE cancelling old one — avoids unprotected window
+                        _be_resp = await hyperliquid.place_stop_loss(_tr_asset, _tr_long, _tr_size, _be_sl)
+                        _be_oids = hyperliquid.extract_oids(_be_resp)
+                        if _tr.get("sl_oid"):
+                            try:
+                                await hyperliquid.cancel_order(_tr_asset, _tr["sl_oid"])
+                            except Exception as _be_ce:
+                                logging.warning("[TRAIL] %s could not cancel old SL %s: %s", _tr_asset, _tr["sl_oid"], _be_ce)
+                        _tr["sl_price"] = _be_sl
+                        _tr["sl_oid"] = _be_oids[0] if _be_oids else _tr.get("sl_oid")
+                        _tr["trail_breakeven_done"] = True
+                        save_active_trades(active_trades)
+                        logging.info("[TRAIL] %s breakeven — SL moved to entry %.4f", _tr_asset, _be_sl)
+                        add_event(f"[TRAIL] {_tr_asset} SL moved to breakeven {_be_sl:.4f}")
+                    except Exception as _te:
+                        logging.warning("[TRAIL] %s breakeven failed: %s", _tr_asset, _te)
+
+                # Stage 2: Trailing — price moved +1.5×ATR, trail SL 0.5×ATR behind
+                if _tr.get("trail_breakeven_done") and _move >= 1.5 * _tr_atr:
+                    _trail_sl = (
+                        round(_cur_px - 0.5 * _tr_atr, 6) if _tr_long
+                        else round(_cur_px + 0.5 * _tr_atr, 6)
+                    )
+                    _cur_sl = float(_tr.get("sl_price") or 0)
+                    _improves = (_tr_long and _trail_sl > _cur_sl) or (not _tr_long and _trail_sl < _cur_sl)
+                    if _improves:
+                        try:
+                            # P5-MEDIUM-2: place new SL BEFORE cancelling old one — avoids unprotected window
+                            _tsl_resp = await hyperliquid.place_stop_loss(_tr_asset, _tr_long, _tr_size, _trail_sl)
+                            _tsl_oids = hyperliquid.extract_oids(_tsl_resp)
+                            if _tr.get("sl_oid"):
+                                try:
+                                    await hyperliquid.cancel_order(_tr_asset, _tr["sl_oid"])
+                                except Exception as _tsl_ce:
+                                    logging.warning("[TRAIL] %s could not cancel old SL %s: %s", _tr_asset, _tr["sl_oid"], _tsl_ce)
+                            _tr["sl_price"] = _trail_sl
+                            _tr["sl_oid"] = _tsl_oids[0] if _tsl_oids else _tr.get("sl_oid")
+                            _tr["trail_active"] = True
+                            save_active_trades(active_trades)
+                            logging.info("[TRAIL] %s trailing SL → %.4f", _tr_asset, _trail_sl)
+                        except Exception as _te:
+                            logging.warning("[TRAIL] %s trailing update failed: %s", _tr_asset, _te)
+            # ──────────────────────────────────────────────────────────────────────
 
             recent_fills_struct = []
             try:
@@ -1058,6 +1304,11 @@ def main():
                     )
                     asset_prices[asset] = current_price
                     asset_candles_5m[asset] = candles_5m
+                    # CRITICAL-2: Accumulate OI history for oi_confirmed()
+                    if asset not in _oi_history:
+                        _oi_history[asset] = _deque(maxlen=3)
+                    if oi is not None:
+                        _oi_history[asset].append(float(oi))
                     if asset not in price_history:
                         price_history[asset] = deque(maxlen=60)
                     price_history[asset].append({"t": datetime.now(timezone.utc).isoformat(), "mid": round_or_none(current_price, 2)})
@@ -1162,6 +1413,19 @@ def main():
                         else None
                     )
 
+                    # CRITICAL-3: Build BB width series for is_trending_regime()
+                    _bbu_ser = lt.get("bbands_upper", [])
+                    _bbl_ser = lt.get("bbands_lower", [])
+                    _bbm_ser = lt.get("bbands_middle", [])
+                    _bb_w_vals = []
+                    for _bbi in range(len(_bbu_ser)):
+                        _bu = _bbu_ser[_bbi]
+                        _bl = _bbl_ser[_bbi] if _bbi < len(_bbl_ser) else None
+                        _bm = _bbm_ser[_bbi] if _bbi < len(_bbm_ser) else None
+                        if _bu is not None and _bl is not None and _bm is not None and _bm > 0:
+                            _bb_w_vals.append(round((_bu - _bl) / _bm * 100, 3))
+                    bb_width_series = _bb_w_vals[-20:]
+
                     market_sections.append({
                         "asset": asset,
                         "current_price": round_or_none(current_price, 2),
@@ -1199,10 +1463,12 @@ def main():
                             "bb_upper": round_or_none(bb_upper_4h, 2),
                             "bb_lower": round_or_none(bb_lower_4h, 2),
                             "bb_width_pct": bb_width_pct_4h,
+                            "bb_width_series": bb_width_series,  # CRITICAL-3
                             "macd_histogram_series": round_series(last_n(lt.get("macd_histogram", []), 3), 4),
                             "rsi_series": round_series(last_n(lt.get("rsi14", []), 3), 2),
                         },
                         "open_interest": round_or_none(oi, 2),
+                        "oi_series": list(_oi_history.get(asset, [])),  # CRITICAL-2
                         "funding_rate": round_or_none(funding, 8),
                         "funding_annualized_pct": funding_annualized,
                         "recent_mid_prices": recent_mids,
@@ -1224,6 +1490,9 @@ def main():
                             "candle_bullish": candles_5m[-1]["close"] > candles_5m[-1]["open"] if candles_5m else False,
                         },
                         "spread_pct": round(spread_pct, 4),
+                        "candles_4h": candles_4h,
+                        "candles_1h": candles_1h,   # CRITICAL-4: needed for S&R swing H/L gate
+                        "daily_1d": candles_1d[-1] if candles_1d else {},
                     })
                 except Exception as e:
                     add_event(f"Data gather error {asset}: {e}")
@@ -1278,9 +1547,34 @@ def main():
 
                 # Weighted score gate (0-10 float)
                 _score = compute_signal_score(_ac, _direction)
+                # Kronos-mini forecast modifier (±0.5, code-only, clamped to [0,11] — MASTER RULE 1)
+                try:
+                    from src.indicators.kronos_forecast import get_kronos_modifier
+                    _kmod = get_kronos_modifier(candles=_ac.get("candles_4h", []), direction=_direction)
+                    if _kmod != 0.0:
+                        logging.info("[KRONOS] %s modifier=%.1f score %.1f → %.1f", _asset, _kmod, _score, _score + _kmod)
+                    _score = min(11.0, max(0.0, _score + _kmod))
+                except ImportError:
+                    pass
                 if _score < _min_sig:
                     logging.debug("[SCORE] %s %s score=%.1f < %.1f → HOLD", _asset, _direction, _score, _min_sig)
                     outputs["trade_decisions"].append(_make_hold(_asset, f"score={_score:.1f} < min {_min_sig:.0f}"))
+                    # Signal logging — log every score≥7 signal including HOLDs, for 2-month win-rate analysis
+                    if _score >= 7.0:
+                        try:
+                            with open("signals.jsonl", "a", encoding="utf-8") as _sf:
+                                _sf.write(json.dumps({
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "asset": _asset,
+                                    "direction": _direction,
+                                    "score": round(_score, 2),
+                                    "action": "hold" if _score < _min_sig else "pending",
+                                    "reason": f"score={_score:.1f} min={_min_sig}",
+                                    "trend_4h": _ac.get("trend_4h"),
+                                    "trend_1h": _ac.get("trend_1h"),
+                                }) + "\n")
+                        except Exception:
+                            pass
                     continue
 
                 # Code computes trade parameters
@@ -1290,15 +1584,16 @@ def main():
                     outputs["trade_decisions"].append(_make_hold(_asset, "missing price or ATR14"))
                     continue
 
-                _tp, _sl = _code_compute_tpsl(_entry, _atr, _direction)
+                _tp1, _tp2, _sl, _tp = _code_compute_tpsl(_entry, _atr, _direction, _score)
                 # Position sizing: target = 15% of buying_power (account × leverage).
                 # ATR 1% risk rule acts as a safety ceiling — reduces size when SL is distant.
                 _buying_power = account_value * float(CONFIG.get("max_leverage") or 5)
                 _pct_cap = _buying_power * (float(CONFIG.get("max_position_pct") or 15) / 100.0)
                 _atr_sized = risk_mgr.atr_position_size(account_value, _entry, _sl)
                 _alloc = min(_pct_cap, _atr_sized)
-                # Scale allocation by signal strength (score/10): score-7 → 70%, score-10 → 100%
-                _alloc = _alloc * (_score / 10.0)
+                # Scale allocation by signal strength (min(score,10)/10): score-7 → 70%, score-10..11 → 100%
+                # Scores above 10.0 do NOT grant above-100% sizing (MASTER RULE 2)
+                _alloc = _alloc * (min(_score, 10.0) / 10.0)
                 # ADX ranging market guard: half-size if ADX weak and score not at maximum
                 _adx_1h_val = float(_ac.get("intraday_1h", {}).get("adx") or 25)
                 _adx_thr    = float(CONFIG.get("adx_half_size_threshold") or 20)
@@ -1382,17 +1677,39 @@ def main():
                         continue
 
                 add_event(f"[SCORE] {_asset} {_direction} score={_score:.1f} → queuing trade")
+                # Signal logging — log approved trades to signals.jsonl for win-rate analysis (#78)
+                try:
+                    import json as _sjson
+                    with open("signals.jsonl", "a", encoding="utf-8") as _sf:
+                        _sf.write(_sjson.dumps({
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "asset": _asset,
+                            "direction": _direction,
+                            "score": round(_score, 2),
+                            "action": "queued",
+                            "reason": f"score={_score:.1f} APPROVED",
+                            "trend_4h": _ac.get("trend_4h"),
+                            "trend_1h": _ac.get("trend_1h"),
+                        }) + "\n")
+                except Exception:
+                    pass
+                # Limit order: buy 0.15% below ask, sell 0.15% above bid
+                _lim_off = _entry * 0.0015
+                _lim_px  = round(_entry - _lim_off, 6) if _direction == "buy" else round(_entry + _lim_off, 6)
                 outputs["trade_decisions"].append({
                     "asset":        _asset,
                     "action":       _direction,
                     "allocation_usd": _alloc,
-                    "order_type":   "market",
-                    "limit_price":  None,
+                    "order_type":   "limit",
+                    "limit_price":  _lim_px,
                     "tp_price":     _tp,
+                    "tp1_price":    _tp1,
+                    "tp2_price":    _tp2,
                     "sl_price":     _sl,
                     "atr14":        _atr,
                     "current_price": _entry,
-                    "exit_plan":    f"code TP={_tp:.4f} SL={_sl:.4f} score={_score:.1f}",
+                    "score":        round(_score, 2),  # P6-HIGH-1: store per-asset score so execution loop uses correct value
+                    "exit_plan":    f"code TP={_tp:.4f} TP1={_tp1:.4f} TP2={_tp2:.4f} SL={_sl:.4f} score={_score:.1f}",
                     "rationale":    (f"score={_score:.1f} trend_4h={_ac.get('trend_4h')} "
                                      f"trend_1h={_ac.get('trend_1h')}"),
                 })
@@ -1503,13 +1820,38 @@ def main():
                         # Attach raw 5m candles for volume confirmation inside entry_confirmed.
                         # Done here, not in market_sections, so they are never serialised into
                         # the Claude context payload (which would waste tokens on raw OHLCV data).
-                        asset_ctx_local = {**asset_ctx, "candles_5m": asset_candles_5m.get(asset, [])}
+                        # Inject score so market_filter() can apply the off-session score≥9 gate (#3)
+                        asset_ctx_local = {**asset_ctx, "candles_5m": asset_candles_5m.get(asset, []), "_current_score": output.get("score", _score)}
                         # ATR spike + spread pre-flight — market_filter() was dead code (only
                         # called from make_decision() which is never invoked); wire it directly.
-                        _mf_pass, _mf_reason = market_filter(asset_ctx_local)
+                        _btc_trend_1h = next(
+                            (m.get("trend_1h", "UNKNOWN") for m in market_sections if m.get("asset") == "BTC"),
+                            "UNKNOWN"
+                        )
+                        _btc_5m_candles = asset_candles_5m.get("BTC", [])
+                        _mf_pass, _mf_reason = market_filter(
+                            asset_ctx_local,
+                            btc_trend_1h=_btc_trend_1h,
+                            btc_candles_5m=_btc_5m_candles,
+                            direction=action
+                        )
                         if not _mf_pass:
                             logging.warning("[MARKET FILTER] %s %s blocked — %s", asset, action, _mf_reason)
                             add_event(f"[MARKET FILTER] {asset} {action} blocked — {_mf_reason}")
+                            # P4-E-2: log filter-blocked signals so win-rate analysis captures all score≥7 signals
+                            try:
+                                import json as _fsjson
+                                with open("signals.jsonl", "a", encoding="utf-8") as _fsf:
+                                    _fsf.write(_fsjson.dumps({
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "asset": asset, "direction": action,
+                                        "score": round(output.get("score", _score), 2), "action": "filtered",
+                                        "reason": f"market_filter: {_mf_reason}",
+                                        "trend_4h": asset_ctx.get("trend_4h"),
+                                        "trend_1h": asset_ctx.get("trend_1h"),
+                                    }) + "\n")
+                            except Exception:
+                                pass
                             continue
                         # Entry confirmation (15m/5m layers + volume gate)
                         if not entry_confirmed(asset_ctx_local, action):
@@ -1519,6 +1861,37 @@ def main():
                                 asset, action
                             )
                             add_event(f"[ENTRY] {asset} {action} blocked — 15m/5m not confirmed")
+                            # P4-E-2: log entry-confirmation blocks
+                            try:
+                                import json as _ecjson
+                                with open("signals.jsonl", "a", encoding="utf-8") as _ecf:
+                                    _ecf.write(_ecjson.dumps({
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "asset": asset, "direction": action,
+                                        "score": round(output.get("score", _score), 2), "action": "filtered",
+                                        "reason": "entry_confirmed: 15m/5m not confirmed",
+                                        "trend_4h": asset_ctx.get("trend_4h"),
+                                        "trend_1h": asset_ctx.get("trend_1h"),
+                                    }) + "\n")
+                            except Exception:
+                                pass
+                            continue
+                        # Candle close gate — only fire when the 5m trigger candle has fully closed
+                        # Prevents entering mid-candle on false signals that reverse before close
+                        _now_sec = datetime.now(timezone.utc).second + datetime.now(timezone.utc).minute % 5 * 60
+                        _secs_into_5m = (datetime.now(timezone.utc).minute % 5) * 60 + datetime.now(timezone.utc).second
+                        _candle_age_pct = _secs_into_5m / 300  # 0.0 = just opened, 1.0 = about to close
+                        if _candle_age_pct < 0.85:  # candle must be at least 85% complete (255 of 300s)
+                            logging.debug(
+                                "[CANDLE GATE] %s waiting — 5m candle only %.0f%% complete",
+                                asset, _candle_age_pct * 100
+                            )
+                            continue
+                        # OI confirmation gate — requires OI increasing, blocks spikes
+                        _oi_ok, _oi_reason = oi_confirmed(asset_ctx_local, action)
+                        if not _oi_ok:
+                            logging.info("[OI GATE] %s blocked — %s", asset, _oi_reason)
+                            add_event(f"[OI GATE] {asset} blocked — {_oi_reason}")
                             continue
                         is_buy = action == "buy"
                         alloc_usd = float(output.get("allocation_usd", 0.0))
@@ -1549,6 +1922,19 @@ def main():
                         # Use potentially adjusted values from risk manager
                         alloc_usd = float(output.get("allocation_usd", alloc_usd))
                         amount = alloc_usd / current_price
+
+                        # P4-H-2 / P8-HIGH-1: Second concurrent-position gate immediately before order.
+                        # Uses max(exchange count, active_trades count) — state.get("positions") misses
+                        # same-cycle entries placed before this asset but not yet visible on exchange.
+                        _max_conc = int(CONFIG.get("max_concurrent_positions") or 3)
+                        _open_pos_count = max(
+                            sum(1 for _p in (state.get("positions") or []) if abs(float(_p.get("szi") or 0)) > 0),
+                            len(active_trades),
+                        )
+                        if _open_pos_count >= _max_conc:
+                            add_event(f"[CONC GATE] {asset} blocked — {_open_pos_count}/{_max_conc} positions open")
+                            logging.info("[CONC GATE] %s blocked — %d/%d concurrent positions", asset, _open_pos_count, _max_conc)
+                            continue
 
                         # Place market or limit order
                         order_type = output.get("order_type", "market")
@@ -1598,6 +1984,25 @@ def main():
                                 pass
                         # No early break — always complete all 3 polls to capture partial fills
 
+                        # Cancel unfilled limit orders after 1 candle (5 minutes)
+                        if order_type == "limit" and filled_qty == 0 and entry_oid:
+                            try:
+                                await hyperliquid.cancel_order(asset, entry_oid)
+                                logging.info("[LIMIT] %s unfilled limit cancelled after 1 candle — skipping trade", asset)
+                                add_event(f"[LIMIT] {asset} unfilled limit cancelled — price moved away")
+                                continue
+                            except Exception as _ce:
+                                logging.warning("[LIMIT] %s cancel failed: %s", asset, _ce)
+
+                        # CRITICAL-5: Partial fill — cancel unfilled remainder to avoid unprotected second fill
+                        if order_type == "limit" and 0 < filled_qty < amount * 0.99 and entry_oid:
+                            try:
+                                await hyperliquid.cancel_order(asset, entry_oid)
+                                logging.info("[LIMIT] %s partial fill %.6f/%.6f — unfilled remainder cancelled", asset, filled_qty, amount)
+                                add_event(f"[LIMIT] {asset} partial fill {filled_qty:.4f}/{amount:.4f} — remainder cancelled to avoid unprotected exposure")
+                            except Exception as _pce:
+                                logging.warning("[LIMIT] %s partial fill cancel failed: %s", asset, _pce)
+
                         # Use actual filled quantity for TP/SL sizing.
                         # Fall back to the requested amount for resting limit orders
                         # that haven't filled yet, or when OID matching found nothing.
@@ -1614,18 +2019,45 @@ def main():
                         # Reduce-only orders submitted against a non-existent position are
                         # silently rejected by Hyperliquid. The guardian places them next
                         # cycle once the position is confirmed open on the exchange.
+                        tp1_oid = None
+                        tp2_oid = None
                         _can_place_tpsl = filled_qty > 0 or order_type != "limit"
                         if _can_place_tpsl:
-                            if output.get("tp_price"):
-                                tp_order = await hyperliquid.place_take_profit(asset, is_buy, tp_sl_size, output["tp_price"])
-                                tp_oids = hyperliquid.extract_oids(tp_order)
-                                tp_oid = tp_oids[0] if tp_oids else None
+                            _half = round(tp_sl_size / 2, 6)
+                            if output.get("tp1_price") and _half > 0:
+                                _tp1r = await hyperliquid.place_take_profit(asset, is_buy, _half, output["tp1_price"])
+                                _tp1_oids = hyperliquid.extract_oids(_tp1r)
+                                tp1_oid = _tp1_oids[0] if _tp1_oids else None
+                                add_event(f"TP1 placed {asset} at {output['tp1_price']} size={_half:.6f} (50%)")
+                            if output.get("tp2_price") and _half > 0:
+                                _tp2r = await hyperliquid.place_take_profit(asset, is_buy, _half, output["tp2_price"])
+                                _tp2_oids = hyperliquid.extract_oids(_tp2r)
+                                tp2_oid = _tp2_oids[0] if _tp2_oids else None
+                                add_event(f"TP2 placed {asset} at {output['tp2_price']} size={_half:.6f} (50% runner)")
+                            # Fallback if tp1/tp2 not set: use single tp_price
+                            if not tp1_oid and output.get("tp_price"):
+                                _tpr = await hyperliquid.place_take_profit(asset, is_buy, tp_sl_size, output["tp_price"])
+                                _tp_oids = hyperliquid.extract_oids(_tpr)
+                                tp_oid = _tp_oids[0] if _tp_oids else None
                                 add_event(f"TP placed {asset} at {output['tp_price']} size={tp_sl_size:.6f}")
                             if output.get("sl_price"):
-                                sl_order = await hyperliquid.place_stop_loss(asset, is_buy, tp_sl_size, output["sl_price"])
-                                sl_oids = hyperliquid.extract_oids(sl_order)
-                                sl_oid = sl_oids[0] if sl_oids else None
-                                add_event(f"SL placed {asset} at {output['sl_price']} size={tp_sl_size:.6f}")
+                                try:
+                                    _slr = await hyperliquid.place_stop_loss(asset, is_buy, tp_sl_size, output["sl_price"])
+                                    _sl_oids = hyperliquid.extract_oids(_slr)
+                                    sl_oid = _sl_oids[0] if _sl_oids else None
+                                    add_event(f"SL placed {asset} at {output['sl_price']} size={tp_sl_size:.6f}")
+                                except Exception as _sl_err:
+                                    logging.critical("[SL FAIL] %s — SL placement failed: %s — market-closing position to avoid unprotected exposure", asset, _sl_err)
+                                    add_event(f"[SL FAIL] {asset} SL placement failed — market-closing position immediately")
+                                    await send_alert(f"\U0001f6a8 SL FAIL {asset} — SL placement failed, market-closing position NOW. Error: {_sl_err}")
+                                    try:
+                                        await hyperliquid.market_close(asset)
+                                        await hyperliquid.cancel_all_orders(asset)
+                                    except Exception as _mc_err:
+                                        logging.critical("[SL FAIL] %s — market-close also failed: %s — MANUAL INTERVENTION REQUIRED", asset, _mc_err)
+                                        add_event(f"[SL FAIL] {asset} MARKET CLOSE ALSO FAILED — close manually on Hyperliquid NOW")
+                                        await send_alert(f"\U0001f198 CRITICAL {asset} — SL fail AND market-close failed. CLOSE MANUALLY ON HYPERLIQUID NOW. Error: {_mc_err}")
+                                    continue
                         else:
                             logging.info("[LIMIT] %s TP/SL deferred — limit order not yet filled, guardian covers next cycle", asset)
                             add_event(f"[LIMIT] {asset} TP/SL deferred — position not confirmed (guardian places next cycle)")
@@ -1640,18 +2072,29 @@ def main():
                             "asset": asset,
                             "is_long": is_buy,
                             "amount": tp_sl_size,
+                            "half_size": round(tp_sl_size / 2, 6),
                             "entry_price": current_price,
+                            "entry_atr": float(output.get("atr14") or 0),
                             "tp_price": output.get("tp_price"),
+                            "tp1_price": output.get("tp1_price"),
+                            "tp2_price": output.get("tp2_price"),
                             "sl_price": output.get("sl_price"),
                             "tp_oid": tp_oid,
+                            "tp1_oid": tp1_oid,
+                            "tp2_oid": tp2_oid,
                             "sl_oid": sl_oid,
+                            "tp1_hit": False,
+                            "trail_breakeven_done": False,
+                            "trail_active": False,
                             "exit_plan": output["exit_plan"],
                             "funding_rate": float(asset_ctx.get("funding_rate") or 0),
                             "opened_at": datetime.now(timezone.utc).isoformat()
                         })
-                        save_active_trades(active_trades)
+                        # CRITICAL-8: record_entry (state.json) BEFORE save_active_trades
                         state_mgr.record_entry(asset)
+                        save_active_trades(active_trades)
                         _daily_trade_count += 1
+                        _save_daily_count(_daily_trade_count, str(_today_utc))  # CRITICAL-7
                         add_event(f"{action.upper()} {asset} amount {amount:.4f} at ~{current_price} [daily={_daily_trade_count}]")
                         if rationale:
                             add_event(f"Post-trade rationale for {asset}: {rationale}")
@@ -1669,7 +2112,11 @@ def main():
                                 "requested_qty": amount,
                                 "entry_price": current_price,
                                 "tp_price": output.get("tp_price"),
+                                "tp1_price": output.get("tp1_price"),
+                                "tp2_price": output.get("tp2_price"),
                                 "tp_oid": tp_oid,
+                                "tp1_oid": tp1_oid,
+                                "tp2_oid": tp2_oid,
                                 "sl_price": output.get("sl_price"),
                                 "sl_oid": sl_oid,
                                 "exit_plan": output.get("exit_plan", ""),
@@ -1679,6 +2126,9 @@ def main():
                                 "filled": filled
                             }
                             f.write(json.dumps(diary_entry) + "\n")
+                        # P3-M2: Update per-asset diary index so guardian reads O(1) not O(n)
+                        _diary_index[asset] = diary_entry
+                        _save_diary_index(_diary_index)
                     else:
                         add_event(f"Hold {asset}: {output.get('rationale', '')}")
                 except Exception as e:
@@ -1710,6 +2160,8 @@ def main():
 
                 if risk_mgr.circuit_breaker_active:
                     logging.info("[INNER] circuit breaker active — skipping tick %d", _tick + 1)
+                    if _tick == 0:  # alert once per inner-loop session, not every tick
+                        await send_alert("⛔ Daily loss circuit breaker active — no new trades until UTC midnight reset.")
                     continue
 
                 logging.info("[INNER %d/11] refreshing 5m candles for %d assets", _tick + 1, len(args.assets))
@@ -1741,6 +2193,11 @@ def main():
                     _iac = next((m for m in market_sections if m.get("asset") == _i_asset), None)
                     if not _iac:
                         continue
+                    # P4-E-5: Circuit breaker re-checked per-asset so a breaker tripped mid-loop
+                    # (e.g. after a loss updates risk_mgr) blocks remaining assets in the same tick.
+                    if risk_mgr.circuit_breaker_active:
+                        logging.info("[INNER CB] circuit breaker active — skipping %s tick %d", _i_asset, _tick + 1)
+                        continue
                     if _daily_trade_count >= int(CONFIG.get("max_daily_trades") or 10):
                         break
                     _cd = _sl_cooldown_map.get(_i_asset)
@@ -1750,6 +2207,11 @@ def main():
                     if _idir is None:
                         continue
                     _iscr = compute_signal_score(_iac, _idir)
+                    try:
+                        from src.indicators.kronos_forecast import get_kronos_modifier
+                        _iscr = min(11.0, max(0.0, _iscr + get_kronos_modifier(candles=_iac.get("candles_4h", []), direction=_idir)))
+                    except ImportError:
+                        pass
                     if _iscr < float(CONFIG.get("min_signal_score") or 7):
                         continue
                     # BUG-2 FIX: Use the fresh price already refreshed by the C-3/C-4 block above,
@@ -1759,7 +2221,7 @@ def main():
                     _iatr = float(_iac.get("long_term_4h", {}).get("atr14") or 0)
                     if _ie <= 0 or _iatr <= 0:
                         continue
-                    _itp, _isl = _code_compute_tpsl(_ie, _iatr, _idir)
+                    _itp1, _itp2, _isl, _itp = _code_compute_tpsl(_ie, _iatr, _idir, _iscr)
                     _i_buying_power = account_value * float(CONFIG.get("max_leverage") or 5)
                     _i_pct_cap = _i_buying_power * (float(CONFIG.get("max_position_pct") or 15) / 100.0)
                     _i_atr_sized = risk_mgr.atr_position_size(account_value, _ie, _isl)
@@ -1830,12 +2292,14 @@ def main():
                         if _iverd != "APPROVE":
                             continue
 
+                    _ilim_px = round(_ie * (1 - 0.0015), 6) if _idir == "buy" else round(_ie * (1 + 0.0015), 6)
                     _inner_outputs["trade_decisions"].append({
                         "asset": _i_asset, "action": _idir,
-                        "allocation_usd": _ialloc, "order_type": "market",
-                        "limit_price": None, "tp_price": _itp, "sl_price": _isl,
-                        "atr14": _iatr, "current_price": _ie,
-                        "exit_plan": f"inner TP={_itp:.4f} SL={_isl:.4f} score={_iscr:.1f}",
+                        "allocation_usd": _ialloc, "order_type": "limit",   # BONUS-2
+                        "limit_price": _ilim_px, "tp_price": _itp, "tp1_price": _itp1, "tp2_price": _itp2,
+                        "sl_price": _isl, "atr14": _iatr, "current_price": _ie,
+                        "score": round(_iscr, 2),  # P5-HIGH-1: store per-asset score so execution loop uses correct value
+                        "exit_plan": f"inner TP={_itp:.4f} TP1={_itp1:.4f} TP2={_itp2:.4f} SL={_isl:.4f} score={_iscr:.1f}",
                         "rationale": f"inner score={_iscr:.1f}",
                     })
 
@@ -1885,13 +2349,32 @@ def main():
                             if _itrend_1d == "BULLISH" and _iout["action"] == "sell":
                                 logging.info("[INNER DAILY FILTER] %s SELL blocked — daily BULLISH", _ia)
                                 continue
-                        _iact_ctx_local = {**_iact_ctx, "candles_5m": asset_candles_5m.get(_ia, [])}
-                        _mf_ok, _mf_why = market_filter(_iact_ctx_local)
+                        _iact_ctx_local = {**_iact_ctx, "candles_5m": asset_candles_5m.get(_ia, []), "_current_score": _iout.get("score", _iscr)}
+                        _btc_trend_1h_inner = next(
+                            (m.get("trend_1h", "UNKNOWN") for m in market_sections if m.get("asset") == "BTC"),
+                            "UNKNOWN"
+                        )
+                        _mf_ok, _mf_why = market_filter(
+                            _iact_ctx_local,
+                            btc_trend_1h=_btc_trend_1h_inner,
+                            btc_candles_5m=asset_candles_5m.get("BTC", []),
+                            direction=_iout["action"]
+                        )
                         if not _mf_ok:
                             logging.info("[INNER MKTFILTER] %s blocked: %s", _ia, _mf_why)
                             continue
                         if not entry_confirmed(_iact_ctx_local, _iout["action"]):
                             logging.debug("[INNER ENTRY] %s not confirmed", _ia)
+                            continue
+                        # BONUS-1: Candle-close gate (same 85% logic as outer loop)
+                        _i_secs_into_5m = (datetime.now(timezone.utc).minute % 5) * 60 + datetime.now(timezone.utc).second
+                        if (_i_secs_into_5m / 300) < 0.85:
+                            logging.debug("[INNER CANDLE GATE] %s candle only %.0f%% complete", _ia, _i_secs_into_5m / 3)
+                            continue
+                        # BONUS-1: OI confirmation gate
+                        _i_oi_ok, _i_oi_reason = oi_confirmed(_iact_ctx_local, _iout["action"])
+                        if not _i_oi_ok:
+                            logging.info("[INNER OI GATE] %s blocked — %s", _ia, _i_oi_reason)
                             continue
                         _iout["current_price"] = _iprice
                         _iout["atr14"] = _iact_ctx.get("long_term_4h", {}).get("atr14")
@@ -1900,9 +2383,30 @@ def main():
                             add_event(f"[INNER RISK] {_ia}: {_ireason}")
                             continue
                         _iamt = float(_iout["allocation_usd"]) / _iprice
-                        _iorder = await (hyperliquid.place_buy_order(_ia, _iamt)
-                                         if _iout["action"] == "buy"
-                                         else hyperliquid.place_sell_order(_ia, _iamt))
+                        # P7-HIGH-1 / P8-HIGH-1: Second concurrent-position gate immediately before order.
+                        # Uses max(exchange count, active_trades count) — state.get("positions") misses
+                        # same-tick entries placed before this asset but not yet visible on exchange.
+                        _i_max_conc = int(CONFIG.get("max_concurrent_positions") or 3)
+                        _i_open_pos = max(
+                            sum(1 for _ip in (state.get("positions") or []) if abs(float(_ip.get("szi") or 0)) > 0),
+                            len(active_trades),
+                        )
+                        if _i_open_pos >= _i_max_conc:
+                            add_event(f"[INNER CONC GATE] {_ia} blocked — {_i_open_pos}/{_i_max_conc} positions open")
+                            logging.info("[INNER CONC GATE] %s blocked — %d/%d concurrent positions", _ia, _i_open_pos, _i_max_conc)
+                            continue
+                        # BONUS-2: Use LIMIT orders in inner loop
+                        _i_order_type = _iout.get("order_type", "market")
+                        _i_limit_px = _iout.get("limit_price")
+                        if _i_order_type == "limit" and _i_limit_px:
+                            _i_limit_px = float(_i_limit_px)
+                            _iorder = await (hyperliquid.place_limit_buy(_ia, _iamt, _i_limit_px)
+                                             if _iout["action"] == "buy"
+                                             else hyperliquid.place_limit_sell(_ia, _iamt, _i_limit_px))
+                        else:
+                            _iorder = await (hyperliquid.place_buy_order(_ia, _iamt)
+                                             if _iout["action"] == "buy"
+                                             else hyperliquid.place_sell_order(_ia, _iamt))
                         # H-5 FIX: Poll fills to get confirmed quantity before placing TP/SL.
                         # Old code used requested _iamt directly; partial fills left remainder unprotected.
                         _i_entry_oids = hyperliquid.extract_oids(_iorder) if _iorder else []
@@ -1925,41 +2429,115 @@ def main():
                                     _i_filled_qty += float(_ifc.get('sz') or _ifc.get('size') or 0)
                             except Exception:
                                 pass
+                        # BONUS-2: Cancel unfilled inner limit after 1 candle
+                        if _i_order_type == "limit" and _i_filled_qty == 0 and _i_entry_oid:
+                            try:
+                                await hyperliquid.cancel_order(_ia, _i_entry_oid)
+                                logging.info("[INNER LIMIT] %s unfilled limit cancelled", _ia)
+                                continue
+                            except Exception as _ice:
+                                logging.warning("[INNER LIMIT] %s cancel failed: %s", _ia, _ice)
+                        # HIGH-1: Cancel partial fill remainder (mirrors outer loop CRITICAL-5 fix)
+                        if _i_order_type == "limit" and 0 < _i_filled_qty < _iamt * 0.99 and _i_entry_oid:
+                            try:
+                                await hyperliquid.cancel_order(_ia, _i_entry_oid)
+                                logging.info("[INNER LIMIT] %s partial fill %.6f/%.6f — unfilled remainder cancelled", _ia, _i_filled_qty, _iamt)
+                            except Exception as _ipce:
+                                logging.warning("[INNER LIMIT] %s partial fill cancel failed: %s", _ia, _ipce)
                         _itp_sl_size = _i_filled_qty if _i_filled_qty > 0 else _iamt
+                        _itp1_oid = None
+                        _itp2_oid = None
                         _itp_oid = None
                         _isl_oid = None
-                        if _iout.get("tp_price"):
-                            _itp_res = await hyperliquid.place_take_profit(
-                                _ia, _iout["action"] == "buy", _itp_sl_size, _iout["tp_price"])
+                        _i_is_buy = _iout["action"] == "buy"
+                        _i_half = round(_itp_sl_size / 2, 6)
+                        # MEDIUM-1 / P3-H1: Only place TP/SL when fill is confirmed.
+                        # When _i_can_place_tpsl is False (cancel failed on an unfilled limit),
+                        # fall through to record the trade in active_trades + state_mgr so the
+                        # guardian monitors it next cycle — do NOT `continue` (that leaves the
+                        # position untracked and allows a double-entry on the next inner tick).
+                        _i_can_place_tpsl = _i_filled_qty > 0 or _i_order_type != "limit"
+                        if not _i_can_place_tpsl:
+                            logging.info("[INNER LIMIT] %s TP/SL deferred — limit order not yet filled, guardian covers next cycle", _ia)
+                        if _i_can_place_tpsl and _iout.get("tp1_price") and _i_half > 0:
+                            _itp1_res = await hyperliquid.place_take_profit(_ia, _i_is_buy, _i_half, _iout["tp1_price"])
+                            _itp1_oid = (hyperliquid.extract_oids(_itp1_res) or [None])[0]
+                        if _i_can_place_tpsl and _iout.get("tp2_price") and _i_half > 0:
+                            _itp2_res = await hyperliquid.place_take_profit(_ia, _i_is_buy, _i_half, _iout["tp2_price"])
+                            _itp2_oid = (hyperliquid.extract_oids(_itp2_res) or [None])[0]
+                        if _i_can_place_tpsl and not _itp1_oid and _iout.get("tp_price"):
+                            _itp_res = await hyperliquid.place_take_profit(_ia, _i_is_buy, _itp_sl_size, _iout["tp_price"])
                             _itp_oid = (hyperliquid.extract_oids(_itp_res) or [None])[0]
-                        if _iout.get("sl_price"):
-                            _isl_res = await hyperliquid.place_stop_loss(
-                                _ia, _iout["action"] == "buy", _itp_sl_size, _iout["sl_price"])
-                            _isl_oid = (hyperliquid.extract_oids(_isl_res) or [None])[0]
+                        if _i_can_place_tpsl and _iout.get("sl_price"):
+                            try:
+                                _isl_res = await hyperliquid.place_stop_loss(_ia, _i_is_buy, _itp_sl_size, _iout["sl_price"])
+                                _isl_oid = (hyperliquid.extract_oids(_isl_res) or [None])[0]
+                            except Exception as _isl_err:
+                                logging.critical("[INNER SL FAIL] %s — SL failed: %s — market-closing", _ia, _isl_err)
+                                try:
+                                    await hyperliquid.market_close(_ia)
+                                    await hyperliquid.cancel_all_orders(_ia)
+                                except Exception:
+                                    pass
+                                continue
                         active_trades.append({
-                            "asset": _ia, "is_long": _iout["action"] == "buy",
-                            "amount": _itp_sl_size, "entry_price": _iprice,
-                            "tp_price": _iout.get("tp_price"), "sl_price": _iout.get("sl_price"),
-                            "tp_oid": _itp_oid, "sl_oid": _isl_oid,
+                            "asset": _ia, "is_long": _i_is_buy,
+                            "amount": _itp_sl_size, "half_size": _i_half,
+                            "entry_price": _iprice, "entry_atr": float(_iout.get("atr14") or 0),
+                            "tp_price": _iout.get("tp_price"), "tp1_price": _iout.get("tp1_price"),
+                            "tp2_price": _iout.get("tp2_price"), "sl_price": _iout.get("sl_price"),
+                            "tp_oid": _itp_oid, "tp1_oid": _itp1_oid, "tp2_oid": _itp2_oid, "sl_oid": _isl_oid,
+                            "tp1_hit": False, "trail_breakeven_done": False, "trail_active": False,
                             "exit_plan": _iout.get("exit_plan", ""),
                             "funding_rate": float(_iact_ctx.get("funding_rate") or 0),
                             "opened_at": datetime.now(timezone.utc).isoformat(),
                         })
-                        save_active_trades(active_trades)
+                        # CRITICAL-8: record_entry (state.json) BEFORE save_active_trades
                         state_mgr.record_entry(_ia)
+                        save_active_trades(active_trades)
+                        # MEDIUM-2: refresh date inside inner loop to handle UTC midnight crossing
+                        _today_utc = datetime.now(timezone.utc).date()
+                        if _today_utc != _last_daily_reset:
+                            _daily_trade_count = 0
+                            _last_daily_reset = _today_utc
+                            _save_daily_count(0, str(_today_utc))
                         _daily_trade_count += 1
+                        _save_daily_count(_daily_trade_count, str(_today_utc))  # CRITICAL-7
                         add_event(f"[INNER] {_iout['action'].upper()} {_ia} amt={_itp_sl_size:.4f} filled={_i_filled_qty:.4f} score={_iout.get('rationale','')} daily={_daily_trade_count}")
+                        _i_diary_entry = {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "asset": _ia, "action": _iout["action"],
+                            "order_type": _i_order_type, "limit_price": _i_limit_px,
+                            "allocation_usd": float(_iout["allocation_usd"]),
+                            "amount": _itp_sl_size, "filled_qty": _i_filled_qty, "entry_price": _iprice,
+                            "tp_price": _iout.get("tp_price"),
+                            "tp1_price": _iout.get("tp1_price"),
+                            "tp2_price": _iout.get("tp2_price"),
+                            "sl_price": _iout.get("sl_price"),
+                            "exit_plan": _iout.get("exit_plan", ""),
+                            "rationale": _iout.get("rationale", ""),
+                            "inner_tick": _tick + 1,
+                        }
                         with open(diary_path, "a") as _idf:
-                            _idf.write(json.dumps({
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "asset": _ia, "action": _iout["action"],
-                                "order_type": "market", "allocation_usd": float(_iout["allocation_usd"]),
-                                "amount": _itp_sl_size, "filled_qty": _i_filled_qty, "entry_price": _iprice,
-                                "tp_price": _iout.get("tp_price"), "sl_price": _iout.get("sl_price"),
-                                "exit_plan": _iout.get("exit_plan", ""),
-                                "rationale": _iout.get("rationale", ""),
-                                "inner_tick": _tick + 1,
-                            }) + "\n")
+                            _idf.write(json.dumps(_i_diary_entry) + "\n")
+                        # P3-M2: Update per-asset diary index so guardian reads O(1) not O(n)
+                        _diary_index[_ia] = _i_diary_entry
+                        _save_diary_index(_diary_index)
+                        # P4-E-1: Log inner-loop approved trades to signals.jsonl for win-rate analysis
+                        try:
+                            with open("signals.jsonl", "a", encoding="utf-8") as _isf:
+                                _isf.write(json.dumps({
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "asset": _ia,
+                                    "direction": _iout["action"],
+                                    "score": round(_iout.get("score", _iscr), 2),
+                                    "action": "queued_inner",
+                                    "reason": f"inner score={_iout.get('score', _iscr):.1f} tick={_tick+1}",
+                                    "trend_4h": _iact_ctx.get("trend_4h"),
+                                    "trend_1h": _iact_ctx.get("trend_1h"),
+                                }) + "\n")
+                        except Exception:
+                            pass
                     except Exception as _ie2:
                         add_event(f"[INNER] execution error {_ia}: {_ie2}")
             # ── end 5-minute inner loop ────────────────────────────────────────────
@@ -2193,7 +2771,11 @@ def main():
         site = web.TCPSite(runner, host, port)
         await site.start()
         logging.info(f"API server started at http://{host}:{port}")
-        await run_loop()
+        await send_alert(f"\U0001f680 Trading bot started — assets: {args.assets} interval: {args.interval} port: {port}")
+        try:
+            await run_loop()
+        finally:
+            await send_alert("\U0001f6d1 Trading bot stopped.")
 
     def calculate_sharpe_from_diary(path: str) -> float:
         """Compute Sharpe ratio from realized P&L recorded in diary.jsonl.

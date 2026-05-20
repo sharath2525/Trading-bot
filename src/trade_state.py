@@ -72,7 +72,7 @@ class TradeStateMachine:
                 json.dump(payload, f)
             os.replace(tmp, self._state_file)
         except Exception as e:
-            logging.warning("[STATE] failed to persist state: %s", e)
+            logging.critical("[STATE] CRITICAL: failed to persist state: %s — next restart will not know about open positions", e)
 
     def _load(self) -> None:
         """Restore state from disk if state.json exists."""

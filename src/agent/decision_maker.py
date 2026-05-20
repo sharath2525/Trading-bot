@@ -9,6 +9,7 @@ They implemented the pre-2026-04-30 Claude-as-decision-engine architecture and
 violated MASTER RULE 2. confirm_trade() below is the only active method.
 """
 
+import re
 import anthropic
 from src.config_loader import CONFIG
 import logging
@@ -35,9 +36,27 @@ class TradingAgent:
         max_tokens from AI_MAX_TOKENS config (default 4000).
         Parses for 'VERDICT: APPROVE' anywhere in response — anything else → REJECT.
         """
-        _haiku = "claude-haiku-4-5-20251001"
+        _model = "claude-sonnet-4-6"
         _max_tok = int(CONFIG.get("ai_max_tokens") or 4000)
         _now_utc = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Last 5 completed trades for this asset — gives Claude recent performance context
+        _recent_trades_ctx = "No recent trade history available."
+        try:
+            import json as _rj
+            _diary_path = "diary.jsonl"
+            if __import__("os").path.exists(_diary_path):
+                with open(_diary_path, "r") as _rf:
+                    _all_lines = [_rj.loads(l) for l in _rf if l.strip()]
+                _asset_trades = [t for t in _all_lines if t.get("asset") == asset][-5:]
+                if _asset_trades:
+                    _recent_trades_ctx = "\n".join(
+                        f"  {t.get('timestamp','?')[:16]} {t.get('action','?').upper()} "
+                        f"entry={t.get('entry_price','?')} result={t.get('pnl_pct','?')}%"
+                        for t in _asset_trades
+                    )
+        except Exception:
+            pass
 
         ad = asset_data or {}
         mc = macro_context or {}
@@ -116,37 +135,52 @@ class TradingAgent:
 
         _instr = (
             f"INSTRUCTIONS\n{'='*60}\n"
-            "You are a professional trading risk analyst and market environment validator.\n\n"
-            "The code has already confirmed:\n"
-            f"  Multi-timeframe alignment across all timeframes (above)\n"
-            f"  Direction, entry, TP, SL — all set by code. You CANNOT change these.\n\n"
-            "YOUR ONLY JOB: assess whether this is a REAL, HIGH-QUALITY setup or FALSE/RISKY.\n\n"
-            "Analyze each category:\n\n"
-            "BREAKOUT VALIDITY:\n"
-            "- Are all timeframes genuinely aligned or is one borderline?\n"
-            "- Is MACD acceleration consistent across timeframes (not just one TF)?\n"
-            "- Is RSI at a level that supports further move (not already overbought)?\n"
-            "- Does price structure suggest genuine breakout or potential fake-out?\n\n"
-            "MACRO & NEWS RISK:\n"
-            "- Any high-impact scheduled events in next 4-12 hours?\n"
-            "  (FOMC, CPI, NFP, ECB, PCE, PPI, GDP, PMI, earnings, options expiry)\n"
-            "- Any active geopolitical shocks in headlines?\n"
-            "- Does current UTC time put entry near a high-risk window?\n"
-            "  (US open 13:30 UTC, US close 20:00 UTC, Asia open 23:00 UTC)\n\n"
-            "VOLATILITY RISK:\n"
-            "- Is ATR in normal range or spike regime?\n"
-            "- Is Bollinger Band width healthy for this entry type?\n"
-            "- Is spread normal?\n\n"
-            "POSITIONING RISK:\n"
-            "- Is funding rate at extreme suggesting crowded positioning (>0.05% per 8h)?\n"
-            "- Is open interest confirming trend or warning of reversal?\n\n"
-            "End your response with exactly one of:\n"
-            "VERDICT: APPROVE\n"
-            "VERDICT: REJECT\n\n"
-            "Lean toward REJECT when uncertain. A missed trade is better than a trapped position."
+            "You are a professional trading risk analyst validating a code-confirmed setup.\n"
+            "Code has set direction, entry, TP, SL — you CANNOT change any of these.\n\n"
+            "═══ STEP 1: AUTO-REJECT CHECK ═══\n"
+            "If ANY of the following are true, write VERDICT: REJECT immediately:\n"
+            "  - RSI divergence on 4h or 1h (price at new high/low but RSI is NOT)\n"
+            "  - Price within 0.3% of a round-number resistance level\n"
+            "  - Funding rate > +0.05% per 8h on a BUY (crowded longs)\n"
+            "  - Funding rate < -0.05% per 8h on a SELL (crowded shorts)\n"
+            "  - High-impact event within 2 hours: FOMC, CPI, NFP, ECB, PCE, GDP, earnings\n"
+            "  - Candle body < 30% of total candle range on 15m trigger (indecision/wick-dominated)\n\n"
+            "═══ STEP 2: SCORE EACH FACTOR 1–5 ═══\n"
+            "(Proceed only if no auto-reject triggered)\n\n"
+            "FACTOR 1 — Trend strength (quality of multi-timeframe alignment)\n"
+            "  1=TFs conflicting  3=most aligned  5=all TFs aligned + MACD accelerating\n"
+            "  Score: __/5\n\n"
+            "FACTOR 2 — Entry quality (price vs EMA, S&R, market structure)\n"
+            "  1=chasing far from EMA  3=acceptable  5=at key level with clean structure\n"
+            "  Score: __/5\n\n"
+            "FACTOR 3 — Risk/reward validity (is TP reachable without major resistance?)\n"
+            "  1=TP blocked by resistance  3=reasonable path  5=TP in open air + volume\n"
+            "  Score: __/5\n\n"
+            "FACTOR 4 — Macro/news environment (safety of this trading window)\n"
+            "  1=event imminent  3=no major events  5=post-event calm + strong trend\n"
+            "  Score: __/5\n\n"
+            "FACTOR 5 — Volume/OI confirmation (real money behind this move?)\n"
+            "  1=low volume fake-out  3=average volume  5=volume spike + OI expanding\n"
+            "  Score: __/5\n\n"
+            "═══ STEP 3: RESPOND IN THIS EXACT FORMAT ═══\n"
+            "Factor 1: [score]/5 — [one sentence reason]\n"
+            "Factor 2: [score]/5 — [one sentence reason]\n"
+            "Factor 3: [score]/5 — [one sentence reason]\n"
+            "Factor 4: [score]/5 — [one sentence reason]\n"
+            "Factor 5: [score]/5 — [one sentence reason]\n"
+            "TOTAL: [sum]/25\n"
+            "CONFIDENCE: [1-10]\n\n"
+            "VERDICT: APPROVE  ← only if TOTAL >= 18 and no auto-reject\n"
+            "VERDICT: REJECT   ← if TOTAL < 18 or any auto-reject triggered\n\n"
+            "Lean toward REJECT when uncertain. A missed trade beats a trapped position."
         )
 
-        _user = "\n\n".join([_setup, _tf, _vol, _pos, _macro, _instr])
+        _history = (
+            f"RECENT TRADE HISTORY — {asset}\n{'='*60}\n"
+            f"{_recent_trades_ctx}"
+        )
+
+        _user = "\n\n".join([_setup, _tf, _vol, _pos, _macro, _history, _instr])
         _system = (
             "You are a professional trading risk analyst. "
             "Analyze market conditions thoroughly, then end with VERDICT: APPROVE or VERDICT: REJECT."
@@ -154,7 +188,7 @@ class TradingAgent:
 
         try:
             resp = self.client.messages.create(
-                model=_haiku,
+                model=_model,
                 max_tokens=_max_tok,
                 system=_system,
                 messages=[{"role": "user", "content": _user}],
@@ -163,17 +197,21 @@ class TradingAgent:
             answer = resp.content[0].text.strip() if resp.content else ""
             verdict = "APPROVE" if "VERDICT: APPROVE" in answer.upper() else "REJECT"
 
+            # P5: Extract CONFIDENCE score from response (format: "CONFIDENCE: X/10" or "CONFIDENCE: X")
+            _conf_match = re.search(r"CONFIDENCE:\s*(\d+)(?:/10)?", answer, re.IGNORECASE)
+            confidence = int(_conf_match.group(1)) if _conf_match else None
+
             input_tokens  = resp.usage.input_tokens
             output_tokens = resp.usage.output_tokens
-            cost_usd = (input_tokens * 0.0000008) + (output_tokens * 0.000004)
+            cost_usd = (input_tokens * 0.000003) + (output_tokens * 0.000015)
 
-            logging.info("[CONFIRM] %s score=%.1f direction=%s verdict=%s cost=$%.5f",
-                         asset, score, direction, verdict, cost_usd)
+            logging.info("[CONFIRM] %s score=%.1f direction=%s verdict=%s confidence=%s cost=$%.5f",
+                         asset, score, direction, verdict, confidence, cost_usd)
 
             with open("llm_requests.log", "a", encoding="utf-8") as _lf:
                 _lf.write(
                     f"\n=== MARKET ANALYSIS {asset} score={score:.1f} {_now_utc} ===\n"
-                    f"direction={direction} verdict={verdict}\n"
+                    f"direction={direction} verdict={verdict} confidence={confidence}/10\n"
                     f"input_tokens={input_tokens} output_tokens={output_tokens} cost=${cost_usd:.5f}\n"
                     f"--- ANALYSIS ---\n{answer}\n"
                     f"{'='*60}\n"

@@ -1,0 +1,29 @@
+[Unit]
+Description=Hyperliquid Trading Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trading
+WorkingDirectory=/opt/hyperliquid-trading-agent-master
+ExecStart=/usr/bin/python3 src/main.py --assets "BTC ETH SOL AVAX" --interval 1h
+EnvironmentFile=/opt/hyperliquid-trading-agent-master/.env
+
+# Restart policy: 30s delay prevents hammering the exchange after a crash loop.
+# The socket-based instance lock (port 47293) requires the previous process to
+# fully exit before a new one can start — RestartSec=30 gives it time to release.
+Restart=on-failure
+RestartSec=30s
+
+# Logging: capture stdout/stderr to systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-agent
+
+# Hard limits
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

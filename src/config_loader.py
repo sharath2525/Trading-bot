@@ -95,13 +95,17 @@ CONFIG = {
     "max_total_exposure_pct": _get_env("MAX_TOTAL_EXPOSURE_PCT", "50"),       # was 80 (permissive)
     "daily_loss_circuit_breaker_pct": _get_env("DAILY_LOSS_CIRCUIT_BREAKER_PCT", "12"),  # was 25
     "mandatory_sl_pct": _get_env("MANDATORY_SL_PCT", "3"),            # was 5
-    "max_concurrent_positions": _get_env("MAX_CONCURRENT_POSITIONS", "2"),    # was 10 (permissive)
+    "max_concurrent_positions": _get_env("MAX_CONCURRENT_POSITIONS", "3"),    # was 10 (permissive)
     "min_balance_reserve_pct": _get_env("MIN_BALANCE_RESERVE_PCT", "20"),     # was 10 (permissive)
 
     # API server
     "api_host": _get_env("API_HOST", "127.0.0.1"),
     "api_port": _get_env("APP_PORT") or _get_env("API_PORT") or "3000",
     "dashboard_token": _get_env("DASHBOARD_TOKEN"),  # Bearer token for dashboard auth; unset = no auth
+
+    # Telegram alerting — set both to enable push notifications
+    "telegram_bot_token": _get_env("TELEGRAM_BOT_TOKEN", ""),
+    "telegram_chat_id": _get_env("TELEGRAM_CHAT_ID", ""),
 
     # Time-based exit and scoring thresholds
     "max_trade_hours": _get_int("MAX_TRADE_HOURS", 12),
@@ -110,8 +114,8 @@ CONFIG = {
 
     # Execution reality + frequency control
     "taker_fee_pct": float(_get_env("TAKER_FEE_PCT", "0.00045")),  # 0.045% per side
-    "cooldown_minutes": _get_int("COOLDOWN_MINUTES", 60),           # minutes blocked after SL hit
-    "max_daily_trades": _get_int("MAX_DAILY_TRADES", 10),           # hard cap per UTC day
+    "cooldown_minutes": _get_int("COOLDOWN_MINUTES", 30),            # minutes blocked after SL hit
+    "max_daily_trades": _get_int("MAX_DAILY_TRADES", 20),           # hard cap per UTC day
 
     # AI analysis controls — THREE separate score keys, never merge
     # MIN_TRADE_SCORE (0-5 int): entry_confirmed() gate in strategy.py

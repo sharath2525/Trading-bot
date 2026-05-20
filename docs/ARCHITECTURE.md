@@ -1,94 +1,134 @@
-## Trading Agent Architecture (High-Level)
+## Trading Agent Architecture
 
-> **Architecture version: CODE-FIRST HYBRID (updated 2026-04-30, all 22 fixes applied)**
-> Code decides direction, TP, SL, and size. Claude is called only as a final sanity check
-> on the highest-confidence (score = 10/10) setups. All signal logic is deterministic.
-> Permanent rules governing this architecture: see `MASTER_RULES.md` in the project root.
+> **Architecture: CODE-FIRST HYBRID — updated 2026-05-17**
+> Code decides direction, TP, SL, and size. Claude (Sonnet 4.6) is called as a deep market-analysis
+> gate when score ≥ MIN_AI_SCORE (7) AND multi-timeframe confluence is confirmed.
+> Permanent rules: see `MASTER_RULES.md`.
 
-This document outlines the end-to-end flow of the trading agent at a conceptual level.
-It focuses on subsystems, data flows, and guardrails rather than specific functions.
+---
 
 ### Subsystems
 
-- **Config/Env**: Centralized runtime settings from `.env` (keys, model, assets, interval).
-- **Outer Loop (every 1h)**: Coordinates all subsystems. Fetches full candle history, computes all indicators, handles force-closes, reconciliation, and guardian re-placement of missing TP/SL orders.
-- **Inner Loop (every 5m × 12)**: Refreshes 5m candles only and re-runs the full scoring pipeline. 12 ticks per hour = entry opportunities every 5 minutes without waiting for the 1h outer cycle.
+- **Config/Env**: All runtime settings from `.env`. `src/config_loader.py` handles type coercion.
+- **Outer Loop (every 1h)**: Fetches full candle history, computes all indicators, handles force-closes, trailing-stop guardian, TP/SL guardian, time-based exits, daily counter reset.
+- **Inner Loop (every 5m × 12)**: Refreshes 5m candles and re-runs the full scoring pipeline. 12 ticks/hour.
 - **Code Signal Engine** (`strategy.py` + `main.py`):
-  - `_code_decide_direction()` — 4h hard gate. Returns `"buy"`, `"sell"`, or `None` (HOLD). Counter-trend trades are structurally impossible.
-  - `compute_signal_score()` — weighted float score 0–10. Score < `MIN_SIGNAL_SCORE` (7) → HOLD.
-  - `_code_compute_tpsl()` — TP = entry + 2×ATR, SL = entry − 1×ATR. Never set by Claude.
-  - `entry_confirmed()` — final 15m/5m confirmation gate (RSI, ADX, volume, near-EMA).
+  - `_code_decide_direction()` — 4h EMA trend + 1h ADX>25 + daily bias (1d candle) + BB width regime. Returns `"buy"`, `"sell"`, or `None` (HOLD). Counter-trend entries are structurally impossible.
+  - `compute_signal_score()` — weighted float 0–10 with optional bonuses (volume +1.0, candle pattern +0.5, Kronos ±0.5). Capped at 10.0.
+  - `_code_compute_tpsl()` — score-adaptive TP (1.8×/2.2×/2.5×ATR) + partial-close levels (TP1=1×ATR, TP2=3×ATR) + SL=1×ATR. Fee buffer always included.
+  - `entry_confirmed()` — 15m/5m RSI, volume, near-EMA, stale-setup confirmation gate.
+  - `market_filter()` — ATR spike, spread, time gate (00:00–06:00 UTC), weekend gate (Fri 20:00→Sun 08:00 UTC), BTC correlation filter, S&R zones, funding rate hard gate.
+  - `oi_confirmed()` — OI must be increasing; blocks on OI spike >5%.
+  - `is_trending_regime()` — BB width above 20-period median required.
 - **Claude Confirmation Gate** (`confirm_trade()` in `decision_maker.py`):
-  - Called ONLY when score == 10.0 (mathematically rare).
-  - Receives a ~150-token context: asset, direction, entry, TP, SL, score.
-  - Returns exactly one word: `APPROVE` or `REJECT`. `max_tokens=10`.
-  - Fails closed — any error, timeout, or unexpected output → `REJECT`.
-- **Risk/Collateral Gate** (`risk_manager.py`): Validates all 8 safety checks before execution. Can cap allocation or block trade entirely. Non-bypassable.
-- **Execution Layer** (`hyperliquid_api.py`): Places market orders. Immediately places reduce-only TP and SL trigger orders after entry.
-- **Reconciliation**: Resolves local intent vs exchange truth (positions/orders/fills), purges stale local state, logs outcomes.
-- **Observability**: HTTP API (port 3000) serving `/diary`, `/live`, `/logs`.
+  - Called when `score >= MIN_AI_SCORE (7)` AND `multi_timeframe_confluence()` returns True.
+  - Model: `claude-sonnet-4-6`, `max_tokens=4000`, `timeout=30s`.
+  - Receives ~1500-token context: full 5-TF indicators, macro events, news headlines, recent trade history.
+  - Returns structured 5-factor analysis (each 1–5) with TOTAL/25.
+  - `VERDICT: APPROVE` only if TOTAL ≥ 18 and no auto-reject. Anything else → REJECT (fail closed).
+  - Verdict cached: 60 min APPROVE / 30 min REJECT per asset.
+  - Hard gap: `MIN_AI_CALL_GAP_MINUTES` (30 min) per asset.
+- **Risk/Collateral Gate** (`risk_manager.py`): Validates all 8 safety checks before execution. Non-bypassable.
+- **Execution Layer** (`hyperliquid_api.py`): Places LIMIT orders (0.15% better than market). Cancels if unfilled after 1 candle. Places TP1 (50% at 1×ATR) + TP2 (50% at 3×ATR) + SL trigger orders.
+- **Trailing Stop Guardian** (outer loop): Stage 1 — move SL to breakeven at +1×ATR. Stage 2 — trail SL at 0.5×ATR behind at +1.5×ATR.
+- **Observability**: HTTP API (port 3000) serving `/`, `/diary`, `/live`, `/logs`.
 
-### Data Principles
-
-- **Authoritative Source**: Exchange state (positions, orders, fills, mids) always supersedes local intent.
-- **Perp-Only Pricing**: Price context comes from Hyperliquid mids; no spot/perp basis mixing.
-- **Pre-Computed Signals**: `trend_4h`, `trend_1h` (EMA20 vs EMA50) and all MACD/ATR values are computed locally before any decision logic runs.
-- **Two-Config Isolation**: `MIN_TRADE_SCORE` (int, 0–5) feeds `entry_confirmed()` only. `MIN_SIGNAL_SCORE` (float, 0–10) feeds the main loop pre-gate only. These must stay separate.
-- **Time Semantics**: All timestamps are UTC ISO-8601.
+---
 
 ### Signal Flow
 
 ```
-Candles (5m × 20, 15m × 30, 1h × 60, 4h × 60, 1d × 30) — per asset
-    ↓ compute_all() — local indicator calculation (EMA, RSI, MACD, ATR, ADX, etc.)
+Candles (5m × 20+, 15m × 30+, 1h × 60+, 4h × 60+, 1d × 30+) — per asset
+    ↓ compute_all() — local indicators (EMA, RSI, MACD, ATR, ADX, BB, OBV, VWAP)
     ↓
 _code_decide_direction()
-    ↓ None → HOLD (conflicting or unknown trend_4h)
+    Gates: 4h EMA trend + 1h ADX>25 + daily bias + BB width regime
+    ↓ None → HOLD
     ↓ "buy" or "sell"
-compute_signal_score()   [weights: trend_4h=3, trend_1h=2, MACD_15m=2, near_ema=1.5, trigger_5m=1.5]
-    ↓ score < 7.0 → HOLD
-    ↓ score 7.0–8.5 → proceed to daily cap + SL cooldown + market_filter + entry_confirmed
-    ↓ score == 10.0 → confirm_trade() (Claude APPROVE/REJECT, max_tokens=10, fail-closed)
-_code_compute_tpsl(entry, atr, direction)
-    ↓ tp = entry ± 2×ATR,  sl = entry ∓ 1×ATR
-atr_position_size × (score / 10)
+compute_signal_score()
+    Base weights: trend_4h=3.0, trend_1h=2.0, MACD_15m=2.0, near_ema=1.5, trigger_5m=1.5
+    Bonuses: volume +1.0, candle pattern +0.5, Kronos ±0.5 (optional)
+    ↓ score < MIN_SIGNAL_SCORE (7) → HOLD + signal log if score ≥ 7
+    ↓ score ≥ 7
+Daily cap check, SL cooldown check
+multi_timeframe_confluence() — 4h/1h/30m/15m/5m all aligned
+    ↓ if False → skip Claude, check MIN_AI_SCORE gate separately
+confirm_trade() — Claude Sonnet structured 5-factor analysis
+    ↓ VERDICT: REJECT → HOLD
+    ↓ VERDICT: APPROVE
+market_filter() — ATR, spread, time gate, weekend gate, BTC correlation, S&R, funding
+entry_confirmed() — RSI, volume, near-EMA, stale setup
+Candle close gate (85% of 5m candle complete)
+oi_confirmed() — OI increasing + no spike
+_code_compute_tpsl(entry, atr, direction, score) — score-adaptive TP + partial close
+atr_position_size × (score / 10) + pct_cap
+risk_manager.validate_trade() — 8 guards
     ↓
-risk_manager.validate_trade()   [8 guards]
-    ↓
-Hyperliquid SDK — market order + TP trigger + SL trigger
+Place LIMIT entry order → poll fill (3 attempts) → cancel if unfilled
+Place TP1 (50%) + TP2 (50%) trigger orders + SL trigger
+Trailing stop tracking begins
 ```
 
-### 4h Hard Gate
-
-`_code_decide_direction()` returns `None` (HOLD) if:
-- `trend_4h` is `"UNKNOWN"` (insufficient candles or flat EMA cross)
-- `trend_4h == "BULLISH"` but `trend_1h == "BEARISH"` (conflicting trends)
-- `trend_4h == "BEARISH"` but `trend_1h == "BULLISH"` (conflicting trends)
-
-When `None` is returned, `compute_signal_score()` is never called and no Claude call is made.
-Counter-trend entries are structurally impossible.
+---
 
 ### Score Achievable Values
 
-Weights: `trend_4h=3.0, trend_1h=2.0, MACD_15m=2.0, near_ema=1.5, trigger_5m=1.5` (sum = 10.0)
+Base weights: `trend_4h=3.0, trend_1h=2.0, MACD_15m=2.0, near_ema=1.5, trigger_5m=1.5` (sum=10.0)
 
-Achievable: **0, 1.5, 2, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8, 8.5, 10**
+Achievable base values: **0, 1.5, 2, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8, 8.5, 10**
 
-Score 9 is mathematically unreachable. Every path to score ≥ 7 requires `trend_4h` to be aligned.
+With bonuses: any base value can add up to +1.5 (volume +1.0 + pattern +0.5 + Kronos +0.5), capped at 10.0.
 
-### Per-Asset SL Cooldown
+Score 9 base is unreachable. Every path to base ≥ 7 requires `trend_4h` to be aligned.
 
-After any SL hit or force-close due to loss on an asset, that asset is blocked from new entries for `COOLDOWN_MINUTES` (default 60). Tracked in `_sl_cooldown_map: dict[str, datetime]` inside `run_loop()`. Prevents revenge-trading into a losing direction.
+---
 
-### Daily Trade Cap
+### Pre-Trade Filter Chain (market_filter)
 
-`_daily_trade_count` increments on each executed trade. When `>= MAX_DAILY_TRADES`, all new executions are blocked until UTC midnight reset. Prevents fee bleed on high-signal days.
+| Check | Block condition |
+|-------|----------------|
+| ATR spike | ATR14 > 5% of price |
+| Spread | spread_pct > 0.15% |
+| Time gate | UTC hour 00:00–05:59 |
+| Weekend gate | Fri 20:00 UTC → Sun 08:00 UTC |
+| BTC correlation | ETH/SOL/AVAX BUY when BTC 1h BEARISH or last 3 BTC 5m candles red |
+| S&R round numbers | price within 0.5% of round level |
+| S&R swing H/L | BUY within 0.3% of 50-candle swing high; SELL near swing low |
+| S&R PDH/PDL | price within 0.2% of previous-day high/low |
+| Funding rate | BUY when funding > +0.05%/8h; SELL when funding < -0.05%/8h |
+
+---
+
+### Direction Decision Gates (_code_decide_direction)
+
+| Gate | Condition to pass |
+|------|------------------|
+| 4h EMA trend | EMA20 > EMA50 (BUY) or EMA20 < EMA50 (SELL) |
+| 1h trend alignment | Same direction or UNKNOWN |
+| 1h ADX | ADX > 25 (trending, not ranging) |
+| Daily bias | 1d candle direction agrees (green = BUY, red = SELL) |
+| BB width regime | Current BB width ≥ 20-period median |
+
+---
+
+### Data Principles
+
+- **Authoritative source**: Exchange state always supersedes local intent
+- **All indicators local**: Computed from OHLCV candles via `local_indicators.py` — zero external API cost
+- **Three score keys isolated**: `MIN_TRADE_SCORE` (int 0–5) → `entry_confirmed()` only; `MIN_SIGNAL_SCORE` (float 0–10) → main loop pre-gate; `MIN_AI_SCORE` (float 0–10) → Claude trigger
+- **All timestamps UTC ISO-8601**
+- **Signal log**: Every score ≥ 7.0 written to `signals.jsonl` for win-rate analysis
+
+---
 
 ### Robustness
 
-- **Retry**: Up to 3 attempts with exponential backoff on Hyperliquid API calls.
-- **Reconciliation**: Stale `active_trades` entries are pruned each cycle based on live exchange state.
-- **TP/SL Guardian**: Every outer cycle re-places missing trigger orders for any ENTERED position.
-- **Circuit Breaker**: Daily drawdown limit halts all new trades; resets at UTC midnight.
-- **Time-Based Exit**: Trades open > `MAX_TRADE_HOURS` (12h) with no TP hit are force-closed at market to prevent capital lock.
-- **Fail-Closed Claude**: `confirm_trade()` catches all exceptions and returns `"REJECT"` — a Claude API outage never causes a bad trade to execute.
+- **Retry**: Up to 3 attempts with exponential backoff on Hyperliquid API calls
+- **Reconciliation**: Stale `active_trades` entries pruned each cycle from live exchange state
+- **TP/SL Guardian**: Every outer cycle re-places missing trigger orders for active positions
+- **Trailing Stop Guardian**: Every outer cycle adjusts SL for profitable positions
+- **Circuit Breaker**: Daily drawdown limit halts all new trades; resets at UTC midnight
+- **Time-Based Exit**: Trades open > `MAX_TRADE_HOURS` (12h) force-closed at market
+- **Fail-Closed Claude**: All exceptions and timeouts → `"REJECT"` automatically
+- **Instance Lock**: Socket mutex prevents two simultaneous bot instances
+- **Log Rotation**: JSONL files rotated at 50MB
