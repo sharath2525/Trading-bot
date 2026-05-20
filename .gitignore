@@ -44,6 +44,7 @@ risk_state.json.tmp
 # Private notes — local only, not for server or GitHub
 DEVNOTES.md
 STRATEGY.md
+DEPLOY_AND_OPERATIONS.md
 
 # Reports folder — bug council reports, feature notes, internal analysis
 reports/
