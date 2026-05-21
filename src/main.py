@@ -2377,7 +2377,7 @@ def main():
                             logging.info("[INNER MKTFILTER] %s blocked: %s", _ia, _mf_why)
                             continue
                         if not entry_confirmed(_iact_ctx_local, _iout["action"]):
-                            logging.debug("[INNER ENTRY] %s not confirmed", _ia)
+                            logging.info("[INNER ENTRY] %s entry_confirmed failed — 15m/5m conditions not met", _ia)
                             continue
                         # BONUS-1: Candle-close gate (same 85% logic as outer loop)
                         _i_secs_into_5m = (datetime.now(timezone.utc).minute % 5) * 60 + datetime.now(timezone.utc).second

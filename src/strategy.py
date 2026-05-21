@@ -336,8 +336,8 @@ def entry_confirmed(asset_data: dict, direction: str) -> bool:
         trigger_vol = candles_5m[-1].get("volume", 0)
         vol_ok = trigger_vol >= avg_vol * 1.2 if avg_vol > 0 else True
         if not vol_ok:
-            logging.debug(
-                "Entry rejected: low volume on 5m trigger (%.0f vs avg %.0f)",
+            logging.info(
+                "Entry rejected: low volume on 5m trigger (%.0f vs avg %.0f, need 1.2×)",
                 trigger_vol, avg_vol,
             )
     else:
@@ -351,9 +351,9 @@ def entry_confirmed(asset_data: dict, direction: str) -> bool:
         _atr_15m_proxy = float(_atr14_actual) * 0.5 if _atr14_actual else current_price * 0.005
         _dist_from_ema = abs(current_price - float(_ema20_15m))
         if _dist_from_ema > _atr_15m_proxy:
-            logging.debug(
-                "[STALE] %s setup stale — price %.4f moved %.4f from EMA20 %.4f (>0.5%%)",
-                asset_data.get("asset", "?"), current_price, _dist_from_ema, float(_ema20_15m)
+            logging.info(
+                "[STALE] %s setup stale — price %.4f moved %.4f from EMA20 %.4f (limit=%.4f, >0.5×ATR)",
+                asset_data.get("asset", "?"), current_price, _dist_from_ema, float(_ema20_15m), _atr_15m_proxy
             )
             return False
 
