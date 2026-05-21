@@ -293,7 +293,7 @@ def entry_confirmed(asset_data: dict, direction: str) -> bool:
     _score = _compute_signal_score(asset_data, direction)
     _min_score = int(CONFIG.get("min_trade_score") or 3)
     if _score < _min_score:
-        logging.debug(
+        logging.info(
             "[SCORE] %s %s blocked — score %d < min %d",
             asset_data.get("asset", "?"), direction, _score, _min_score,
         )
@@ -303,16 +303,16 @@ def entry_confirmed(asset_data: dict, direction: str) -> bool:
     rsi_15m = s15.get("rsi14")
     if rsi_15m is not None:
         if direction == "buy" and float(rsi_15m) > 70:
-            logging.debug("buy blocked — 15m RSI %.1f overbought", float(rsi_15m))
+            logging.info("buy blocked — 15m RSI %.1f overbought", float(rsi_15m))
             return False
         if direction == "sell" and float(rsi_15m) < 30:
-            logging.debug("sell blocked — 15m RSI %.1f oversold", float(rsi_15m))
+            logging.info("sell blocked — 15m RSI %.1f oversold", float(rsi_15m))
             return False
 
     # ADX gate — block entries in ranging (non-trending) markets
     adx_1h = asset_data.get("intraday_1h", {}).get("adx")
     if adx_1h is not None and float(adx_1h) < 20:
-        logging.debug("entry blocked — 1h ADX %.1f below 20 (ranging market)", float(adx_1h))
+        logging.info("entry blocked — 1h ADX %.1f below 20 (ranging market)", float(adx_1h))
         return False
 
     macd_15m = float(s15.get("macd_histogram") or 0)

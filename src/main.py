@@ -208,7 +208,7 @@ def _code_decide_direction(asset_data: dict) -> str | None:
     # ADX gate — must be trending (ADX > 25) on 1h BEFORE scoring (not downstream in entry_confirmed)
     _adx_1h = asset_data.get("intraday_1h", {}).get("adx")
     if _adx_1h is not None and float(_adx_1h) < 25:
-        logging.debug(
+        logging.info(
             "[DIRECTION] %s blocked — 1h ADX %.1f < 25 (ranging, not trending)",
             asset_data.get("asset", "?"), float(_adx_1h)
         )
@@ -222,13 +222,13 @@ def _code_decide_direction(asset_data: dict) -> str | None:
     if _d_close > 0 and _d_open > 0:
         _daily_bullish = _d_close > _d_open
         if _direction == "buy" and not _daily_bullish:
-            logging.debug(
+            logging.info(
                 "[DIRECTION] %s BUY blocked — daily candle is bearish (close %.4f < open %.4f)",
                 asset_data.get("asset", "?"), _d_close, _d_open
             )
             return None
         if _direction == "sell" and _daily_bullish:
-            logging.debug(
+            logging.info(
                 "[DIRECTION] %s SELL blocked — daily candle is bullish (close %.4f > open %.4f)",
                 asset_data.get("asset", "?"), _d_close, _d_open
             )
@@ -236,8 +236,8 @@ def _code_decide_direction(asset_data: dict) -> str | None:
 
     # BB width regime — only trade when BB width is above its 20-period median (trending)
     if not is_trending_regime(asset_data):
-        logging.debug("[DIRECTION] %s blocked — BB width below median (ranging regime)",
-                      asset_data.get("asset", "?"))
+        logging.info("[DIRECTION] %s blocked — BB width below median (ranging regime)",
+                     asset_data.get("asset", "?"))
         return None
 
     return _direction
@@ -1504,7 +1504,8 @@ def main():
                         "spread_pct": round(spread_pct, 4),
                         "candles_4h": candles_4h,
                         "candles_1h": candles_1h,   # CRITICAL-4: needed for S&R swing H/L gate
-                        "daily_1d": candles_1d[-1] if candles_1d else {},
+                        "candles_5m": candles_5m,   # BUG-B: required for volume/pattern bonuses in compute_signal_score()
+                        "daily_1d": candles_1d[-2] if len(candles_1d) >= 2 else (candles_1d[-1] if candles_1d else {}),  # BUG-C: use yesterday's closed candle not today's incomplete
                     })
                 except Exception as e:
                     add_event(f"Data gather error {asset}: {e}")
@@ -1569,7 +1570,7 @@ def main():
                 except ImportError:
                     pass
                 if _score < _min_sig:
-                    logging.debug("[SCORE] %s %s score=%.1f < %.1f → HOLD", _asset, _direction, _score, _min_sig)
+                    logging.info("[SCORE] %s %s score=%.1f < %.1f → HOLD", _asset, _direction, _score, _min_sig)
                     outputs["trade_decisions"].append(_make_hold(_asset, f"score={_score:.1f} < min {_min_sig:.0f}"))
                     # Signal logging — log every score≥7 signal including HOLDs, for 2-month win-rate analysis
                     if _score >= 7.0:
@@ -1618,14 +1619,14 @@ def main():
                 _require_30m = bool(CONFIG.get("confluence_require_30m", True))
                 _confluence_ok = multi_timeframe_confluence(_ac, _direction, _require_30m)
                 if not _confluence_ok:
-                    logging.debug("[CONFLUENCE] %s %s — TFs not aligned → HOLD", _asset, _direction)
+                    logging.info("[CONFLUENCE] %s %s — TFs not aligned → HOLD", _asset, _direction)
                     outputs["trade_decisions"].append(_make_hold(_asset, "confluence failed — TFs not aligned"))
                     continue
 
                 # MIN_AI_SCORE gate — separate from MIN_SIGNAL_SCORE so Claude call frequency is independently tunable
                 _min_ai = float(CONFIG.get("min_ai_score") or 7)
                 if _score < _min_ai:
-                    logging.debug("[AI GATE] %s score=%.1f < MIN_AI_SCORE %.1f → HOLD", _asset, _score, _min_ai)
+                    logging.info("[AI GATE] %s score=%.1f < MIN_AI_SCORE %.1f → HOLD", _asset, _score, _min_ai)
                     outputs["trade_decisions"].append(_make_hold(_asset, f"score={_score:.1f} < MIN_AI_SCORE {_min_ai:.1f}"))
                     continue
 
@@ -1894,7 +1895,7 @@ def main():
                         _secs_into_5m = (datetime.now(timezone.utc).minute % 5) * 60 + datetime.now(timezone.utc).second
                         _candle_age_pct = _secs_into_5m / 300  # 0.0 = just opened, 1.0 = about to close
                         if _candle_age_pct < 0.85:  # candle must be at least 85% complete (255 of 300s)
-                            logging.debug(
+                            logging.info(
                                 "[CANDLE GATE] %s waiting — 5m candle only %.0f%% complete",
                                 asset, _candle_age_pct * 100
                             )
@@ -2237,7 +2238,7 @@ def main():
                     _i_buying_power = account_value * float(CONFIG.get("max_leverage") or 5)
                     _i_pct_cap = _i_buying_power * (float(CONFIG.get("max_position_pct") or 15) / 100.0)
                     _i_atr_sized = risk_mgr.atr_position_size(account_value, _ie, _isl)
-                    _ialloc = min(_i_pct_cap, _i_atr_sized) * (_iscr / 10.0)
+                    _ialloc = min(_i_pct_cap, _i_atr_sized) * (min(_iscr, 10.0) / 10.0)
                     # ADX ranging market guard (inner loop)
                     _iadx_1h = float(_iac.get("intraday_1h", {}).get("adx") or 25)
                     _iadx_thr = float(CONFIG.get("adx_half_size_threshold") or 20)
@@ -2254,7 +2255,7 @@ def main():
                     # MIN_AI_SCORE gate (inner loop)
                     _imin_ai = float(CONFIG.get("min_ai_score") or 7)
                     if _iscr < _imin_ai:
-                        logging.debug("[INNER AI GATE] %s score=%.1f < MIN_AI_SCORE %.1f → HOLD", _i_asset, _iscr, _imin_ai)
+                        logging.info("[INNER AI GATE] %s score=%.1f < MIN_AI_SCORE %.1f → HOLD", _i_asset, _iscr, _imin_ai)
                         continue
 
                     # AI verdict: cache → gap → stale-TF check → call Claude
@@ -2381,7 +2382,7 @@ def main():
                         # BONUS-1: Candle-close gate (same 85% logic as outer loop)
                         _i_secs_into_5m = (datetime.now(timezone.utc).minute % 5) * 60 + datetime.now(timezone.utc).second
                         if (_i_secs_into_5m / 300) < 0.85:
-                            logging.debug("[INNER CANDLE GATE] %s candle only %.0f%% complete", _ia, _i_secs_into_5m / 3)
+                            logging.info("[INNER CANDLE GATE] %s candle only %.0f%% complete", _ia, _i_secs_into_5m / 3)
                             continue
                         # BONUS-1: OI confirmation gate
                         _i_oi_ok, _i_oi_reason = oi_confirmed(_iact_ctx_local, _iout["action"])
