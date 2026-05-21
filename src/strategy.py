@@ -31,13 +31,15 @@ def market_filter(asset_data: dict, btc_trend_1h: str = "UNKNOWN", btc_candles_5
     _utc_weekday = _now_utc.weekday()  # 0=Mon, 5=Sat, 6=Sun
     if 0 <= _utc_hour <= 5:
         return False, f"time gate — UTC {_utc_hour:02d}:xx blocked (00:00–06:00 UTC)"
-    # Outside prime session hours (08:00–17:00 UTC): require score ≥9 to trade
-    # Low-liquidity windows produce more false breakouts — raise the bar
+    # Outside prime session hours (08:00–17:00 UTC): require score ≥8.5 to trade
+    # Low-liquidity windows produce more false breakouts — raise the bar.
+    # Threshold is 8.5 (not 9.0) because base score 9 is structurally unreachable;
+    # 8.5 requires 4 of 5 base signals aligned — still a high-quality setup off-session.
     _in_session = 8 <= _utc_hour < 17
     _score_context = asset_data.get("_current_score")  # injected by main.py when available
-    if not _in_session and _score_context is not None and float(_score_context) < 9.0:
+    if not _in_session and _score_context is not None and float(_score_context) < 8.5:
         return False, (f"session gate — UTC {_utc_hour:02d}:xx is outside 08:00–17:00 "
-                       f"window; score {float(_score_context):.1f} < 9.0 required off-session")
+                       f"window; score {float(_score_context):.1f} < 8.5 required off-session")
     # Block Friday 20:00 UTC through Sunday 08:00 UTC
     # Friday=4, Saturday=5, Sunday=6
     _is_weekend_block = (
@@ -110,10 +112,12 @@ def market_filter(asset_data: dict, btc_trend_1h: str = "UNKNOWN", btc_candles_5
                     _swing_low  = min(_lows)
                     _dist_high = abs(current_price - _swing_high) / current_price * 100
                     _dist_low  = abs(current_price - _swing_low)  / current_price * 100
-                    if direction == "buy" and _dist_high < 0.3:
+                    # Only block BUY approaching swing high from BELOW (not confirmed breakout)
+                    if direction == "buy" and _dist_high < 0.3 and current_price <= _swing_high:
                         _sr_blocked = True
                         _sr_reason = f"BUY within 0.3% of 1h 50-candle swing high ${_swing_high:.2f}"
-                    elif direction == "sell" and _dist_low < 0.3:
+                    # Only block SELL approaching swing low from ABOVE (not confirmed breakdown)
+                    elif direction == "sell" and _dist_low < 0.3 and current_price >= _swing_low:
                         _sr_blocked = True
                         _sr_reason = f"SELL within 0.3% of 1h 50-candle swing low ${_swing_low:.2f}"
 
@@ -121,10 +125,12 @@ def market_filter(asset_data: dict, btc_trend_1h: str = "UNKNOWN", btc_candles_5
                     if not _sr_blocked and len(_recent_1h) >= 24:
                         _pdh = max(float(c.get("high", 0)) for c in _recent_1h[-24:])
                         _pdl = min(float(c.get("low", 0))  for c in _recent_1h[-24:])
-                        if _pdh > 0 and abs(current_price - _pdh) / current_price * 100 < 0.2:
+                        # Only block BUY near PDH when price hasn't cleared it yet
+                        if _pdh > 0 and abs(current_price - _pdh) / current_price * 100 < 0.2 and current_price <= _pdh:
                             _sr_blocked = True
                             _sr_reason = f"price within 0.2% of PDH ${_pdh:.2f}"
-                        elif _pdl > 0 and abs(current_price - _pdl) / current_price * 100 < 0.2:
+                        # Only block SELL near PDL when price hasn't broken below it yet
+                        elif _pdl > 0 and abs(current_price - _pdl) / current_price * 100 < 0.2 and current_price >= _pdl:
                             _sr_blocked = True
                             _sr_reason = f"price within 0.2% of PDL ${_pdl:.2f}"
 
@@ -138,10 +144,11 @@ def market_filter(asset_data: dict, btc_trend_1h: str = "UNKNOWN", btc_candles_5
                 if _highs_4h and _lows_4h:
                     _swing_high_4h = max(_highs_4h)
                     _swing_low_4h  = min(_lows_4h)
-                    if direction == "buy" and abs(current_price - _swing_high_4h) / current_price * 100 < 0.3:
+                    # Only block when approaching resistance from below / support from above
+                    if direction == "buy" and abs(current_price - _swing_high_4h) / current_price * 100 < 0.3 and current_price <= _swing_high_4h:
                         _sr_blocked = True
                         _sr_reason = f"BUY within 0.3% of 4h 50-candle swing high ${_swing_high_4h:.2f}"
-                    elif direction == "sell" and abs(current_price - _swing_low_4h) / current_price * 100 < 0.3:
+                    elif direction == "sell" and abs(current_price - _swing_low_4h) / current_price * 100 < 0.3 and current_price >= _swing_low_4h:
                         _sr_blocked = True
                         _sr_reason = f"SELL within 0.3% of 4h 50-candle swing low ${_swing_low_4h:.2f}"
 
@@ -416,7 +423,7 @@ def oi_confirmed(asset_data: dict, direction: str) -> tuple[bool, str]:
                 return False, f"OI spike {oi_change_pct:.1f}% in last period — manipulation risk"
 
             # OI must be increasing to confirm real money entering
-            if curr_oi <= prev_oi:
+            if curr_oi < prev_oi * 0.995:
                 return False, f"OI not increasing ({curr_oi:.0f} <= {prev_oi:.0f}) — no new money confirming move"
     except (TypeError, ValueError):
         return True, ""
