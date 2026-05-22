@@ -32,10 +32,18 @@ from src.utils.prompt_utils import json_default, round_or_none, round_series
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+for _h in list(_root_logger.handlers):          # clear whatever libraries set up before us
+    _root_logger.removeHandler(_h)
+_stderr_handler = logging.StreamHandler()
+_stderr_handler.setLevel(logging.INFO)
+_stderr_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+_root_logger.addHandler(_stderr_handler)
 _log_file_handler = RotatingFileHandler("bot.log", maxBytes=5 * 1024 * 1024, backupCount=3)
+_log_file_handler.setLevel(logging.INFO)
 _log_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-logging.getLogger().addHandler(_log_file_handler)
+_root_logger.addHandler(_log_file_handler)
 
 _shutdown = False  # Set to True by SIGTERM/SIGINT handler for clean loop exit
 
@@ -212,6 +220,7 @@ def _code_decide_direction(asset_data: dict) -> str | None:
             "[DIRECTION] %s blocked — 1h ADX %.1f < 25 (ranging, not trending)",
             asset_data.get("asset", "?"), float(_adx_1h)
         )
+        print(f"[DIRECTION] {asset_data.get('asset', '?')} blocked — 1h ADX {float(_adx_1h):.1f} < 25 (ranging)")
         return None
 
     # Daily bias — 1d candle should agree with direction
@@ -226,18 +235,21 @@ def _code_decide_direction(asset_data: dict) -> str | None:
                 "[DIRECTION] %s BUY blocked — daily candle is bearish (close %.4f < open %.4f)",
                 asset_data.get("asset", "?"), _d_close, _d_open
             )
+            print(f"[DIRECTION] {asset_data.get('asset', '?')} BUY blocked — daily bearish close={_d_close:.4f} open={_d_open:.4f}")
             return None
         if _direction == "sell" and _daily_bullish:
             logging.info(
                 "[DIRECTION] %s SELL blocked — daily candle is bullish (close %.4f > open %.4f)",
                 asset_data.get("asset", "?"), _d_close, _d_open
             )
+            print(f"[DIRECTION] {asset_data.get('asset', '?')} SELL blocked — daily bullish close={_d_close:.4f} open={_d_open:.4f}")
             return None
 
     # BB width regime — only trade when BB width is above its 20-period median (trending)
     if not is_trending_regime(asset_data):
         logging.info("[DIRECTION] %s blocked — BB width below median (ranging regime)",
                      asset_data.get("asset", "?"))
+        print(f"[DIRECTION] {asset_data.get('asset', '?')} blocked — BB width below median (ranging regime)")
         return None
 
     return _direction
@@ -1552,9 +1564,12 @@ def main():
                 # 4h hard gate — direction must align with trend_4h or return None
                 _direction = _code_decide_direction(_ac)
                 if _direction is None:
+                    _t4h = _ac.get('trend_4h', 'UNKNOWN')
+                    _t1h = _ac.get('trend_1h', 'UNKNOWN')
+                    _gate_label = "trend conflict" if _t4h != _t1h else "secondary gate blocked (ADX/daily/BB)"
                     outputs["trade_decisions"].append(_make_hold(
                         _asset,
-                        f"4h gate: trend_4h={_ac.get('trend_4h')} trend_1h={_ac.get('trend_1h')} conflict"
+                        f"4h gate: trend_4h={_t4h} trend_1h={_t1h} — {_gate_label}"
                     ))
                     continue
 

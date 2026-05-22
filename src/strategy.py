@@ -388,10 +388,11 @@ def is_trending_regime(asset_data: dict) -> bool:
         _current = float(bb_width)
         _is_trending = _current >= _median
         if not _is_trending:
-            logging.debug(
+            logging.info(
                 "[BB] ranging market detected — BB width %.3f%% below 20-period median %.3f%%",
                 _current, _median
             )
+            print(f"[BB] ranging — BB width {_current:.3f}% below median {_median:.3f}%")
         return _is_trending
     except (TypeError, ValueError):
         return True  # data error — don't block
