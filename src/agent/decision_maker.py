@@ -170,8 +170,8 @@ class TradingAgent:
             "Factor 5: [score]/5 — [one sentence reason]\n"
             "TOTAL: [sum]/25\n"
             "CONFIDENCE: [1-10]\n\n"
-            "VERDICT: APPROVE  ← only if TOTAL >= 18 and no auto-reject\n"
-            "VERDICT: REJECT   ← if TOTAL < 18 or any auto-reject triggered\n\n"
+            "VERDICT: APPROVE  ← only if TOTAL >= 15 and no auto-reject\n"
+            "VERDICT: REJECT   ← if TOTAL < 15 or any auto-reject triggered\n\n"
             "Lean toward REJECT when uncertain. A missed trade beats a trapped position."
         )
 

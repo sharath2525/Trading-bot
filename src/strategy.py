@@ -309,12 +309,6 @@ def entry_confirmed(asset_data: dict, direction: str) -> bool:
             logging.info("sell blocked — 15m RSI %.1f oversold", float(rsi_15m))
             return False
 
-    # ADX gate — block entries in ranging (non-trending) markets
-    adx_1h = asset_data.get("intraday_1h", {}).get("adx")
-    if adx_1h is not None and float(adx_1h) < 20:
-        logging.info("entry blocked — 1h ADX %.1f below 20 (ranging market)", float(adx_1h))
-        return False
-
     macd_15m = float(s15.get("macd_histogram") or 0)
     near_ema  = bool(s15.get("near_ema", False))  # E-1 FIX: default False — missing data blocks entry
     macd_5m   = float(t5.get("macd_histogram") or 0)
@@ -392,7 +386,7 @@ def is_trending_regime(asset_data: dict) -> bool:
                 "[BB] ranging market detected — BB width %.3f%% below 20-period median %.3f%%",
                 _current, _median
             )
-            print(f"[BB] ranging — BB width {_current:.3f}% below median {_median:.3f}%")
+            print(f"[BB] {asset_data.get('asset', '?')} ranging — BB width {_current:.3f}% below median {_median:.3f}%")
         return _is_trending
     except (TypeError, ValueError):
         return True  # data error — don't block

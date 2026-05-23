@@ -159,8 +159,8 @@ Claude is a deep market analyst and confirmation gate, not a direction or number
 4. Factor 4 — Macro/news environment (1–5)
 5. Factor 5 — Volume/OI confirmation (1–5)
 - TOTAL: sum/25 · CONFIDENCE: 1–10
-- `VERDICT: APPROVE` only if TOTAL ≥ 18 and no auto-reject triggered
-- `VERDICT: REJECT` if TOTAL < 18 or any auto-reject triggered
+- `VERDICT: APPROVE` only if TOTAL ≥ 15 and no auto-reject triggered
+- `VERDICT: REJECT` if TOTAL < 15 or any auto-reject triggered
 
 **Auto-reject conditions (Claude must reject immediately if any are true):**
 - RSI divergence on 4h or 1h (price at new extreme but RSI is not)

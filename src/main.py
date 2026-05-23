@@ -193,13 +193,12 @@ def get_interval_seconds(interval_str):
 
 
 def _code_decide_direction(asset_data: dict) -> str | None:
-    """Return 'buy', 'sell', or None from 4h/1h trend alignment plus regime gates.
+    """Return 'buy', 'sell', or None from 4h/1h trend alignment plus ADX gate.
 
     Gates (all must pass before any direction is returned):
-    1. 4h EMA20/50 trend alignment (existing, unchanged)
-    2. 1h ADX > 25 — must be trending, not ranging (MOVED from entry_confirmed)
-    3. Daily bias — 1d candle direction aligns with trade direction
-    4. BB width regime — BB width above 20-period median (not ranging)
+    1. 4h EMA20/50 trend alignment
+    2. 1h trend agrees with 4h direction
+    3. 1h ADX > 20 — must be trending, not ranging
     Returns None when any gate fails.
     """
     trend_4h = asset_data.get("trend_4h", "UNKNOWN")
@@ -213,43 +212,14 @@ def _code_decide_direction(asset_data: dict) -> str | None:
     else:
         return None  # conflicting trends
 
-    # ADX gate — must be trending (ADX > 25) on 1h BEFORE scoring (not downstream in entry_confirmed)
+    # ADX gate — must be trending (ADX > 20) on 1h BEFORE scoring
     _adx_1h = asset_data.get("intraday_1h", {}).get("adx")
-    if _adx_1h is not None and float(_adx_1h) < 25:
+    if _adx_1h is not None and float(_adx_1h) < 20:
         logging.info(
-            "[DIRECTION] %s blocked — 1h ADX %.1f < 25 (ranging, not trending)",
+            "[DIRECTION] %s blocked — 1h ADX %.1f < 20 (ranging, not trending)",
             asset_data.get("asset", "?"), float(_adx_1h)
         )
-        print(f"[DIRECTION] {asset_data.get('asset', '?')} blocked — 1h ADX {float(_adx_1h):.1f} < 25 (ranging)")
-        return None
-
-    # Daily bias — 1d candle should agree with direction
-    # A green daily candle (close > open) supports BUY; red supports SELL
-    _daily = asset_data.get("daily_1d", {})
-    _d_close = float(_daily.get("close") or 0)
-    _d_open  = float(_daily.get("open") or 0)
-    if _d_close > 0 and _d_open > 0:
-        _daily_bullish = _d_close > _d_open
-        if _direction == "buy" and not _daily_bullish:
-            logging.info(
-                "[DIRECTION] %s BUY blocked — daily candle is bearish (close %.4f < open %.4f)",
-                asset_data.get("asset", "?"), _d_close, _d_open
-            )
-            print(f"[DIRECTION] {asset_data.get('asset', '?')} BUY blocked — daily bearish close={_d_close:.4f} open={_d_open:.4f}")
-            return None
-        if _direction == "sell" and _daily_bullish:
-            logging.info(
-                "[DIRECTION] %s SELL blocked — daily candle is bullish (close %.4f > open %.4f)",
-                asset_data.get("asset", "?"), _d_close, _d_open
-            )
-            print(f"[DIRECTION] {asset_data.get('asset', '?')} SELL blocked — daily bullish close={_d_close:.4f} open={_d_open:.4f}")
-            return None
-
-    # BB width regime — only trade when BB width is above its 20-period median (trending)
-    if not is_trending_regime(asset_data):
-        logging.info("[DIRECTION] %s blocked — BB width below median (ranging regime)",
-                     asset_data.get("asset", "?"))
-        print(f"[DIRECTION] {asset_data.get('asset', '?')} blocked — BB width below median (ranging regime)")
+        print(f"[DIRECTION] {asset_data.get('asset', '?')} blocked — 1h ADX {float(_adx_1h):.1f} < 20 (ranging)")
         return None
 
     return _direction
@@ -296,60 +266,36 @@ def _code_compute_tpsl(entry: float, atr: float, direction: str, score: float = 
     return tp1, tp2, sl, tp_main
 
 
-def multi_timeframe_confluence(asset_data: dict, direction: str, require_30m: bool = True) -> bool:
-    """Return True only when all active timeframes agree on direction.
+def multi_timeframe_confluence(asset_data: dict, direction: str, require_30m: bool = False) -> bool:
+    """Return True when 4h, 1h, and 15m MACD all agree on direction.
 
-    4h: EMA20 vs EMA50 strict alignment
-    1h: EMA20 vs EMA50 strict alignment
-    30m (optional): EMA cross OR MACD histogram direction
-    15m: MACD histogram direction
-    5m:  bullish/bearish candle OR MACD histogram direction
-    All rows must pass simultaneously.
+    Reduced from 5 timeframes to 3: 4h (macro trend) + 1h (intraday trend) + 15m MACD
+    (short-term momentum). 30m is correlated with 4h/1h (redundant). 5m candle direction
+    is noise — bullish 5m candles occur 40-50% of the time even in strong downtrends.
     """
     is_buy = direction == "buy"
 
+    # 4h: macro trend alignment
     trend_4h = asset_data.get("trend_4h", "UNKNOWN")
     if is_buy and trend_4h != "BULLISH":
         return False
     if not is_buy and trend_4h != "BEARISH":
         return False
 
+    # 1h: intraday trend alignment
     trend_1h = asset_data.get("trend_1h", "UNKNOWN")
     if is_buy and trend_1h != "BULLISH":
         return False
     if not is_buy and trend_1h != "BEARISH":
         return False
 
-    if require_30m:
-        s30m = asset_data.get("setup_30m", {})
-        ema20_30m = s30m.get("ema20")
-        ema50_30m = s30m.get("ema50")
-        macd_30m  = s30m.get("macd_histogram")
-        if ema20_30m is not None and ema50_30m is not None:
-            ok_30m = (is_buy and ema20_30m > ema50_30m) or (not is_buy and ema20_30m < ema50_30m)
-        elif macd_30m is not None:
-            ok_30m = (is_buy and macd_30m > 0) or (not is_buy and macd_30m < 0)
-        else:
-            ok_30m = True  # insufficient data — don't block
-        if not ok_30m:
-            return False
-
+    # 15m: short-term momentum confirmation via MACD histogram
     macd_15m = asset_data.get("setup_15m", {}).get("macd_histogram")
     if macd_15m is not None:
         if is_buy and macd_15m <= 0:
             return False
         if not is_buy and macd_15m >= 0:
             return False
-
-    t5m = asset_data.get("trigger_5m", {})
-    candle_bullish = t5m.get("candle_bullish", False)
-    macd_5m = t5m.get("macd_histogram")
-    if is_buy:
-        ok_5m = candle_bullish or (macd_5m is not None and macd_5m > 0)
-    else:
-        ok_5m = (not candle_bullish) or (macd_5m is not None and macd_5m < 0)
-    if not ok_5m:
-        return False
 
     return True
 
@@ -1566,7 +1512,7 @@ def main():
                 if _direction is None:
                     _t4h = _ac.get('trend_4h', 'UNKNOWN')
                     _t1h = _ac.get('trend_1h', 'UNKNOWN')
-                    _gate_label = "trend conflict" if _t4h != _t1h else "secondary gate blocked (ADX/daily/BB)"
+                    _gate_label = "trend conflict" if _t4h != _t1h else "secondary gate blocked (ADX)"
                     outputs["trade_decisions"].append(_make_hold(
                         _asset,
                         f"4h gate: trend_4h={_t4h} trend_1h={_t1h} — {_gate_label}"
@@ -1631,8 +1577,7 @@ def main():
                                  _asset, _adx_1h_val, _adx_thr, _score)
 
                 # Confluence gate: all timeframes must agree before calling Claude
-                _require_30m = bool(CONFIG.get("confluence_require_30m", True))
-                _confluence_ok = multi_timeframe_confluence(_ac, _direction, _require_30m)
+                _confluence_ok = multi_timeframe_confluence(_ac, _direction)
                 if not _confluence_ok:
                     logging.info("[CONFLUENCE] %s %s — TFs not aligned → HOLD", _asset, _direction)
                     outputs["trade_decisions"].append(_make_hold(_asset, "confluence failed — TFs not aligned"))
@@ -1909,7 +1854,7 @@ def main():
                         _now_sec = datetime.now(timezone.utc).second + datetime.now(timezone.utc).minute % 5 * 60
                         _secs_into_5m = (datetime.now(timezone.utc).minute % 5) * 60 + datetime.now(timezone.utc).second
                         _candle_age_pct = _secs_into_5m / 300  # 0.0 = just opened, 1.0 = about to close
-                        if _candle_age_pct < 0.85:  # candle must be at least 85% complete (255 of 300s)
+                        if _candle_age_pct < 0.70:  # candle must be at least 70% complete (210 of 300s)
                             logging.info(
                                 "[CANDLE GATE] %s waiting — 5m candle only %.0f%% complete",
                                 asset, _candle_age_pct * 100
@@ -2263,8 +2208,7 @@ def main():
                                      _i_asset, _iadx_1h, _iadx_thr, _iscr)
 
                     # Confluence gate (inner loop)
-                    _irq30m = bool(CONFIG.get("confluence_require_30m", True))
-                    if not multi_timeframe_confluence(_iac, _idir, _irq30m):
+                    if not multi_timeframe_confluence(_iac, _idir):
                         continue
 
                     # MIN_AI_SCORE gate (inner loop)
@@ -2396,7 +2340,7 @@ def main():
                             continue
                         # BONUS-1: Candle-close gate (same 85% logic as outer loop)
                         _i_secs_into_5m = (datetime.now(timezone.utc).minute % 5) * 60 + datetime.now(timezone.utc).second
-                        if (_i_secs_into_5m / 300) < 0.85:
+                        if (_i_secs_into_5m / 300) < 0.70:
                             logging.info("[INNER CANDLE GATE] %s candle only %.0f%% complete", _ia, _i_secs_into_5m / 3)
                             continue
                         # BONUS-1: OI confirmation gate
