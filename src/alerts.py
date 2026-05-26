@@ -38,14 +38,26 @@ async def send_alert(message: str) -> None:
 
 
 def send_alert_sync(message: str) -> None:
-    """Synchronous wrapper for use in signal handlers or non-async contexts."""
+    """Synchronous wrapper for use in signal handlers or non-async contexts.
+
+    BUG-v8-S4 FIX: replaced asyncio.ensure_future() which silently drops alerts when
+    the event loop is shutting down (e.g., KILLSWITCH). Now uses a direct synchronous
+    urllib HTTP call that does not depend on the event loop being alive. This ensures
+    KILLSWITCH confirmation and shutdown alerts are always delivered.
+    """
     if not _ENABLED:
         return
+    import json as _json
+    import urllib.request as _urlreq
+    import urllib.error as _urlerr
+    url = f"https://api.telegram.org/bot{_BOT_TOKEN}/sendMessage"
+    payload = _json.dumps({"chat_id": _CHAT_ID, "text": message, "parse_mode": "HTML"}).encode()
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(send_alert(message))
-        else:
-            loop.run_until_complete(send_alert(message))
+        req = _urlreq.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        with _urlreq.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                logging.warning("[ALERTS] Telegram sync send failed: %d", resp.status)
+    except _urlerr.URLError as _e:
+        logging.warning("[ALERTS] Telegram sync send error: %s", _e)
     except Exception as _e:
         logging.warning("[ALERTS] Telegram sync send error: %s", _e)

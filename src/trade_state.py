@@ -95,6 +95,19 @@ class TradeStateMachine:
                 "[STATE] restored from disk: %s",
                 {a: self._states.get(a, self.IDLE) for a in set(self._states) | set(self._entry_time)},
             )
+        except json.JSONDecodeError as e:
+            # CHAOS-7 FIX: Corrupt state.json (bad JSON) must halt, not silently reset to IDLE.
+            # A silent reset clears all ENTERED states — if a position is open on the exchange,
+            # the bot re-enters and creates 2× exposure at 5× leverage (= 10× effective leverage).
+            # Force a clean exit so the operator can manually inspect and repair state.json.
+            logging.critical(
+                "[STATE] FATAL: state.json is corrupt (JSON parse error: %s). "
+                "Refusing to start to prevent re-entry on existing open positions. "
+                "Inspect '%s', fix or delete it, then restart.",
+                e, self._state_file,
+            )
+            import sys as _state_sys
+            _state_sys.exit(1)
         except Exception as e:
             logging.warning("[STATE] failed to load state.json: %s — starting fresh", e)
 

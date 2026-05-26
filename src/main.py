@@ -25,7 +25,7 @@ from src.alerts import send_alert
 from src.config_loader import CONFIG
 from src.indicators.local_indicators import compute_all, last_n, latest
 from src.risk_manager import RiskManager
-from src.strategy import entry_confirmed, market_filter, compute_signal_score, is_trending_regime, oi_confirmed
+from src.strategy import entry_confirmed, market_filter, compute_signal_score, oi_confirmed
 from src.trade_state import TradeStateMachine, load_active_trades, save_active_trades
 from src.trading.hyperliquid_api import HyperliquidAPI
 from src.utils.prompt_utils import json_default, round_or_none, round_series
@@ -44,6 +44,41 @@ _log_file_handler = RotatingFileHandler("bot.log", maxBytes=5 * 1024 * 1024, bac
 _log_file_handler.setLevel(logging.INFO)
 _log_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 _root_logger.addHandler(_log_file_handler)
+
+# BUG-P9-5 FIX: Warn at startup when DASHBOARD_TOKEN is not set.
+# The /logs endpoint serves decisions.jsonl which contains account value, positions,
+# and allocation amounts. Without a token the dashboard is fully unauthenticated.
+# BUG-v7-S3 FIX: Refuse to start if DASHBOARD_TOKEN is unset and API_HOST is not localhost.
+# An open dashboard on 0.0.0.0 with no auth exposes live position data to any host on port 3000.
+_dashboard_token = os.getenv("DASHBOARD_TOKEN", "").strip()
+_api_host = os.getenv("API_HOST", "127.0.0.1").strip()
+_api_host_is_local = _api_host in ("127.0.0.1", "localhost", "::1")
+if not _dashboard_token:
+    if not _api_host_is_local:
+        print(
+            "[SECURITY] FATAL: DASHBOARD_TOKEN is not set and API_HOST is not localhost.\n"
+            "  The dashboard exposes live account balance, positions, and trade history.\n"
+            "  Either set DASHBOARD_TOKEN in .env (recommended) or change API_HOST to 127.0.0.1.\n"
+            "  Refusing to start to protect your funds."
+        )
+        import sys as _sys
+        _sys.exit(1)
+    logging.warning(
+        "[SECURITY] ⚠️  DASHBOARD_TOKEN not set — HTTP dashboard is unauthenticated. "
+        "The /logs endpoint serves account balance and position data. "
+        "Set DASHBOARD_TOKEN in .env and restrict port 3000 to localhost."
+    )
+    print("[SECURITY] ⚠️  DASHBOARD_TOKEN not set — dashboard has no auth. Set it in .env to protect account data.")
+
+# Telegram alert status — warn at startup if not configured
+from src.alerts import _ENABLED as _telegram_enabled
+if not _telegram_enabled:
+    logging.warning(
+        "[ALERTS] ⚠️  Telegram NOT configured — push alerts disabled. "
+        "Set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env to enable. "
+        "Without alerts: circuit breaker, API failures, and KILLSWITCH events are silent."
+    )
+    print("[ALERTS] ⚠️  Telegram NOT configured — no push notifications. Add TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID to .env")
 
 _shutdown = False  # Set to True by SIGTERM/SIGINT handler for clean loop exit
 
@@ -198,34 +233,50 @@ def _code_decide_direction(asset_data: dict) -> str | None:
     Gates (all must pass before any direction is returned):
     1. 4h EMA20/50 trend alignment
     2. 1h trend agrees with 4h direction
-    3. 1h ADX > 20 — must be trending, not ranging
+    3. 1h ADX ≥ 15 — must be trending (ADX < 15 → HOLD; 15–20 → half-size via ADX_HALF_SIZE_THRESHOLD)
     Returns None when any gate fails.
     """
     trend_4h = asset_data.get("trend_4h", "UNKNOWN")
     trend_1h = asset_data.get("trend_1h", "UNKNOWN")
     if trend_4h == "UNKNOWN":
         return None
-    if trend_4h == "BULLISH" and trend_1h in ("BULLISH", "UNKNOWN"):
+    # BUG-P9-3 FIX: Fail closed on UNKNOWN 1h trend — UNKNOWN means insufficient
+    # candle history (startup/data gap). Allowing UNKNOWN bypasses the 1h EMA gate
+    # entirely. Both 4h and 1h must have confirmed trend direction before proceeding.
+    if trend_1h == "UNKNOWN":
+        return None
+    if trend_4h == "BULLISH" and trend_1h == "BULLISH":
         _direction = "buy"
-    elif trend_4h == "BEARISH" and trend_1h in ("BEARISH", "UNKNOWN"):
+    elif trend_4h == "BEARISH" and trend_1h == "BEARISH":
         _direction = "sell"
     else:
         return None  # conflicting trends
 
-    # ADX gate — must be trending (ADX > 20) on 1h BEFORE scoring
+    # ADX gate — must show some directional movement on 1h (ADX ≥ 15 to proceed).
+    # Threshold lowered from 20 → 15: purely ranging markets (ADX < 15) are blocked.
+    # Markets with ADX 15–20 are weakly trending — allowed but sized at 50% by
+    # ADX_HALF_SIZE_THRESHOLD=20 in risk sizing. Markets with ADX ≥ 20 get full size.
+    # This creates three layers: no-trade (< 15), half-size (15–20), full-size (≥ 20).
+    # BUG-P9-3 FIX preserved: Fail closed when ADX is None.
     _adx_1h = asset_data.get("intraday_1h", {}).get("adx")
-    if _adx_1h is not None and float(_adx_1h) < 20:
+    if _adx_1h is None:
         logging.info(
-            "[DIRECTION] %s blocked — 1h ADX %.1f < 20 (ranging, not trending)",
+            "[DIRECTION] %s blocked — 1h ADX unavailable (insufficient 1h candle data)",
+            asset_data.get("asset", "?")
+        )
+        return None
+    if float(_adx_1h) < 15:
+        logging.info(
+            "[DIRECTION] %s blocked — 1h ADX %.1f < 15 (too flat, no directional move)",
             asset_data.get("asset", "?"), float(_adx_1h)
         )
-        print(f"[DIRECTION] {asset_data.get('asset', '?')} blocked — 1h ADX {float(_adx_1h):.1f} < 20 (ranging)")
+        print(f"[DIRECTION] {asset_data.get('asset', '?')} blocked — 1h ADX {float(_adx_1h):.1f} < 15 (flat)")
         return None
 
     return _direction
 
 
-def _code_compute_tpsl(entry: float, atr: float, direction: str, score: float = 7.0) -> tuple[float, float, float, float]:
+def _code_compute_tpsl(entry: float, atr: float, direction: str, score: float = 7.0, funding_rate: float = 0.0) -> tuple[float, float, float, float]:
     """Return (tp1, tp2, sl, tp_main) — score-adaptive TP with partial-close levels.
 
     tp1     = 1.0×ATR  — close 50% of position (lock profit)
@@ -234,12 +285,20 @@ def _code_compute_tpsl(entry: float, atr: float, direction: str, score: float = 
               score >= 10.0 → 2.5×ATR  (perfect base + volume bonus — highest conviction)
               score >= 9.0  → 2.2×ATR
               score >= 8.0  → 2.0×ATR
-              score >= 7.0  → 1.8×ATR  (minimum passing setup)
+              score >= 7.0  → 1.8×ATR
+              score >= 6.0  → 1.6×ATR  (minimum passing setup at lowered gate)
     sl      = 1.0×ATR from entry always (MASTER RULE 4)
-    Fee buffer baked into all levels. Code owns all TP/SL (MASTER RULE 2).
+    Fee buffer + funding buffer baked into all levels. Code owns all TP/SL (MASTER RULE 2).
     Score scale is 0–11; tiers anchored to updated scale (MASTER RULES 2026-05-20).
+    CHAOS-8 FIX: funding_rate (per 8h) factored in as one-interval buffer so funding cost
+    does not erode TP1 on positions held through a single funding window.
     """
     fee_buffer = entry * float(CONFIG.get("taker_fee_pct") or 0.00045) * 2
+    # One funding interval (8h) worst-case buffer; only applied when funding_rate is adverse
+    # For BUY: positive funding_rate means longs pay → add to TP; negative → shorts pay, ignore
+    # For SELL: negative funding_rate means shorts pay → add to TP; positive → longs pay, ignore
+    _fr = abs(float(funding_rate or 0))
+    funding_buffer = entry * _fr if _fr > 0 else 0.0
 
     if score >= 10.0:
         tp_mult = 2.5
@@ -249,24 +308,27 @@ def _code_compute_tpsl(entry: float, atr: float, direction: str, score: float = 
         tp_mult = 2.0
     elif score >= 7.0:
         tp_mult = 1.8
+    elif score >= 6.0:
+        tp_mult = 1.6
     else:
-        tp_mult = 2.0
+        tp_mult = 1.6  # fallback — should not reach here below MIN_SIGNAL_SCORE
 
+    total_buf = fee_buffer + funding_buffer
     if direction == "buy":
-        tp1     = round(entry + 1.0 * atr + fee_buffer, 6)
-        tp2     = round(entry + 3.0 * atr + fee_buffer, 6)
-        tp_main = round(entry + tp_mult * atr + fee_buffer, 6)
-        sl      = round(entry - 1.0 * atr - fee_buffer, 6)
+        tp1     = round(entry + 1.0 * atr + total_buf, 6)
+        tp2     = round(entry + 3.0 * atr + total_buf, 6)
+        tp_main = round(entry + tp_mult * atr + total_buf, 6)
+        sl      = round(entry - 1.0 * atr - fee_buffer, 6)  # SL: fees only, funding not relevant if stopped out
     else:
-        tp1     = round(entry - 1.0 * atr - fee_buffer, 6)
-        tp2     = round(entry - 3.0 * atr - fee_buffer, 6)
-        tp_main = round(entry - tp_mult * atr - fee_buffer, 6)
+        tp1     = round(entry - 1.0 * atr - total_buf, 6)
+        tp2     = round(entry - 3.0 * atr - total_buf, 6)
+        tp_main = round(entry - tp_mult * atr - total_buf, 6)
         sl      = round(entry + 1.0 * atr + fee_buffer, 6)
 
     return tp1, tp2, sl, tp_main
 
 
-def multi_timeframe_confluence(asset_data: dict, direction: str, require_30m: bool = False) -> bool:
+def multi_timeframe_confluence(asset_data: dict, direction: str) -> bool:
     """Return True when 4h, 1h, and 15m MACD all agree on direction.
 
     Reduced from 5 timeframes to 3: 4h (macro trend) + 1h (intraday trend) + 15m MACD
@@ -283,18 +345,28 @@ def multi_timeframe_confluence(asset_data: dict, direction: str, require_30m: bo
         return False
 
     # 1h: intraday trend alignment
+    # BUG-v7-L5 FIX: also block UNKNOWN — defense-in-depth against direction-logic refactors.
+    # _code_decide_direction() already rejects UNKNOWN 1h; confluence is a backstop.
     trend_1h = asset_data.get("trend_1h", "UNKNOWN")
     if is_buy and trend_1h != "BULLISH":
         return False
     if not is_buy and trend_1h != "BEARISH":
         return False
 
-    # 15m: short-term momentum confirmation via MACD histogram
+    # 15m: short-term momentum confirmation via MACD histogram.
+    # Tolerance widened to 0.5% of price (was 0.05%):
+    # In pullback entries during a strong trend, 15m MACD can be -0.2 to -0.5% of price
+    # while the trade is still valid (4h+1h trend aligned). The entry_confirmed() function
+    # handles MACD more precisely via OR logic with near_ema. Confluence should only block
+    # when 15m MACD is STRONGLY against direction (>0.5% of price) — a genuine reversal signal.
+    # At BTC=$90k, 0.5% = $450 — this only blocks clear counter-trend 15m momentum.
     macd_15m = asset_data.get("setup_15m", {}).get("macd_histogram")
     if macd_15m is not None:
-        if is_buy and macd_15m <= 0:
+        _price = float(asset_data.get("current_price") or 0)
+        _tol = _price * 0.005 if _price > 0 else 0.0  # 0.5% of price — only block strong counter-trend
+        if is_buy and float(macd_15m) < -_tol:
             return False
-        if not is_buy and macd_15m >= 0:
+        if not is_buy and float(macd_15m) > _tol:
             return False
 
     return True
@@ -478,6 +550,19 @@ def main():
     price_history = {}
 
     print(f"Starting trading agent for assets: {args.assets} at interval: {args.interval}")
+
+    # PERF-1 FIX: Pre-warm Kronos-mini at startup in a thread so the blocking HuggingFace
+    # model load (30–60s on cold VPS) happens before the first guardian pass, not inside it.
+    # Without this, any open positions from a prior session have no SL re-placement protection
+    # during the cold-load window. asyncio.to_thread keeps the event loop responsive.
+    async def _prewarm_kronos():
+        try:
+            from src.indicators.kronos_forecast import _load_kronos
+            await asyncio.to_thread(_load_kronos)
+            logging.info("[KRONOS] pre-warm complete")
+        except Exception as _kw_err:
+            logging.warning("[KRONOS] pre-warm error (non-fatal): %s", _kw_err)
+    asyncio.ensure_future(_prewarm_kronos())
 
     def add_event(msg: str):
         logging.info(msg)
@@ -750,8 +835,48 @@ def main():
             if os.path.exists(os.path.normpath(_KILLSWITCH_FILE)):
                 logging.critical("[KILLSWITCH] KILLSWITCH file detected — halting all trading. Remove the file to re-enable.")
                 add_event("[KILLSWITCH] Trading halted by KILLSWITCH file. Remove it to restart.")
-                await send_alert("\U0001f6a8 KILLSWITCH activated — all trading halted. Remove the KILLSWITCH file to restart.")
-                break
+                # BUG-P9-2 FIX: Close all open positions and cancel orders before exiting.
+                # Previous code only broke the loop — positions kept running with no monitoring.
+                # BUG-v7-O1 FIX: Retry each close up to 3 times. If any position cannot be closed,
+                # do NOT exit — keep the bot running so the guardian continues protecting it.
+                # A silent exit with an open leveraged position is worse than staying up.
+                _ks_unclosed = []
+                for _ks_tr in list(active_trades):
+                    _ks_asset = _ks_tr.get("asset")
+                    if not _ks_asset:
+                        continue
+                    _ks_closed = False
+                    for _ks_attempt in range(3):
+                        try:
+                            await hyperliquid.cancel_all_orders(_ks_asset)
+                            await hyperliquid.market_close(_ks_asset)
+                            logging.critical("[KILLSWITCH] %s — orders cancelled and position closed", _ks_asset)
+                            add_event(f"[KILLSWITCH] {_ks_asset} closed successfully")
+                            _ks_closed = True
+                            break
+                        except Exception as _ks_err:
+                            logging.critical("[KILLSWITCH] %s — close attempt %d/3 failed: %s", _ks_asset, _ks_attempt + 1, _ks_err)
+                            if _ks_attempt < 2:
+                                import asyncio as _ks_asyncio
+                                await _ks_asyncio.sleep(2)
+                    if not _ks_closed:
+                        _ks_unclosed.append(_ks_asset)
+                        logging.critical("[KILLSWITCH] %s — ALL 3 CLOSE ATTEMPTS FAILED — position remains open — bot staying alive to monitor", _ks_asset)
+                        add_event(f"[KILLSWITCH] {_ks_asset} CLOSE FAILED x3 — MANUAL INTERVENTION REQUIRED")
+                if _ks_unclosed:
+                    _ks_msg = (
+                        f"\U0001f6a8 KILLSWITCH: {len(active_trades) - len(_ks_unclosed)} closed, "
+                        f"{len(_ks_unclosed)} FAILED TO CLOSE: {', '.join(_ks_unclosed)}. "
+                        f"Bot staying alive to monitor unclosed positions. Manual close required."
+                    )
+                    await send_alert(_ks_msg)
+                    logging.critical("[KILLSWITCH] staying alive — unclosed positions need manual action: %s", _ks_unclosed)
+                    # Do NOT break — continue monitoring the unclosed positions
+                    continue
+                else:
+                    _ks_msg = f"\U0001f6a8 KILLSWITCH activated — closed {len(active_trades)} position(s). Remove the KILLSWITCH file to restart."
+                    await send_alert(_ks_msg)
+                    break
             cycle_start = time.monotonic()
             _outer_cycle_timestamp = cycle_start  # inner ticks read this to check higher-TF freshness
             # C-2 FIX: Do NOT clear the entire AI verdict cache on every outer cycle.
@@ -828,6 +953,7 @@ def main():
             _rotate_if_needed(decisions_path)
             _rotate_if_needed("llm_requests.log")   # V3-HIGH-1: was missed in E-4 fix
             _rotate_if_needed("prompts.log")
+            _rotate_if_needed("signals.jsonl")      # BUG-v7-P5 FIX: was omitted; can grow to GB without rotation
 
             positions = []
             for pos_wrap in state.get('positions', []):
@@ -929,6 +1055,34 @@ def main():
                         # let _log_trade_close resolve tp/sl from the fill price.
                         _recon_exit_type = tr.get('pending_exit_type', 'unknown')
                         await _log_trade_close(tr, _recon_exit_type)
+                # BUG-P11-1 FIX: TP1 hit detection — set tp1_hit=True and halve tracked amount
+                # when TP1 order disappears from open orders but position still exists.
+                # Without this, tp1_hit stays False forever and the trailing stop guardian
+                # continues placing SL for the full original size after 50% has been closed.
+                for _tp1_tr in active_trades:
+                    _tp1_tr_asset = _tp1_tr.get("asset")
+                    _tp1_tr_oid   = _tp1_tr.get("tp1_oid")
+                    if not _tp1_tr_asset or not _tp1_tr_oid or _tp1_tr.get("tp1_hit"):
+                        continue  # no TP1 OID, or already marked hit
+                    _tp1_still_open = any(
+                        str(o.get("oid")) == str(_tp1_tr_oid) for o in (open_orders or [])
+                    )
+                    if _tp1_still_open:
+                        continue  # TP1 order still live
+                    if _tp1_tr_asset not in assets_with_positions:
+                        continue  # full exit — handled by reconcile loop above
+                    # TP1 filled: partial close of 50%. Update tracked amount for guardian.
+                    _new_amount = float(_tp1_tr.get("half_size") or float(_tp1_tr.get("amount", 0)) / 2)
+                    _tp1_tr["tp1_hit"]  = True
+                    _tp1_tr["amount"]   = _new_amount
+                    _tp1_tr["tp1_oid"]  = None  # cleared — no longer in open orders
+                    save_active_trades(active_trades)
+                    logging.info(
+                        "[TP1 HIT] %s TP1 filled — amount reduced to %.6f for trailing stop guardian",
+                        _tp1_tr_asset, _new_amount
+                    )
+                    add_event(f"[TP1 HIT] {_tp1_tr_asset} TP1 filled — trailing stop now covers remaining 50%")
+
             except Exception as _rec_err:
                 # C-6 FIX: Log reconcile errors instead of silently swallowing them.
                 # A bare `pass` left stale ENTERED state that blocked future entries for 13h.
@@ -941,9 +1095,23 @@ def main():
                 if state_mgr.get_state(_asset_name) == "ENTERED":
                     _max_hours = int(CONFIG.get("max_trade_hours") or 12)
                     if state_mgr.is_trade_expired(_asset_name, _max_hours):
+                        # Compute actual age for alert message using opened_at from active_trades
+                        _timeout_age_str = f"{_max_hours}h"
+                        for _atr_t in active_trades:
+                            if _atr_t.get("asset") == _asset_name and _atr_t.get("opened_at"):
+                                try:
+                                    _atr_opened = datetime.fromisoformat(_atr_t["opened_at"].replace("Z", "+00:00"))
+                                    _atr_age_h = (datetime.now(timezone.utc) - _atr_opened).total_seconds() / 3600
+                                    _timeout_age_str = f"{_atr_age_h:.1f}h"
+                                except (ValueError, TypeError):
+                                    pass
+                                break
                         add_event(
                             f"[TIMEOUT] {_asset_name} force-closing "
-                            f"after {_max_hours}h — no progress"
+                            f"after {_timeout_age_str} — no progress (max={_max_hours}h)"
+                        )
+                        await send_alert(
+                            f"⏰ [MAX DURATION] {_asset_name} — trade open {_timeout_age_str}, auto-closing (max={_max_hours}h)"
                         )
                         try:
                             await hyperliquid.market_close(_asset_name)
@@ -958,6 +1126,7 @@ def main():
                                     _tr['pending_exit_type'] = 'timeout'
                         except Exception as _te:
                             add_event(f"[TIMEOUT] {_asset_name} close error: {_te}")
+                            await send_alert(f"🚨 [MAX DURATION FAIL] {_asset_name} could not auto-close: {_te}")
 
             # TP/SL GUARDIAN — re-place missing trigger orders for every ENTERED position.
             # TP/SL are placed once at entry; if the exchange dropped the order (rate-limit,
@@ -1044,7 +1213,13 @@ def main():
                                     add_event(f"[GUARDIAN] {_g_asset} fallback SL failed: {_g_fb_err}")
                     continue
                 _g_is_long  = _g_diary.get('action') == 'buy'
-                _g_amount   = float(_g_diary.get('amount') or 0)
+                # BUG-v7-L1 FIX: Use active_trades amount (halved post-TP1) not diary amount (full original).
+                # After TP1 fills, active_trades["amount"] is halved by the BUG-P11-1 fix.
+                # The diary still records the original full amount at entry time.
+                # Placing a reduce-only SL for the full amount against a half-size position
+                # causes Hyperliquid to reject the order, leaving the position naked.
+                _g_active_tr = next((t for t in active_trades if t.get('asset') == _g_asset), None)
+                _g_amount   = float((_g_active_tr or {}).get('amount') or _g_diary.get('amount') or 0)
                 _g_tp_px    = _g_diary.get('tp_price')
                 _g_tp1_px   = _g_diary.get('tp1_price')
                 _g_tp2_px   = _g_diary.get('tp2_price')
@@ -1118,7 +1293,12 @@ def main():
                 _tr_long  = _tr.get("is_long", True)
                 _tr_size  = float(_tr.get("amount") or 0)
 
-                if not _tr_asset or _tr_entry <= 0 or _tr_atr <= 0 or _tr_size <= 0:
+                if not _tr_asset or _tr_entry <= 0 or _tr_atr <= 0:
+                    continue
+                if _tr_size <= 0:
+                    # BUG-v8-L7: amount can round to zero after TP1 halves it on very small positions.
+                    # Log clearly so operator knows trailing stop is skipped for this position.
+                    logging.warning("[TRAIL] %s skipped — amount is zero (lot-size rounding after TP1?); position has no trailing stop", _tr_asset)
                     continue
 
                 _cur_px = float(asset_prices.get(_tr_asset) or 0)
@@ -1269,11 +1449,27 @@ def main():
                         hyperliquid.get_candles(asset, "4h",  60),
                         hyperliquid.get_candles(asset, "30m", 40),
                         hyperliquid.get_candles(asset, "15m", 30),
-                        hyperliquid.get_candles(asset, "5m",  20),
+                        hyperliquid.get_candles(asset, "5m",  400),  # BUG-v8-L2 FIX: 400 candles for Kronos-mini context window (was 100 — degraded forecast)
                         hyperliquid.get_candles(asset, "1d",  50),
                     )
                     asset_prices[asset] = current_price
                     asset_candles_5m[asset] = candles_5m
+
+                    # CHAOS-3 FIX: Stale candle watchdog — warn if last candle is more than
+                    # 3× the interval duration old (indicates REST data lag or exchange issue).
+                    _now_ms = int(time.time() * 1000)
+                    for _stale_label, _stale_candles, _stale_ms in [
+                        ("5m", candles_5m, 300_000), ("1h", candles_1h, 3_600_000),
+                        ("4h", candles_4h, 14_400_000),
+                    ]:
+                        if _stale_candles:
+                            _last_t = _stale_candles[-1].get("t")
+                            if _last_t and (_now_ms - int(_last_t)) > 3 * _stale_ms:
+                                logging.warning(
+                                    "[STALE DATA] %s %s last candle is %.1f min old — possible data lag",
+                                    asset, _stale_label, (_now_ms - int(_last_t)) / 60_000,
+                                )
+
                     # CRITICAL-2: Accumulate OI history for oi_confirmed()
                     if asset not in _oi_history:
                         _oi_history[asset] = _deque(maxlen=3)
@@ -1364,8 +1560,13 @@ def main():
                     # Previously defaulted to True, silently bypassing the near_ema gate when EMA
                     # data was missing — the E-1 fix in strategy.py never fired because this always
                     # wrote the key with a value, and it was True on unavailable data.
+                    # near_ema threshold widened from 0.3% → 0.5%:
+                    # 0.3% = $270 for BTC at $90k — a single 15m candle can move that far,
+                    # making near_ema permanently False in even mild trends. 0.5% = $450,
+                    # which still represents a genuine pullback to the EMA zone while allowing
+                    # more realistic trend setups to register near_ema=True and gain the 1.5 score points.
                     near_ema_15m = (
-                        abs(current_price - ema20_15m) / current_price < 0.003
+                        abs(current_price - ema20_15m) / current_price < 0.005
                         if (ema20_15m is not None and current_price > 0)
                         else False
                     )
@@ -1412,7 +1613,7 @@ def main():
                             "macd_signal": round_or_none(macd_sig_1h, 4),
                             "rsi14": round_or_none(rsi14_1h, 2),
                             "adx": round_or_none(adx_1h, 2),
-                            "adx_trending": (adx_1h or 0) > 25,
+                            "adx_trending": (adx_1h or 0) > 15,  # BUG-P11-PERF-2 FIX: matches active gate (was 25)
                             "series": {
                                 "ema20": round_series(last_n(intra.get("ema20", []), 3), 2),
                                 "ema50": round_series(last_n(intra.get("ema50", []), 3), 2),
@@ -1429,7 +1630,7 @@ def main():
                             "macd_signal": round_or_none(macd_sig_4h, 4),
                             "rsi14": round_or_none(rsi14_4h, 2),
                             "adx": round_or_none(adx_4h, 2),
-                            "adx_trending": (adx_4h or 0) > 25,
+                            "adx_trending": (adx_4h or 0) > 15,  # BUG-P11-PERF-2 FIX: matches active gate (was 25)
                             "bb_upper": round_or_none(bb_upper_4h, 2),
                             "bb_lower": round_or_none(bb_lower_4h, 2),
                             "bb_width_pct": bb_width_pct_4h,
@@ -1470,17 +1671,37 @@ def main():
                     continue
 
             # V3-HIGH-2 FIX: Removed dead `context_payload` build block.
-            # The old code built a large JSON dict and serialized it every cycle, but it was
-            # never sent to Claude — it was a remnant of the pre-2026-04-30 full-context design.
-            # `confirm_trade()` writes its own prompts.log entry with the actual Claude input.
-            # The misleading "Combined prompt length: X chars" log line is also removed.
+
+            # BUG-v8-L5 FIX: BTC correlation filter was bypassed when BTC is not in --assets.
+            # market_filter() blocks altcoin BUY when BTC 1h trend is BEARISH. With BTC absent,
+            # _btc_trend_1h defaulted to "UNKNOWN" (filter never fires). Fetch BTC 1h candles
+            # once per outer cycle when BTC is not already in the tracked asset list.
+            if "BTC" not in args.assets:
+                try:
+                    _btc_corr_1h = await hyperliquid.get_candles("BTC", "1h", 60)
+                    _btc_corr_5m = await hyperliquid.get_candles("BTC", "5m", 20)
+                    if _btc_corr_1h:
+                        from src.indicators.local_indicators import compute_all as _btc_compute
+                        _btc_ind = _btc_compute(_btc_corr_1h)
+                        _btc_ema20 = (_btc_ind.get("ema20") or [None])[-1]
+                        _btc_ema50 = (_btc_ind.get("ema50") or [None])[-1]
+                        if _btc_ema20 and _btc_ema50:
+                            asset_candles_5m["BTC"] = _btc_corr_5m or []
+                            # Inject a minimal BTC entry into market_sections so _btc_trend_1h lookup works
+                            _btc_trend_label = "BULLISH" if _btc_ema20 > _btc_ema50 else "BEARISH"
+                            if not any(m.get("asset") == "BTC" for m in market_sections):
+                                market_sections.append({"asset": "BTC", "trend_1h": _btc_trend_label})
+                            logging.debug("[BTC CORR] injected BTC trend_1h=%s for correlation filter", _btc_trend_label)
+                except Exception as _btc_err:
+                    logging.warning("[BTC CORR] BTC correlation fetch failed — filter will use UNKNOWN: %s", _btc_err)
+
             add_event(f"[CYCLE {invocation_count}] scoring {len(market_sections)} asset(s) — code-first pipeline")
 
             # ── Score-gated code-first pipeline (replaces unconditional Claude call) ──
             # Claude is called when score >= MIN_AI_SCORE and multi-timeframe confluence is confirmed.
             # All direction/TP/SL/size decisions are made by code.
             outputs = {"reasoning": "", "trade_decisions": []}
-            _min_sig = float(CONFIG.get("min_signal_score") or 7)
+            _min_sig = float(CONFIG.get("min_signal_score") or 6)
             _max_dt  = int(CONFIG.get("max_daily_trades") or 10)
 
             def _make_hold(asset_name: str, reason: str) -> dict:
@@ -1522,9 +1743,11 @@ def main():
                 # Weighted score gate (0-10 float)
                 _score = compute_signal_score(_ac, _direction)
                 # Kronos-mini forecast modifier (±0.5, code-only, clamped to [0,11] — MASTER RULE 1)
+                # BUG-P11-4 FIX: Kronos requires 5m candles (MASTER RULE 1). Was incorrectly
+                # passing candles_4h (60 candles, wrong timeframe). Now passes candles_5m.
                 try:
                     from src.indicators.kronos_forecast import get_kronos_modifier
-                    _kmod = get_kronos_modifier(candles=_ac.get("candles_4h", []), direction=_direction)
+                    _kmod = get_kronos_modifier(candles=_ac.get("candles_5m", []), direction=_direction)
                     if _kmod != 0.0:
                         logging.info("[KRONOS] %s modifier=%.1f score %.1f → %.1f", _asset, _kmod, _score, _score + _kmod)
                     _score = min(11.0, max(0.0, _score + _kmod))
@@ -1533,8 +1756,8 @@ def main():
                 if _score < _min_sig:
                     logging.info("[SCORE] %s %s score=%.1f < %.1f → HOLD", _asset, _direction, _score, _min_sig)
                     outputs["trade_decisions"].append(_make_hold(_asset, f"score={_score:.1f} < min {_min_sig:.0f}"))
-                    # Signal logging — log every score≥7 signal including HOLDs, for 2-month win-rate analysis
-                    if _score >= 7.0:
+                    # Signal logging — log ALL scores ≥5.0 for diagnostics (not just ≥7.0)
+                    if _score >= 5.0:
                         try:
                             with open("signals.jsonl", "a", encoding="utf-8") as _sf:
                                 _sf.write(json.dumps({
@@ -1542,11 +1765,16 @@ def main():
                                     "asset": _asset,
                                     "direction": _direction,
                                     "score": round(_score, 2),
-                                    "action": "hold" if _score < _min_sig else "pending",
+                                    "action": "below_threshold",
+                                    "score_needed": _min_sig,
                                     "reason": f"score={_score:.1f} min={_min_sig}",
                                     "trend_4h": _ac.get("trend_4h"),
                                     "trend_1h": _ac.get("trend_1h"),
                                 }) + "\n")
+                            logging.info(
+                                "[SIGNAL LOG] %s %s score=%.1f (min=%.1f) — logged to signals.jsonl for diagnostics",
+                                _asset, _direction, _score, _min_sig
+                            )
                         except Exception:
                             pass
                     continue
@@ -1558,7 +1786,7 @@ def main():
                     outputs["trade_decisions"].append(_make_hold(_asset, "missing price or ATR14"))
                     continue
 
-                _tp1, _tp2, _sl, _tp = _code_compute_tpsl(_entry, _atr, _direction, _score)
+                _tp1, _tp2, _sl, _tp = _code_compute_tpsl(_entry, _atr, _direction, _score, funding_rate=float(_ac.get("funding_rate") or 0))
                 # Position sizing: target = 15% of buying_power (account × leverage).
                 # ATR 1% risk rule acts as a safety ceiling — reduces size when SL is distant.
                 _buying_power = account_value * float(CONFIG.get("max_leverage") or 5)
@@ -1569,8 +1797,8 @@ def main():
                 # Scores above 10.0 do NOT grant above-100% sizing (MASTER RULE 2)
                 _alloc = _alloc * (min(_score, 10.0) / 10.0)
                 # ADX ranging market guard: half-size if ADX weak and score not at maximum
-                _adx_1h_val = float(_ac.get("intraday_1h", {}).get("adx") or 25)
-                _adx_thr    = float(CONFIG.get("adx_half_size_threshold") or 20)
+                _adx_1h_val = float(_ac.get("intraday_1h", {}).get("adx") or 15)
+                _adx_thr    = float(CONFIG.get("adx_half_size_threshold") or 20)  # BUG-v7-O3 FIX: default was 15 but .env is 20; aligned to authoritative .env value
                 if _adx_1h_val < _adx_thr and _score < 9.0:
                     _alloc *= 0.5
                     logging.info("[SIZE] %s ADX %.1f < %.0f + score %.1f < 9 → half-size applied",
@@ -1584,7 +1812,7 @@ def main():
                     continue
 
                 # MIN_AI_SCORE gate — separate from MIN_SIGNAL_SCORE so Claude call frequency is independently tunable
-                _min_ai = float(CONFIG.get("min_ai_score") or 7)
+                _min_ai = float(CONFIG.get("min_ai_score") or 6)
                 if _score < _min_ai:
                     logging.info("[AI GATE] %s score=%.1f < MIN_AI_SCORE %.1f → HOLD", _asset, _score, _min_ai)
                     outputs["trade_decisions"].append(_make_hold(_asset, f"score={_score:.1f} < MIN_AI_SCORE {_min_ai:.1f}"))
@@ -1766,27 +1994,22 @@ def main():
                         if trend_4h == "BEARISH" and action == "buy":
                             raise ValueError(f"INVERSION BUG DETECTED: {asset} trend=BEARISH but action=buy")
 
-                        # Daily macro trend gate — block trades that fight the daily EMA cross.
-                        # Only applied when the daily trend has actual momentum (ADX > 20).
-                        # A near-cross with low ADX is a ranging market — blocking all longs
-                        # or shorts would unnecessarily suppress valid intraday setups.
-                        _trend_1d = asset_trends_1d.get(asset, "UNKNOWN")
-                        _adx_1d = asset_adx_1d.get(asset)
-                        _macro_trending = _adx_1d is not None and float(_adx_1d) > 20
-                        if _macro_trending:
-                            if _trend_1d == "BEARISH" and action == "buy":
-                                logging.info(
-                                    "[DAILY FILTER] %s BUY blocked — daily trend BEARISH ADX=%.1f",
-                                    asset, float(_adx_1d) if _adx_1d else 0,
-                                )
-                                add_event(f"[DAILY FILTER] {asset} BUY skipped — daily trend BEARISH")
+                        # BUG-P9-7 FIX: Mirror the daily macro trend filter from the inner loop.
+                        # Inner loop blocks counter-trend trades when 1d ADX > 20 (market is trending
+                        # on the daily and the trade opposes it). Outer loop was missing this gate.
+                        _outer_trend_1d = asset_trends_1d.get(asset, "UNKNOWN")
+                        _outer_adx_1d   = asset_adx_1d.get(asset)
+                        _outer_macro_trending = _outer_adx_1d is not None and float(_outer_adx_1d) > 20
+                        if _outer_macro_trending:
+                            if _outer_trend_1d == "BEARISH" and action == "buy":
+                                logging.info("[OUTER DAILY FILTER] %s BUY blocked — daily trend BEARISH + ADX=%.1f > 20",
+                                             asset, float(_outer_adx_1d))
+                                add_event(f"[OUTER DAILY FILTER] {asset} BUY blocked — daily BEARISH trend active")
                                 continue
-                            if _trend_1d == "BULLISH" and action == "sell":
-                                logging.info(
-                                    "[DAILY FILTER] %s SELL blocked — daily trend BULLISH ADX=%.1f",
-                                    asset, float(_adx_1d) if _adx_1d else 0,
-                                )
-                                add_event(f"[DAILY FILTER] {asset} SELL skipped — daily trend BULLISH")
+                            if _outer_trend_1d == "BULLISH" and action == "sell":
+                                logging.info("[OUTER DAILY FILTER] %s SELL blocked — daily trend BULLISH + ADX=%.1f > 20",
+                                             asset, float(_outer_adx_1d))
+                                add_event(f"[OUTER DAILY FILTER] {asset} SELL blocked — daily BULLISH trend active")
                                 continue
 
                         asset_ctx = next((m for m in market_sections if m.get("asset") == asset), {})
@@ -1851,7 +2074,6 @@ def main():
                             continue
                         # Candle close gate — only fire when the 5m trigger candle has fully closed
                         # Prevents entering mid-candle on false signals that reverse before close
-                        _now_sec = datetime.now(timezone.utc).second + datetime.now(timezone.utc).minute % 5 * 60
                         _secs_into_5m = (datetime.now(timezone.utc).minute % 5) * 60 + datetime.now(timezone.utc).second
                         _candle_age_pct = _secs_into_5m / 300  # 0.0 = just opened, 1.0 = about to close
                         if _candle_age_pct < 0.70:  # candle must be at least 70% complete (210 of 300s)
@@ -1957,15 +2179,13 @@ def main():
                                 pass
                         # No early break — always complete all 3 polls to capture partial fills
 
-                        # Cancel unfilled limit orders after 1 candle (5 minutes)
+                        # BUG-P11-LIMIT FIX: Do NOT cancel after 3 seconds.
+                        # Previous code cancelled the limit immediately after 3×1s polls.
+                        # A 0.15% offset limit in a trending market never fills in 3 seconds.
+                        # Fix: leave the order live; inner loop cancels after 5 min if still unfilled.
                         if order_type == "limit" and filled_qty == 0 and entry_oid:
-                            try:
-                                await hyperliquid.cancel_order(asset, entry_oid)
-                                logging.info("[LIMIT] %s unfilled limit cancelled after 1 candle — skipping trade", asset)
-                                add_event(f"[LIMIT] {asset} unfilled limit cancelled — price moved away")
-                                continue
-                            except Exception as _ce:
-                                logging.warning("[LIMIT] %s cancel failed: %s", asset, _ce)
+                            logging.info("[LIMIT] %s not yet filled — leaving live; inner loop will cancel after 5 min if still unfilled", asset)
+                            add_event(f"[LIMIT] {asset} limit pending fill — will cancel if unfilled after 5 min")
 
                         # CRITICAL-5: Partial fill — cancel unfilled remainder to avoid unprotected second fill
                         if order_type == "limit" and 0 < filled_qty < amount * 0.99 and entry_oid:
@@ -2014,22 +2234,41 @@ def main():
                                 tp_oid = _tp_oids[0] if _tp_oids else None
                                 add_event(f"TP placed {asset} at {output['tp_price']} size={tp_sl_size:.6f}")
                             if output.get("sl_price"):
-                                try:
-                                    _slr = await hyperliquid.place_stop_loss(asset, is_buy, tp_sl_size, output["sl_price"])
-                                    _sl_oids = hyperliquid.extract_oids(_slr)
-                                    sl_oid = _sl_oids[0] if _sl_oids else None
-                                    add_event(f"SL placed {asset} at {output['sl_price']} size={tp_sl_size:.6f}")
-                                except Exception as _sl_err:
-                                    logging.critical("[SL FAIL] %s — SL placement failed: %s — market-closing position to avoid unprotected exposure", asset, _sl_err)
-                                    add_event(f"[SL FAIL] {asset} SL placement failed — market-closing position immediately")
-                                    await send_alert(f"\U0001f6a8 SL FAIL {asset} — SL placement failed, market-closing position NOW. Error: {_sl_err}")
+                                _sl_placed = False
+                                _sl_err = None
+                                for _sl_attempt in range(2):  # try twice before market-close fallback
+                                    try:
+                                        _slr = await hyperliquid.place_stop_loss(asset, is_buy, tp_sl_size, output["sl_price"])
+                                        _sl_oids = hyperliquid.extract_oids(_slr)
+                                        sl_oid = _sl_oids[0] if _sl_oids else None
+                                        add_event(f"SL placed {asset} at {output['sl_price']} size={tp_sl_size:.6f}")
+                                        _sl_placed = True
+                                        break
+                                    except Exception as _sl_err:
+                                        logging.warning("[SL RETRY] %s attempt %d failed: %s", asset, _sl_attempt + 1, _sl_err)
+                                        if _sl_attempt == 0:
+                                            await asyncio.sleep(2)  # brief pause before retry
+                                if not _sl_placed:
+                                    logging.critical(
+                                        "[SL FAIL] %s — SL placement failed after 2 attempts: %s — market-closing to avoid unprotected exposure",
+                                        asset, _sl_err
+                                    )
+                                    add_event(f"[SL FAIL] {asset} SL failed after retry — market-closing position immediately")
+                                    await send_alert(
+                                        f"\U0001f6a8 SL FAIL {asset} — 2 SL attempts failed, market-closing NOW. Error: {_sl_err}"
+                                    )
                                     try:
                                         await hyperliquid.market_close(asset)
                                         await hyperliquid.cancel_all_orders(asset)
                                     except Exception as _mc_err:
-                                        logging.critical("[SL FAIL] %s — market-close also failed: %s — MANUAL INTERVENTION REQUIRED", asset, _mc_err)
+                                        logging.critical(
+                                            "[SL FAIL] %s — market-close also failed: %s — MANUAL INTERVENTION REQUIRED",
+                                            asset, _mc_err
+                                        )
                                         add_event(f"[SL FAIL] {asset} MARKET CLOSE ALSO FAILED — close manually on Hyperliquid NOW")
-                                        await send_alert(f"\U0001f198 CRITICAL {asset} — SL fail AND market-close failed. CLOSE MANUALLY ON HYPERLIQUID NOW. Error: {_mc_err}")
+                                        await send_alert(
+                                            f"\U0001f198 CRITICAL {asset} — SL fail AND market-close fail. CLOSE MANUALLY ON HYPERLIQUID NOW. Error: {_mc_err}"
+                                        )
                                     continue
                         else:
                             logging.info("[LIMIT] %s TP/SL deferred — limit order not yet filled, guardian covers next cycle", asset)
@@ -2061,7 +2300,10 @@ def main():
                             "trail_active": False,
                             "exit_plan": output["exit_plan"],
                             "funding_rate": float(asset_ctx.get("funding_rate") or 0),
-                            "opened_at": datetime.now(timezone.utc).isoformat()
+                            "opened_at": datetime.now(timezone.utc).isoformat(),
+                            # BUG-P11-LIMIT FIX: track pending limit orders for deferred cancel in inner loop
+                            "entry_oid": entry_oid if (order_type == "limit" and filled_qty == 0) else None,
+                            "limit_placed_at": datetime.now(timezone.utc).isoformat() if (order_type == "limit" and filled_qty == 0) else None,
                         })
                         # CRITICAL-8: record_entry (state.json) BEFORE save_active_trades
                         state_mgr.record_entry(asset)
@@ -2128,9 +2370,53 @@ def main():
                 if os.path.exists(os.path.normpath(_KILLSWITCH_FILE)):
                     logging.critical("[KILLSWITCH] detected inside inner loop tick %d — halting", _tick + 1)
                     add_event("[KILLSWITCH] Trading halted by KILLSWITCH file (inner loop).")
-                    _shutdown = True
+                    # BUG-v8-L1 FIX: Mirror outer loop retry logic — 3 attempts per asset.
+                    # Old code had a single try/except; one exchange timeout → bot exits with
+                    # position open and no alert. Now retries 3× and stays alive if close fails,
+                    # so the outer loop guardian continues protecting the unclosed position.
+                    _iks_unclosed = []
+                    for _iks_tr in list(active_trades):
+                        _iks_asset = _iks_tr.get("asset")
+                        if not _iks_asset:
+                            continue
+                        _iks_closed = False
+                        for _iks_attempt in range(3):
+                            try:
+                                await hyperliquid.cancel_all_orders(_iks_asset)
+                                await hyperliquid.market_close(_iks_asset)
+                                logging.critical("[KILLSWITCH] inner %s — closed (attempt %d)", _iks_asset, _iks_attempt + 1)
+                                add_event(f"[KILLSWITCH] inner {_iks_asset} closed")
+                                _iks_closed = True
+                                break
+                            except Exception as _iks_err:
+                                logging.critical("[KILLSWITCH] inner %s — close attempt %d/3 failed: %s", _iks_asset, _iks_attempt + 1, _iks_err)
+                                if _iks_attempt < 2:
+                                    await asyncio.sleep(2)
+                        if not _iks_closed:
+                            _iks_unclosed.append(_iks_asset)
+                            logging.critical("[KILLSWITCH] inner %s — ALL 3 ATTEMPTS FAILED — position remains open", _iks_asset)
+                            add_event(f"[KILLSWITCH] inner {_iks_asset} CLOSE FAILED x3 — MANUAL INTERVENTION REQUIRED")
+                    if _iks_unclosed:
+                        await send_alert(
+                            f"\U0001f6a8 KILLSWITCH (inner): {len(_iks_unclosed)} position(s) FAILED TO CLOSE: "
+                            f"{', '.join(_iks_unclosed)}. Bot staying alive to monitor. Manual close required."
+                        )
+                        # Do NOT set _shutdown — keep outer loop running to protect unclosed positions
+                    else:
+                        await send_alert(
+                            f"\U0001f6a8 KILLSWITCH (inner): all {len(active_trades)} position(s) closed. "
+                            "Remove KILLSWITCH file to restart."
+                        )
+                        _shutdown = True
                     break
 
+                # BUG-v7-O5 FIX: Alert when circuit breaker auto-resets at UTC midnight.
+                if getattr(risk_mgr, 'circuit_breaker_was_active', False):
+                    risk_mgr.circuit_breaker_was_active = False
+                    await send_alert(
+                        "⚠️ Daily loss circuit breaker AUTO-RESET at UTC midnight — trading has resumed. "
+                        "Review yesterday's drawdown before leaving the bot unattended."
+                    )
                 if risk_mgr.circuit_breaker_active:
                     logging.info("[INNER] circuit breaker active — skipping tick %d", _tick + 1)
                     if _tick == 0:  # alert once per inner-loop session, not every tick
@@ -2139,10 +2425,179 @@ def main():
 
                 logging.info("[INNER %d/11] refreshing 5m candles for %d assets", _tick + 1, len(args.assets))
 
+                # ── SL ORPHAN CHECK — fix unprotected resting limit fills ─────────────
+                # Runs every 5-min inner tick. If any active_trade has sl_oid=None (SL was
+                # deferred because limit order was not yet filled at entry time), check whether
+                # the position now exists on the exchange. If it does, place SL immediately.
+                # This closes the 60-minute unprotected window to ≤5 minutes.
+                for _orphan_tr in list(active_trades):
+                    _orphan_asset = _orphan_tr.get("asset")
+                    _orphan_sl_oid = _orphan_tr.get("sl_oid")
+                    _orphan_sl_px = _orphan_tr.get("sl_price")
+                    _orphan_is_long = _orphan_tr.get("is_long", True)
+                    _orphan_size = float(_orphan_tr.get("amount") or 0)
+
+                    # Only process trades that were deferred (sl_oid is None) and have an SL price
+                    if _orphan_sl_oid is not None or not _orphan_sl_px or _orphan_size <= 0:
+                        continue
+
+                    try:
+                        _orphan_positions = await hyperliquid.get_positions()
+                        _orphan_pos_exists = any(
+                            p.get("coin") == _orphan_asset and abs(float(p.get("szi") or 0)) > 0
+                            for p in (_orphan_positions or [])
+                        )
+                        if not _orphan_pos_exists:
+                            continue  # limit not filled yet — skip
+
+                        logging.warning(
+                            "[SL ORPHAN] %s has open position but no SL (deferred from limit entry) — placing SL NOW at %s",
+                            _orphan_asset, _orphan_sl_px
+                        )
+                        await send_alert(
+                            f"⚠️ [SL ORPHAN] {_orphan_asset} open position found with no SL — placing SL at {_orphan_sl_px} NOW"
+                        )
+                        _orphan_sl_resp = await hyperliquid.place_stop_loss(
+                            _orphan_asset, _orphan_is_long, _orphan_size, float(_orphan_sl_px)
+                        )
+                        _orphan_sl_new_oid = (hyperliquid.extract_oids(_orphan_sl_resp) or [None])[0]
+                        for _otr in active_trades:
+                            if _otr.get("asset") == _orphan_asset:
+                                _otr["sl_oid"] = _orphan_sl_new_oid
+                        save_active_trades(active_trades)
+                        logging.info(
+                            "[SL ORPHAN] %s SL placed successfully at %s (oid=%s)",
+                            _orphan_asset, _orphan_sl_px, _orphan_sl_new_oid
+                        )
+                        add_event(f"[SL ORPHAN FIXED] {_orphan_asset} SL placed at {_orphan_sl_px} (oid={_orphan_sl_new_oid})")
+                    except Exception as _orphan_err:
+                        logging.error(
+                            "[SL ORPHAN] %s — failed to place orphan SL: %s — MANUAL CHECK REQUIRED",
+                            _orphan_asset, _orphan_err
+                        )
+                        await send_alert(
+                            f"🚨 [SL ORPHAN FAIL] {_orphan_asset} — could not place SL at {_orphan_sl_px}. CHECK MANUALLY on Hyperliquid."
+                        )
+                # ── End SL orphan check ──────────────────────────────────────────────
+
+                # ── PENDING LIMIT CANCEL — cancel unfilled limits after 1 candle (5 min) ──
+                # BUG-P11-LIMIT FIX: Limit orders are NOT cancelled at entry time (3s is too short).
+                # Instead, each inner tick checks trades with a pending entry_oid.
+                # If the position opened → clear the pending flags (SL orphan check places TP/SL).
+                # If still unfilled after ≥4 min → cancel the limit and free the slot.
+                for _pl_tr in list(active_trades):
+                    _pl_oid   = _pl_tr.get("entry_oid")
+                    _pl_at    = _pl_tr.get("limit_placed_at")
+                    _pl_asset = _pl_tr.get("asset")
+                    if not _pl_oid or not _pl_at or not _pl_asset:
+                        continue
+                    try:
+                        _pl_age_s = (datetime.now(timezone.utc) - datetime.fromisoformat(_pl_at)).total_seconds()
+                    except Exception:
+                        _pl_age_s = 999
+                    if _pl_age_s < 240:  # give at least 4 min before cancelling (inner tick is 5 min)
+                        continue
+                    # Check whether the limit filled and opened a position
+                    try:
+                        _pl_positions = await hyperliquid.get_positions()
+                        _pl_pos_exists = any(
+                            p.get("coin") == _pl_asset and abs(float(p.get("szi") or 0)) > 0
+                            for p in (_pl_positions or [])
+                        )
+                    except Exception:
+                        _pl_pos_exists = False
+                    if _pl_pos_exists:
+                        # Position opened — limit filled between ticks. Clear pending flags.
+                        # SL orphan check (above this block) will place TP/SL on next tick.
+                        for _upd_tr in active_trades:
+                            if _upd_tr.get("asset") == _pl_asset:
+                                _upd_tr["entry_oid"] = None
+                                _upd_tr["limit_placed_at"] = None
+                        save_active_trades(active_trades)
+                        logging.info("[LIMIT PENDING] %s position confirmed open — pending flags cleared, SL orphan check covers TP/SL", _pl_asset)
+                        add_event(f"[LIMIT PENDING] {_pl_asset} limit filled — position open, TP/SL to be placed")
+                        continue
+                    # Position still absent after ≥5 min — limit never filled; cancel and free slot
+                    try:
+                        await hyperliquid.cancel_order(_pl_asset, _pl_oid)
+                        logging.info("[LIMIT PENDING] %s unfilled limit cancelled after %.0fs — slot freed", _pl_asset, _pl_age_s)
+                        add_event(f"[LIMIT PENDING] {_pl_asset} unfilled limit cancelled after {int(_pl_age_s)}s — re-evaluating next cycle")
+                    except Exception as _pl_ce:
+                        logging.warning("[LIMIT PENDING] %s cancel failed: %s", _pl_asset, _pl_ce)
+                    try:
+                        active_trades.remove(_pl_tr)
+                    except ValueError:
+                        pass
+                    state_mgr.clear_entry(_pl_asset)
+                    state_mgr.set_state(_pl_asset, TradeStateMachine.IDLE)  # BUG-v7-L3 FIX: clear_entry() only removes entry_time, not state
+                    save_active_trades(active_trades)
+                # ── End pending limit cancel ──────────────────────────────────────────
+
+                # ── Lightweight reconcile — detect TP/SL fills between outer cycles ──
+                # Full reconciliation runs in the outer loop. This inner-loop check only
+                # looks for positions that DISAPPEARED since last check (TP/SL filled).
+                # Does NOT re-place orders — just updates local state and starts cooldown.
+                try:
+                    _inner_positions = await hyperliquid.get_positions()
+                    _inner_open_coins = {
+                        p.get("coin")
+                        for p in (_inner_positions or [])
+                        if abs(float(p.get("szi") or 0)) > 0
+                    }
+                    for _recon_tr in list(active_trades):
+                        _recon_asset = _recon_tr.get("asset")
+                        # Skip pending limit orders — position may not exist yet
+                        if _recon_tr.get("entry_oid"):
+                            continue
+                        if _recon_asset and _recon_asset not in _inner_open_coins:
+                            logging.info(
+                                "[INNER RECON] %s position no longer open — marking closed, starting cooldown",
+                                _recon_asset
+                            )
+                            # BUG-P11-2 FIX: Log the close so diary.jsonl and stats.json are updated
+                            # for every mid-cycle TP/SL hit. Without this, 55 of every 60 minutes
+                            # of exits were invisible to trade history and Claude context.
+                            try:
+                                await _log_trade_close(_recon_tr, "unknown")
+                            except Exception as _ilc_err:
+                                logging.warning("[INNER RECON] _log_trade_close failed for %s: %s", _recon_asset, _ilc_err)
+                            active_trades.remove(_recon_tr)
+                            state_mgr.start_cooldown(
+                                _recon_asset,
+                                interval_seconds=int(CONFIG.get("cooldown_minutes") or 30) * 60
+                            )
+                            save_active_trades(active_trades)
+                            add_event(f"[INNER RECON] {_recon_asset} closed (TP/SL hit) — logged, slot freed, cooldown started")
+                except Exception as _inner_recon_err:
+                    logging.debug("[INNER RECON] position check failed: %s", _inner_recon_err)
+                # ── End lightweight reconcile ────────────────────────────────────────
+
+                # PERF-2 FIX: Refresh account value and prices BEFORE scoring/sizing loop.
+                # Previously this refresh happened after the scoring loop, so sizing at lines
+                # _i_buying_power/_i_atr_sized used account_value that was up to 55 min stale.
+                try:
+                    _istate_pre = await hyperliquid.get_user_state()
+                    _iaccval_pre = float(_istate_pre.get("total_value", 0))
+                    if _iaccval_pre > 0:
+                        account_value = _iaccval_pre
+                        state = _istate_pre
+                    for _ri_asset in args.assets:
+                        try:
+                            _rip = await hyperliquid.get_current_price(_ri_asset)
+                            if _rip > 0:
+                                asset_prices[_ri_asset] = _rip
+                                for _rms in market_sections:
+                                    if _rms.get("asset") == _ri_asset:
+                                        _rms["current_price"] = _rip
+                        except Exception:
+                            pass
+                except Exception as _ire_pre:
+                    logging.warning("[INNER tick %d] pre-score state/price refresh failed: %s", _tick + 1, _ire_pre)
+
                 # Refresh 5m candles and recompute trigger_5m per asset
                 for _i_asset in args.assets:
                     try:
-                        _f5m = await hyperliquid.get_candles(_i_asset, "5m", 20)
+                        _f5m = await hyperliquid.get_candles(_i_asset, "5m", 400)  # BUG-v8-L2 FIX: 400 for full Kronos context (was 100)
                         if not _f5m:
                             continue
                         _i5m = compute_all(_f5m)
@@ -2182,10 +2637,11 @@ def main():
                     _iscr = compute_signal_score(_iac, _idir)
                     try:
                         from src.indicators.kronos_forecast import get_kronos_modifier
-                        _iscr = min(11.0, max(0.0, _iscr + get_kronos_modifier(candles=_iac.get("candles_4h", []), direction=_idir)))
+                        # BUG-P11-4 FIX: pass candles_5m, not candles_4h (MASTER RULE 1)
+                        _iscr = min(11.0, max(0.0, _iscr + get_kronos_modifier(candles=_iac.get("candles_5m", []), direction=_idir)))
                     except ImportError:
                         pass
-                    if _iscr < float(CONFIG.get("min_signal_score") or 7):
+                    if _iscr < float(CONFIG.get("min_signal_score") or 6):
                         continue
                     # BUG-2 FIX: Use the fresh price already refreshed by the C-3/C-4 block above,
                     # not the stale outer-loop price. TP/SL were anchored to an old price, placing
@@ -2194,14 +2650,14 @@ def main():
                     _iatr = float(_iac.get("long_term_4h", {}).get("atr14") or 0)
                     if _ie <= 0 or _iatr <= 0:
                         continue
-                    _itp1, _itp2, _isl, _itp = _code_compute_tpsl(_ie, _iatr, _idir, _iscr)
+                    _itp1, _itp2, _isl, _itp = _code_compute_tpsl(_ie, _iatr, _idir, _iscr, funding_rate=float(_iac.get("funding_rate") or 0))
                     _i_buying_power = account_value * float(CONFIG.get("max_leverage") or 5)
                     _i_pct_cap = _i_buying_power * (float(CONFIG.get("max_position_pct") or 15) / 100.0)
                     _i_atr_sized = risk_mgr.atr_position_size(account_value, _ie, _isl)
                     _ialloc = min(_i_pct_cap, _i_atr_sized) * (min(_iscr, 10.0) / 10.0)
                     # ADX ranging market guard (inner loop)
-                    _iadx_1h = float(_iac.get("intraday_1h", {}).get("adx") or 25)
-                    _iadx_thr = float(CONFIG.get("adx_half_size_threshold") or 20)
+                    _iadx_1h = float(_iac.get("intraday_1h", {}).get("adx") or 15)
+                    _iadx_thr = float(CONFIG.get("adx_half_size_threshold") or 20)  # BUG-v7-O3 FIX: default was 15 but .env is 20; aligned to authoritative .env value
                     if _iadx_1h < _iadx_thr and _iscr < 9.0:
                         _ialloc *= 0.5
                         logging.info("[INNER SIZE] %s ADX %.1f < %.0f + score %.1f < 9 → half-size",
@@ -2212,7 +2668,7 @@ def main():
                         continue
 
                     # MIN_AI_SCORE gate (inner loop)
-                    _imin_ai = float(CONFIG.get("min_ai_score") or 7)
+                    _imin_ai = float(CONFIG.get("min_ai_score") or 6)
                     if _iscr < _imin_ai:
                         logging.info("[INNER AI GATE] %s score=%.1f < MIN_AI_SCORE %.1f → HOLD", _i_asset, _iscr, _imin_ai)
                         continue
@@ -2275,28 +2731,6 @@ def main():
                         "rationale": f"inner score={_iscr:.1f}",
                     })
 
-                # C-3 + C-4 FIX: Refresh account state and prices before inner-loop execution.
-                # Old code used stale outer-loop values (up to 55 min old) for risk checks and
-                # TP/SL calculation, defeating total-exposure and concurrent-position guards.
-                try:
-                    _istate_fresh = await hyperliquid.get_user_state()
-                    _iaccval_fresh = float(_istate_fresh.get("total_value", 0))
-                    if _iaccval_fresh > 0:
-                        account_value = _iaccval_fresh
-                        state = _istate_fresh
-                    for _ri_asset in args.assets:
-                        try:
-                            _rip = await hyperliquid.get_current_price(_ri_asset)
-                            if _rip > 0:
-                                asset_prices[_ri_asset] = _rip
-                                for _rms in market_sections:
-                                    if _rms.get("asset") == _ri_asset:
-                                        _rms["current_price"] = _rip
-                        except Exception:
-                            pass
-                except Exception as _ire:
-                    logging.warning("[INNER tick %d] state/price refresh failed: %s", _tick + 1, _ire)
-
                 # Execute inner-loop trades (state gate + market_filter + entry_confirmed + risk)
                 for _iout in _inner_outputs.get("trade_decisions", []):
                     _ia = _iout.get("asset")
@@ -2338,7 +2772,7 @@ def main():
                         if not entry_confirmed(_iact_ctx_local, _iout["action"]):
                             logging.info("[INNER ENTRY] %s entry_confirmed failed — 15m/5m conditions not met", _ia)
                             continue
-                        # BONUS-1: Candle-close gate (same 85% logic as outer loop)
+                        # BONUS-1: Candle-close gate (same 70% logic as outer loop)
                         _i_secs_into_5m = (datetime.now(timezone.utc).minute % 5) * 60 + datetime.now(timezone.utc).second
                         if (_i_secs_into_5m / 300) < 0.70:
                             logging.info("[INNER CANDLE GATE] %s candle only %.0f%% complete", _ia, _i_secs_into_5m / 3)

@@ -109,8 +109,8 @@ CONFIG = {
 
     # Time-based exit and scoring thresholds
     "max_trade_hours": _get_int("MAX_TRADE_HOURS", 12),
-    "min_trade_score": _get_int("MIN_TRADE_SCORE", 3),    # 0-5 scale used by entry_confirmed()
-    "min_signal_score": _get_int("MIN_SIGNAL_SCORE", 7),  # 0-10 weighted pre-gate in main.py
+    "min_trade_score": _get_int("MIN_TRADE_SCORE", 2),    # 0-5 scale used by entry_confirmed()
+    "min_signal_score": _get_int("MIN_SIGNAL_SCORE", 6),  # 0-11 weighted pre-gate in main.py
 
     # Execution reality + frequency control
     "taker_fee_pct": float(_get_env("TAKER_FEE_PCT", "0.00045")),  # 0.045% per side
@@ -119,16 +119,15 @@ CONFIG = {
 
     # AI analysis controls — THREE separate score keys, never merge
     # MIN_TRADE_SCORE (0-5 int): entry_confirmed() gate in strategy.py
-    # MIN_SIGNAL_SCORE (0-10 float): main loop pre-gate
-    # MIN_AI_SCORE (0-10 float): Claude market analysis trigger — this key
-    "min_ai_score": float(_get_env("MIN_AI_SCORE", "7")),                       # Score threshold to trigger Claude analysis
+    # MIN_SIGNAL_SCORE (0-11 float): main loop pre-gate
+    # MIN_AI_SCORE (0-11 float): Claude market analysis trigger — this key
+    "min_ai_score": float(_get_env("MIN_AI_SCORE", "6")),                       # Score threshold to trigger Claude analysis
     "news_fetch_enabled": _get_bool("NEWS_FETCH_ENABLED", True),                # Toggle macro RSS fetching
     "ai_max_tokens": _get_int("AI_MAX_TOKENS", 4000),                           # Max tokens for Claude full market analysis
     "ai_approve_cache_minutes": _get_int("AI_APPROVE_CACHE_MINUTES", 60),       # Minutes an APPROVE verdict is cached
     "ai_reject_cache_minutes": _get_int("AI_REJECT_CACHE_MINUTES", 30),         # Minutes a REJECT verdict is cached (shorter)
-    "confluence_require_30m": _get_bool("CONFLUENCE_REQUIRE_30M", True),        # Require 30m TF in confluence gate
-    "ai_stale_tf_minutes": _get_int("AI_STALE_TF_MINUTES", 55),                # Max age of higher-TF data for inner ticks
+    "ai_stale_tf_minutes": _get_int("AI_STALE_TF_MINUTES", 55),                # Max age of higher-TF data before skipping Claude call
     "min_ai_call_gap_minutes": _get_int("MIN_AI_CALL_GAP_MINUTES", 30),        # Hard minimum gap between Claude calls per asset
-    "adx_half_size_threshold": _get_int("ADX_HALF_SIZE_THRESHOLD", 20),        # ADX below this → position size halved when score < 9
+    "adx_half_size_threshold": _get_int("ADX_HALF_SIZE_THRESHOLD", 15),        # ADX below this → position size halved when score < 9
 
 }

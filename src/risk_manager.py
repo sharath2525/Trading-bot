@@ -28,7 +28,7 @@ class RiskManager:
         self.max_total_exposure_pct = float(CONFIG.get("max_total_exposure_pct") or 50)
         self.daily_loss_circuit_breaker_pct = float(CONFIG.get("daily_loss_circuit_breaker_pct") or 12)
         self.mandatory_sl_pct = float(CONFIG.get("mandatory_sl_pct") or 3)
-        self.max_concurrent_positions = int(CONFIG.get("max_concurrent_positions") or 2)
+        self.max_concurrent_positions = int(CONFIG.get("max_concurrent_positions") or 3)  # OPS-5 FIX: aligned to main.py fallback (was 2 vs 3 mismatch)
         self.min_balance_reserve_pct = float(CONFIG.get("min_balance_reserve_pct") or 20)
 
         # Daily tracking
@@ -36,6 +36,7 @@ class RiskManager:
         self.daily_high_date = None
         self.circuit_breaker_active = False
         self.circuit_breaker_date = None
+        self.circuit_breaker_was_active = False  # BUG-v7-O5: set True when breaker resets at midnight
         self._state_file = _RISK_STATE_FILE
         self._load_circuit_state()
 
@@ -86,11 +87,19 @@ class RiskManager:
         """Reset daily high watermark at UTC day boundary."""
         today = datetime.now(timezone.utc).date()
         if self.daily_high_date != today:
+            # BUG-v7-O5 FIX: track whether the circuit breaker was active when the day rolled.
+            # main.py reads this flag after check_daily_drawdown() and sends an alert if True.
+            self.circuit_breaker_was_active = bool(self.circuit_breaker_active)
             self.daily_high_value = account_value
             self.daily_high_date = today
             self.circuit_breaker_active = False
             self.circuit_breaker_date = None
             self._save_circuit_state()
+            if self.circuit_breaker_was_active:
+                logging.warning(
+                    "[RISK] Daily circuit breaker auto-reset at UTC midnight — trading resumed. "
+                    "Review yesterday's losses before continuing."
+                )
         elif account_value > (self.daily_high_value or 0):
             self.daily_high_value = account_value
             self._save_circuit_state()

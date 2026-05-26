@@ -31,15 +31,16 @@ def market_filter(asset_data: dict, btc_trend_1h: str = "UNKNOWN", btc_candles_5
     _utc_weekday = _now_utc.weekday()  # 0=Mon, 5=Sat, 6=Sun
     if 0 <= _utc_hour <= 5:
         return False, f"time gate — UTC {_utc_hour:02d}:xx blocked (00:00–06:00 UTC)"
-    # Outside prime session hours (08:00–17:00 UTC): require score ≥8.5 to trade
-    # Low-liquidity windows produce more false breakouts — raise the bar.
-    # Threshold is 8.5 (not 9.0) because base score 9 is structurally unreachable;
-    # 8.5 requires 4 of 5 base signals aligned — still a high-quality setup off-session.
-    _in_session = 8 <= _utc_hour < 17
+    # Outside prime session hours (08:00–20:00 UTC): require score ≥7.5 to trade.
+    # Extended session window to 20:00 UTC — captures NY close session (high volume).
+    # Threshold lowered from 8.5 → 7.5: 8.5 required near-perfect alignment and blocked
+    # ~15 of 24 trading hours almost completely. 7.5 still requires 4h+1h trend + MACD OR
+    # near_ema, which is a genuine setup. Low-liquidity filter still active via volume gate.
+    _in_session = 8 <= _utc_hour < 20
     _score_context = asset_data.get("_current_score")  # injected by main.py when available
-    if not _in_session and _score_context is not None and float(_score_context) < 8.5:
-        return False, (f"session gate — UTC {_utc_hour:02d}:xx is outside 08:00–17:00 "
-                       f"window; score {float(_score_context):.1f} < 8.5 required off-session")
+    if not _in_session and _score_context is not None and float(_score_context) < 7.5:
+        return False, (f"session gate — UTC {_utc_hour:02d}:xx is outside 08:00–20:00 "
+                       f"window; score {float(_score_context):.1f} < 7.5 required off-session")
     # Block Friday 20:00 UTC through Sunday 08:00 UTC
     # Friday=4, Saturday=5, Sunday=6
     _is_weekend_block = (
@@ -116,8 +117,10 @@ def market_filter(asset_data: dict, btc_trend_1h: str = "UNKNOWN", btc_candles_5
                     if direction == "buy" and _dist_high < 0.3 and current_price <= _swing_high:
                         _sr_blocked = True
                         _sr_reason = f"BUY within 0.3% of 1h 50-candle swing high ${_swing_high:.2f}"
-                    # Only block SELL approaching swing low from ABOVE (not confirmed breakdown)
-                    elif direction == "sell" and _dist_low < 0.3 and current_price >= _swing_low:
+                    # Only block SELL when AT the swing low (very tight, not approaching from far above).
+                    # 0.15% threshold — avoids blocking every continuation sell in a downtrend where
+                    # the 50-candle low is always near the current price.
+                    elif direction == "sell" and _dist_low < 0.15 and current_price >= _swing_low:
                         _sr_blocked = True
                         _sr_reason = f"SELL within 0.3% of 1h 50-candle swing low ${_swing_low:.2f}"
 
@@ -129,8 +132,8 @@ def market_filter(asset_data: dict, btc_trend_1h: str = "UNKNOWN", btc_candles_5
                         if _pdh > 0 and abs(current_price - _pdh) / current_price * 100 < 0.2 and current_price <= _pdh:
                             _sr_blocked = True
                             _sr_reason = f"price within 0.2% of PDH ${_pdh:.2f}"
-                        # Only block SELL near PDL when price hasn't broken below it yet
-                        elif _pdl > 0 and abs(current_price - _pdl) / current_price * 100 < 0.2 and current_price >= _pdl:
+                        # Only block SELL when exactly at PDL (0.1% — avoids blocking every downtrend continuation)
+                        elif _pdl > 0 and abs(current_price - _pdl) / current_price * 100 < 0.1 and current_price >= _pdl:
                             _sr_blocked = True
                             _sr_reason = f"price within 0.2% of PDL ${_pdl:.2f}"
 
@@ -148,7 +151,7 @@ def market_filter(asset_data: dict, btc_trend_1h: str = "UNKNOWN", btc_candles_5
                     if direction == "buy" and abs(current_price - _swing_high_4h) / current_price * 100 < 0.3 and current_price <= _swing_high_4h:
                         _sr_blocked = True
                         _sr_reason = f"BUY within 0.3% of 4h 50-candle swing high ${_swing_high_4h:.2f}"
-                    elif direction == "sell" and abs(current_price - _swing_low_4h) / current_price * 100 < 0.3 and current_price >= _swing_low_4h:
+                    elif direction == "sell" and abs(current_price - _swing_low_4h) / current_price * 100 < 0.15 and current_price >= _swing_low_4h:
                         _sr_blocked = True
                         _sr_reason = f"SELL within 0.3% of 4h 50-candle swing low ${_swing_low_4h:.2f}"
 
@@ -207,7 +210,7 @@ def compute_signal_score(asset_data: dict, direction: str) -> float:
     Weights: trend_4h=3, trend_1h=2, MACD_15m=2, near_ema=1.5, trigger_5m=1.5.
     Base reachable values: 0, 1.5, 2, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8, 8.5, 10.
     Score 9 base is mathematically unreachable. Bonuses can push score above 10 (cap 11.0).
-    MIN_SIGNAL_SCORE (default 7) is the execution threshold in main.py.
+    MIN_SIGNAL_SCORE (default 6) is the execution threshold in main.py.
     Do NOT call this from entry_confirmed() — that uses _compute_signal_score() (0–5 system).
     """
     s15 = asset_data.get("setup_15m", {})
@@ -237,11 +240,15 @@ def compute_signal_score(asset_data: dict, direction: str) -> float:
         if (not bull_5m) or macd_5m < 0:   score += 1.5
 
     # ── Volume bonus (+1.0 when vol ≥1.5× 5-period avg) ──────────────────────
+    # BUG-v8-L3 FIX: Use last CLOSED candle (_c5m[-2]) not the live forming candle (_c5m[-1]).
+    # The forming candle accumulates volume from 0; near candle-open it is always below average,
+    # and near candle-close it can spike for unrelated reasons. Using [-2] (the last completed
+    # candle) gives a stable, reliable volume reading.
     _c5m = asset_data.get("candles_5m", [])
-    if len(_c5m) >= 6:
-        _vols = [c.get("volume", 0) for c in _c5m[-6:-1]]
+    if len(_c5m) >= 7:  # need at least 7: [-7:-2] = 5 avg candles, [-2] = last closed
+        _vols = [c.get("volume", 0) for c in _c5m[-7:-2]]
         _avg_vol = sum(_vols) / len(_vols) if _vols else 0
-        _cur_vol = _c5m[-1].get("volume", 0)
+        _cur_vol = _c5m[-2].get("volume", 0)  # last closed candle
         if _avg_vol > 0 and _cur_vol >= _avg_vol * 1.5:
             score += 1.0
 
@@ -289,9 +296,11 @@ def entry_confirmed(asset_data: dict, direction: str) -> bool:
     if not s15 or not t5:
         return False
 
-    # Signal score gate — requires minimum aligned conditions before entry
+    # Signal score gate — requires minimum aligned conditions before entry.
+    # Default fallback is 2 (lowered from 3): MIN_TRADE_SCORE=2 in .env means
+    # only 2 of the 5 inner conditions need to pass (e.g. trend_4h + trend_1h).
     _score = _compute_signal_score(asset_data, direction)
-    _min_score = int(CONFIG.get("min_trade_score") or 3)
+    _min_score = int(CONFIG.get("min_trade_score") or 2)
     if _score < _min_score:
         logging.info(
             "[SCORE] %s %s blocked — score %d < min %d",
@@ -299,14 +308,19 @@ def entry_confirmed(asset_data: dict, direction: str) -> bool:
         )
         return False
 
-    # RSI gate — block chasing into overbought longs or oversold shorts
+    # RSI gate — block extreme overbought/oversold only.
+    # Threshold widened from 70/30 → 78/22:
+    # In a genuine strong trend, 15m RSI routinely stays 65-80 (BUY) or 20-35 (SELL).
+    # The old 70/30 threshold was systematically blocking trend-continuation entries
+    # during the exact conditions this strategy targets. 78/22 only blocks truly extreme
+    # levels where reversal risk is highest (parabolic moves, exhaustion spikes).
     rsi_15m = s15.get("rsi14")
     if rsi_15m is not None:
-        if direction == "buy" and float(rsi_15m) > 70:
-            logging.info("buy blocked — 15m RSI %.1f overbought", float(rsi_15m))
+        if direction == "buy" and float(rsi_15m) > 78:
+            logging.info("buy blocked — 15m RSI %.1f extreme overbought (>78)", float(rsi_15m))
             return False
-        if direction == "sell" and float(rsi_15m) < 30:
-            logging.info("sell blocked — 15m RSI %.1f oversold", float(rsi_15m))
+        if direction == "sell" and float(rsi_15m) < 22:
+            logging.info("sell blocked — 15m RSI %.1f extreme oversold (<22)", float(rsi_15m))
             return False
 
     macd_15m = float(s15.get("macd_histogram") or 0)
@@ -328,47 +342,52 @@ def entry_confirmed(asset_data: dict, direction: str) -> bool:
         recent_vols = [c.get("volume", 0) for c in candles_5m[-21:-1]]
         avg_vol = sum(recent_vols) / len(recent_vols) if recent_vols else 0
         trigger_vol = candles_5m[-1].get("volume", 0)
-        vol_ok = trigger_vol >= avg_vol * 1.2 if avg_vol > 0 else True
+        # Volume threshold lowered from 1.2× → 0.7×.
+        # 1.2× required a SURGE to confirm — this killed pullback entries (which are the
+        # highest R:R setups) because volume on pullback candles is by definition lower.
+        # 0.7× means at least 70% of average volume — filters dead/zero-volume candles
+        # while allowing normal consolidation candles to pass.
+        # Zero avg_vol still fails closed (data feed issue).
+        vol_ok = trigger_vol >= avg_vol * 0.7 if avg_vol > 0 else False
         if not vol_ok:
             logging.info(
-                "Entry rejected: low volume on 5m trigger (%.0f vs avg %.0f, need 1.2×)",
+                "Entry rejected: very low volume on 5m trigger (%.0f vs avg %.0f, need 0.7×)",
                 trigger_vol, avg_vol,
             )
     else:
         vol_ok = False  # insufficient candle history — block entry rather than allow with no volume data
 
-    # Stale setup check — if price has moved >0.5×ATR away from 15m EMA20, setup is stale.
-    # Uses actual 4h ATR14 (best available ATR); falls back to 0.5% flat proxy only when missing.
-    _ema20_15m = s15.get("ema20")
-    if _ema20_15m is not None and current_price > 0:
-        _atr14_actual = asset_data.get("long_term_4h", {}).get("atr14")
-        _atr_15m_proxy = float(_atr14_actual) * 0.5 if _atr14_actual else current_price * 0.005
-        _dist_from_ema = abs(current_price - float(_ema20_15m))
-        if _dist_from_ema > _atr_15m_proxy:
-            logging.info(
-                "[STALE] %s setup stale — price %.4f moved %.4f from EMA20 %.4f (limit=%.4f, >0.5×ATR)",
-                asset_data.get("asset", "?"), current_price, _dist_from_ema, float(_ema20_15m), _atr_15m_proxy
-            )
-            return False
+    # NOTE: Stale setup check (>0.5×ATR from EMA) removed.
+    # In a genuine trend, price IS extended from the 15m EMA — that is the definition of
+    # a trending move. The stale check was systematically killing trend-continuation entries,
+    # which are the core of this strategy. The 15m MACD and near_ema signal in the score
+    # already penalise setups where price is too far from structure.
 
+    # BUY: use OR between near_ema and macd_15m.
+    # In a strong trend, price extends away from EMA (near_ema=False) but MACD is positive.
+    # Old AND logic required BOTH — made every extended-trend entry impossible.
     if direction == "buy":
-        return vol_ok and (near_ema and macd_15m > -macd_threshold) and (bull_5m or macd_5m > 0)
+        return vol_ok and (near_ema or macd_15m > macd_threshold) and (bull_5m or macd_5m > 0)
 
-    # H-1 FIX: sell requires genuinely negative MACD (< -threshold), not just below positive threshold.
-    # Old code used `< macd_threshold` (positive number) which passed on neutral/mildly-positive MACD.
+    # SELL: use OR between near_ema and macd_15m — in a downtrend price is below EMA so near_ema=False,
+    # but MACD is strongly negative. Requiring AND made this mutually exclusive with actual downtrends.
     if direction == "sell":
-        return vol_ok and (near_ema and macd_15m < -macd_threshold) and ((not bull_5m) or macd_5m < 0)
+        return vol_ok and (near_ema or macd_15m < -macd_threshold) and ((not bull_5m) or macd_5m < 0)
 
     return True
 
 
 def is_trending_regime(asset_data: dict) -> bool:
-    """Return True when BB width indicates a trending (not ranging) market.
+    """[INACTIVE — NOT CALLED ANYWHERE] BB width regime detection.
 
-    Compares current BB width to its 20-period median.
-    Ranging markets have narrow BB width — avoid entries in these conditions.
-    Returns True (allow entry) if insufficient data.
+    Status: Dead code retained for potential Tier 2 use.
+    The BB width gate was removed from _code_decide_direction() (CHANGE 3, 2026-05-21)
+    because ADX ≥ 15 already filters ranging markets, making this redundant.
+
+    To reactivate: call this from _code_decide_direction() after the ADX gate.
+    Do NOT reactivate without removing the ADX gate first — they are redundant.
     """
+    # DEAD_CODE_MARKER: is_trending_regime — search for this tag to find all inactive functions
     lt = asset_data.get("long_term_4h", {})
     bb_width = lt.get("bb_width_pct")
     bb_width_series = lt.get("bb_width_series", [])

@@ -8,6 +8,7 @@ the trading agent can depend on predictable, non-blocking IO.
 
 import asyncio
 import logging
+import random
 import aiohttp
 from typing import TYPE_CHECKING
 from src.config_loader import CONFIG
@@ -51,6 +52,10 @@ class HyperliquidAPI:
         self._meta_cache_ts: float = 0.0
         self._hip3_meta_cache: dict = {}  # {dex_name: meta_response}
         self._hip3_meta_cache_ts: dict = {}  # {dex_name: fetch timestamp}
+        # CHAOS-5 FIX: Semaphore caps concurrent read-only API calls (candles, prices, OI).
+        # Created here (not as a class var) so it binds to the running event loop.
+        # Order placement calls bypass this so exits are never queued behind candle fetches.
+        self._read_semaphore = asyncio.Semaphore(4)
         if "hyperliquid_private_key" in CONFIG and CONFIG["hyperliquid_private_key"]:
             self.wallet = Account.from_key(CONFIG["hyperliquid_private_key"])
         elif "mnemonic" in CONFIG and CONFIG["mnemonic"]:
@@ -120,7 +125,9 @@ class HyperliquidAPI:
                 logging.warning("HL call failed (attempt %s/%s): %s", attempt + 1, max_attempts, e)
                 if reset_on_fail:
                     self._reset_clients()
-                await asyncio.sleep(backoff_base * (2 ** attempt))
+                # PERF-6 FIX: add ±25% jitter to prevent thundering-herd after rate limit
+                _delay = backoff_base * (2 ** attempt) * (0.75 + random.random() * 0.5)
+                await asyncio.sleep(_delay)
                 continue
             except (RuntimeError, ValueError, KeyError, AttributeError) as e:
                 # Unknown errors: don't spin forever, but allow a quick reset once
@@ -128,7 +135,8 @@ class HyperliquidAPI:
                 logging.warning("HL call unexpected error (attempt %s/%s): %s", attempt + 1, max_attempts, e)
                 if reset_on_fail and attempt == 0:
                     self._reset_clients()
-                    await asyncio.sleep(backoff_base)
+                    _delay = backoff_base * (0.75 + random.random() * 0.5)
+                    await asyncio.sleep(_delay)
                     continue
                 break
         raise last_err if last_err else RuntimeError("Hyperliquid retry: unknown error")
@@ -193,13 +201,13 @@ class HyperliquidAPI:
                 self._reset_clients()
                 if await self._check_order_landed(asset, is_buy):
                     return {"status": "already_placed"}
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                await asyncio.sleep(0.5 * (2 ** attempt) * (0.75 + random.random() * 0.5))
             except (RuntimeError, ValueError, KeyError, AttributeError) as e:
                 last_err = e
                 logging.warning("[ORDER] unexpected error attempt %d/3: %s", attempt + 1, e)
                 if attempt == 0:
                     self._reset_clients()
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.5 * (0.75 + random.random() * 0.5))
                     continue
                 break
         raise last_err if last_err else RuntimeError("Order placement failed after retries")
@@ -333,13 +341,13 @@ class HyperliquidAPI:
                 except Exception as _ce:
                     logging.warning("[IDEMPOTENT] trigger check failed: %s — treating as landed", _ce)
                     return {"status": "already_placed"}
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                await asyncio.sleep(0.5 * (2 ** attempt) * (0.75 + random.random() * 0.5))
             except (RuntimeError, ValueError, KeyError, AttributeError) as e:
                 last_err = e
                 logging.warning("[TRIGGER] unexpected error attempt %d/3: %s", attempt + 1, e)
                 if attempt == 0:
                     self._reset_clients()
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.5 * (0.75 + random.random() * 0.5))
                     continue
                 break
         raise last_err if last_err else RuntimeError(f"Trigger {tpsl_type} placement failed after retries")
@@ -430,13 +438,13 @@ class HyperliquidAPI:
                         return {"status": "already_closed"}
                 except Exception as _ce:
                     logging.warning("[CLOSE] position check failed for %s: %s — will retry", asset, _ce)
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                await asyncio.sleep(0.5 * (2 ** attempt) * (0.75 + random.random() * 0.5))
             except (RuntimeError, ValueError, KeyError, AttributeError) as e:
                 last_err = e
                 logging.warning("[CLOSE] unexpected error attempt %d/3: %s", attempt + 1, e)
                 if attempt == 0:
                     self._reset_clients()
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.5 * (0.75 + random.random() * 0.5))
                     continue
                 break
         raise last_err if last_err else RuntimeError(f"market_close({asset}) failed after retries")
@@ -531,7 +539,11 @@ class HyperliquidAPI:
 
         Returns:
             List of order identifiers present in resting or filled status entries.
+            Returns [] for {"status": "already_placed"} — order is on exchange but OID unknown;
+            callers should query open_orders to find the existing OID rather than re-placing.
         """
+        if isinstance(order_result, dict) and order_result.get("status") == "already_placed":
+            return []
         oids = []
         try:
             statuses = order_result["response"]["data"]["statuses"]
@@ -632,6 +644,22 @@ class HyperliquidAPI:
             "positions":    enriched_positions,
         }
 
+    async def get_positions(self):
+        """Return flat list of open position dicts from user state.
+
+        BUG-P9-1 FIX: SL orphan check and inner reconcile called get_positions()
+        which did not exist — both safety systems were broken on every tick.
+        This method extracts positions from the existing user_state call without
+        the PnL enrichment overhead, so it is safe to call every 5 minutes.
+        """
+        state = await self._retry(lambda: self.info.user_state(self.query_address))
+        positions = []
+        for pos_wrap in state.get("assetPositions", []):
+            pos = pos_wrap.get("position") if isinstance(pos_wrap, dict) and "position" in pos_wrap else pos_wrap
+            if pos:
+                positions.append(pos)
+        return positions
+
     async def get_current_price(self, asset):
         """Return the latest mid-price for ``asset``.
 
@@ -645,14 +673,14 @@ class HyperliquidAPI:
         Returns:
             Mid-price as a float, or ``0.0`` when unavailable.
         """
-        if ":" in asset:
-            # HIP-3 asset — need dex-specific allMids
-            dex = asset.split(":")[0]
-            mids = await self._retry(
-                lambda: self.info.post("/info", {"type": "allMids", "dex": dex})
-            )
-        else:
-            mids = await self._retry(self.info.all_mids)
+        async with self._read_semaphore:
+            if ":" in asset:
+                dex = asset.split(":")[0]
+                mids = await self._retry(
+                    lambda: self.info.post("/info", {"type": "allMids", "dex": dex})
+                )
+            else:
+                mids = await self._retry(self.info.all_mids)
         return float(mids.get(asset, 0.0))
 
     _META_CACHE_TTL = 6 * 3600  # refresh contract specs every 6 hours
@@ -731,20 +759,19 @@ class HyperliquidAPI:
         end_time = int(_time.time() * 1000)
         start_time = end_time - (count * interval_ms)
 
-        if ":" in asset:
-            # HIP-3 asset — SDK candles_snapshot can't resolve dex:asset names,
-            # so use the raw post endpoint directly
-            raw = await self._retry(
-                lambda: self.info.post("/info", {
-                    "type": "candleSnapshot",
-                    "req": {"coin": asset, "interval": interval,
-                            "startTime": start_time, "endTime": end_time}
-                })
-            )
-        else:
-            raw = await self._retry(
-                lambda: self.info.candles_snapshot(asset, interval, start_time, end_time)
-            )
+        async with self._read_semaphore:
+            if ":" in asset:
+                raw = await self._retry(
+                    lambda: self.info.post("/info", {
+                        "type": "candleSnapshot",
+                        "req": {"coin": asset, "interval": interval,
+                                "startTime": start_time, "endTime": end_time}
+                    })
+                )
+            else:
+                raw = await self._retry(
+                    lambda: self.info.candles_snapshot(asset, interval, start_time, end_time)
+                )
         candles = []
         for c in raw:
             candles.append({

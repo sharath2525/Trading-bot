@@ -13,7 +13,7 @@ import re
 import anthropic
 from src.config_loader import CONFIG
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class TradingAgent:
@@ -38,14 +38,17 @@ class TradingAgent:
         """
         _model = "claude-sonnet-4-6"
         _max_tok = int(CONFIG.get("ai_max_tokens") or 4000)
-        _now_utc = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        _now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # BUG-v7-S5 FIX: was datetime.now() (local time)
 
         # Last 5 completed trades for this asset — gives Claude recent performance context
         _recent_trades_ctx = "No recent trade history available."
         try:
             import json as _rj
-            _diary_path = "diary.jsonl"
-            if __import__("os").path.exists(_diary_path):
+            import os as _os
+            # BUG-P9-8 FIX: Use absolute path so diary.jsonl is found regardless of CWD.
+            # Relative path fails silently when launched via systemd or from a different dir.
+            _diary_path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "diary.jsonl")
+            if _os.path.exists(_diary_path):
                 with open(_diary_path, "r") as _rf:
                     _all_lines = [_rj.loads(l) for l in _rf if l.strip()]
                 _asset_trades = [t for t in _all_lines if t.get("asset") == asset][-5:]
@@ -57,6 +60,42 @@ class TradingAgent:
                     )
         except Exception:
             pass
+
+        # ── Hard pre-checks — run BEFORE calling Claude to avoid soft-rule inconsistency ──
+        # These mirror two of Claude's auto-reject conditions as hard Python guards.
+        # market_filter() already checks these but confirm_trade() receives pre-filtered data;
+        # adding them here prevents Claude from applying stricter/inconsistent thresholds.
+
+        # 1. Round S&R check — block if price within 0.5% of a major round level
+        _pre_price = float((asset_data or {}).get("current_price") or entry_price or 0)
+        if _pre_price > 0:
+            _round_levels_pre = []
+            if _pre_price > 10000:
+                _round_levels_pre = [
+                    round(_pre_price / 5000) * 5000,
+                    round(_pre_price / 10000) * 10000,
+                ]
+            elif _pre_price > 1000:
+                _round_levels_pre = [round(_pre_price / 500) * 500, round(_pre_price / 1000) * 1000]
+            elif _pre_price > 50:
+                _round_levels_pre = [round(_pre_price / 50) * 50, round(_pre_price / 100) * 100]
+            for _rl in _round_levels_pre:
+                if _rl > 0 and abs(_pre_price - _rl) / _pre_price < 0.003:  # 0.3% (was 0.5% — too tight, blocked too many setups)
+                    logging.info(
+                        "[PRE-REJECT] %s %s — price $%.2f within 0.5%% of round level $%.0f — skipping Claude call",
+                        asset, direction, _pre_price, _rl
+                    )
+                    return "REJECT"
+
+        # 2. Extreme funding pre-check — matches market_filter() threshold exactly
+        _pre_funding = float((asset_data or {}).get("funding_rate") or 0)
+        if direction == "buy" and _pre_funding > 0.0005:
+            logging.info("[PRE-REJECT] %s BUY — funding %.5f > 0.0005 threshold — skipping Claude call", asset, _pre_funding)
+            return "REJECT"
+        if direction == "sell" and _pre_funding < -0.0005:
+            logging.info("[PRE-REJECT] %s SELL — funding %.5f < -0.0005 threshold — skipping Claude call", asset, _pre_funding)
+            return "REJECT"
+        # ── End hard pre-checks ──────────────────────────────────────────────────
 
         ad = asset_data or {}
         mc = macro_context or {}
@@ -138,11 +177,10 @@ class TradingAgent:
             "You are a professional trading risk analyst validating a code-confirmed setup.\n"
             "Code has set direction, entry, TP, SL — you CANNOT change any of these.\n\n"
             "═══ STEP 1: AUTO-REJECT CHECK ═══\n"
+            "NOTE: Round S&R proximity and extreme funding rate have already been verified by pre-checks.\n"
+            "Focus your auto-reject evaluation on: RSI divergence, high-impact news events, and weak candle body only.\n\n"
             "If ANY of the following are true, write VERDICT: REJECT immediately:\n"
             "  - RSI divergence on 4h or 1h (price at new high/low but RSI is NOT)\n"
-            "  - Price within 0.3% of a round-number resistance level\n"
-            "  - Funding rate > +0.05% per 8h on a BUY (crowded longs)\n"
-            "  - Funding rate < -0.05% per 8h on a SELL (crowded shorts)\n"
             "  - High-impact event within 2 hours: FOMC, CPI, NFP, ECB, PCE, GDP, earnings\n"
             "  - Candle body < 30% of total candle range on 15m trigger (indecision/wick-dominated)\n\n"
             "═══ STEP 2: SCORE EACH FACTOR 1–5 ═══\n"

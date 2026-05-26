@@ -19,26 +19,43 @@ _kronos_failed = False
 
 
 def _load_kronos():
-    """Attempt to load Kronos-mini from HuggingFace. Sets module-level flags."""
+    """Attempt to load Kronos-mini from HuggingFace. Sets module-level flags.
+
+    BUG-P9-4 FIX: "time-series-prediction" is not a valid transformers pipeline task.
+    Kronos-mini is a time-series foundation model that requires direct AutoModel loading
+    with trust_remote_code=True. We store the model+tokenizer tuple as _kronos_pipeline.
+    Falls back to chronos-forecasting package if available (pip install chronos-forecasting).
+    """
     global _kronos_pipeline, _kronos_loaded, _kronos_failed
     if _kronos_loaded or _kronos_failed:
         return
+
+    # Attempt 1: chronos-forecasting package (most reliable for Kronos-family models)
     try:
-        from transformers import pipeline  # type: ignore
-        _kronos_pipeline = pipeline(
-            "time-series-prediction",
-            model="KronosResearch/Kronos-mini",
-            trust_remote_code=True,
+        import torch  # type: ignore
+        from chronos import ChronosPipeline  # type: ignore
+        _kronos_pipeline = ChronosPipeline.from_pretrained(
+            "KronosResearch/Kronos-mini",
+            device_map="cpu",
+            torch_dtype=torch.float32,
         )
         _kronos_loaded = True
-        logging.info("[KRONOS] Kronos-mini loaded from HuggingFace (Tier 1 active)")
-    except Exception as _e:
-        _kronos_failed = True
-        logging.warning(
-            "WARNING: Kronos not available — modifier = 0.0 (%s). "
-            "Install with: pip install torch transformers",
-            _e,
-        )
+        logging.info("[KRONOS] Kronos-mini loaded via chronos-forecasting (Tier 1 active)")
+        return
+    except ImportError:
+        pass  # chronos-forecasting not installed — try direct transformers loading
+    except Exception as _e1:
+        logging.debug("[KRONOS] chronos-forecasting load failed: %s", _e1)
+
+    # BUG-v7-P1 FIX: AutoModel fallback removed. Tokenizing str(_closes) into a seq2seq LM
+    # is not time-series forecasting — the output logit is random noise with no predictive
+    # value. Injecting a random ±0.5 modifier pollutes the score system. Return 0.0 instead.
+
+    _kronos_failed = True
+    logging.warning(
+        "WARNING: Kronos not available — modifier = 0.0. "
+        "Install with: pip install chronos-forecasting torch transformers"
+    )
 
 
 def get_kronos_modifier(candles: list, direction: str) -> float:
@@ -59,14 +76,14 @@ def get_kronos_modifier(candles: list, direction: str) -> float:
         if len(_closes) < 10 or _closes[-1] <= 0:
             return 0.0
 
-        _result = _kronos_pipeline(_closes)
+        # ChronosPipeline path only — AutoModel fallback removed (BUG-v7-P1)
+        import torch  # type: ignore
+        _context = torch.tensor(_closes, dtype=torch.float32).unsqueeze(0)
+        _forecast = _kronos_pipeline.predict(_context, prediction_length=1)
+        # predict() returns a tensor of shape (batch, num_samples, prediction_length)
+        _forecast_val = float(_forecast[0].mean().item())
 
-        if isinstance(_result, (list, tuple)) and len(_result) > 0:
-            _forecast_val = _result[-1]
-            if isinstance(_forecast_val, dict):
-                _forecast_val = _forecast_val.get("label") or _forecast_val.get("score") or 0.0
-            _forecast_val = float(_forecast_val)
-        else:
+        if _forecast_val == 0.0:
             return 0.0
 
         _cur_close = _closes[-1]
@@ -77,10 +94,10 @@ def get_kronos_modifier(candles: list, direction: str) -> float:
 
         _fore_dir = "buy" if _chg_pct > 0 else "sell"
         modifier = +0.5 if _fore_dir == direction else -0.5
-        logging.debug("[KRONOS] forecast_chg=%.3f%% fore_dir=%s code_dir=%s modifier=%.1f",
-                      _chg_pct, _fore_dir, direction, modifier)
+        logging.info("[KRONOS] forecast_chg=%.3f%% fore_dir=%s code_dir=%s modifier=%.1f",
+                     _chg_pct, _fore_dir, direction, modifier)
         return modifier
 
     except Exception as _e:
-        logging.debug("[KRONOS] inference error: %s", _e)
+        logging.info("[KRONOS] inference error: %s", _e)
         return 0.0
