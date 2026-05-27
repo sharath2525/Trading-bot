@@ -551,19 +551,6 @@ def main():
 
     print(f"Starting trading agent for assets: {args.assets} at interval: {args.interval}")
 
-    # PERF-1 FIX: Pre-warm Kronos-mini at startup in a thread so the blocking HuggingFace
-    # model load (30–60s on cold VPS) happens before the first guardian pass, not inside it.
-    # Without this, any open positions from a prior session have no SL re-placement protection
-    # during the cold-load window. asyncio.to_thread keeps the event loop responsive.
-    async def _prewarm_kronos():
-        try:
-            from src.indicators.kronos_forecast import _load_kronos
-            await asyncio.to_thread(_load_kronos)
-            logging.info("[KRONOS] pre-warm complete")
-        except Exception as _kw_err:
-            logging.warning("[KRONOS] pre-warm error (non-fatal): %s", _kw_err)
-    asyncio.ensure_future(_prewarm_kronos())
-
     def add_event(msg: str):
         logging.info(msg)
 
@@ -1296,10 +1283,26 @@ def main():
                 if not _tr_asset or _tr_entry <= 0 or _tr_atr <= 0:
                     continue
                 if _tr_size <= 0:
-                    # BUG-v8-L7: amount can round to zero after TP1 halves it on very small positions.
-                    # Log clearly so operator knows trailing stop is skipped for this position.
-                    logging.warning("[TRAIL] %s skipped — amount is zero (lot-size rounding after TP1?); position has no trailing stop", _tr_asset)
-                    continue
+                    # BUG-v9-L1 FIX: amount can round to zero after TP1 halves it on small positions.
+                    # Query the exchange for the live position size as a fallback before giving up —
+                    # without this the position runs permanently without a trailing stop after TP1.
+                    try:
+                        _live_positions = await hyperliquid.get_positions()
+                        _live_pos = next(
+                            (p for p in (_live_positions or []) if p.get("coin") == _tr_asset),
+                            None,
+                        )
+                        _live_sz = abs(float((_live_pos or {}).get("szi") or 0))
+                        if _live_sz > 0:
+                            _tr_size = _live_sz
+                            _tr["amount"] = _live_sz  # repair active_trades entry
+                            logging.info("[TRAIL] %s recovered live size %.6f from exchange — trailing stop proceeding", _tr_asset, _live_sz)
+                        else:
+                            logging.warning("[TRAIL] %s skipped — amount zero and no live position found on exchange", _tr_asset)
+                            continue
+                    except Exception as _tse:
+                        logging.warning("[TRAIL] %s skipped — amount zero and exchange lookup failed: %s", _tr_asset, _tse)
+                        continue
 
                 _cur_px = float(asset_prices.get(_tr_asset) or 0)
                 if _cur_px <= 0:
@@ -1455,20 +1458,34 @@ def main():
                     asset_prices[asset] = current_price
                     asset_candles_5m[asset] = candles_5m
 
-                    # CHAOS-3 FIX: Stale candle watchdog — warn if last candle is more than
-                    # 3× the interval duration old (indicates REST data lag or exchange issue).
+                    # CHAOS-3 / CHAOS-v9-2 FIX: Stale candle watchdog — if last 5m or 1h candle
+                    # is more than 3× the interval duration old, skip this asset entirely for this
+                    # cycle (signal on 30+ min old OHLCV data is worse than no signal at all).
+                    # 4h candles: only warn (4h candles naturally have a longer gap near open).
                     _now_ms = int(time.time() * 1000)
-                    for _stale_label, _stale_candles, _stale_ms in [
-                        ("5m", candles_5m, 300_000), ("1h", candles_1h, 3_600_000),
-                        ("4h", candles_4h, 14_400_000),
+                    _stale_skip = False
+                    for _stale_label, _stale_candles, _stale_ms, _stale_halt in [
+                        ("5m", candles_5m, 300_000, True),
+                        ("1h", candles_1h, 3_600_000, True),
+                        ("4h", candles_4h, 14_400_000, False),
                     ]:
                         if _stale_candles:
                             _last_t = _stale_candles[-1].get("t")
                             if _last_t and (_now_ms - int(_last_t)) > 3 * _stale_ms:
-                                logging.warning(
-                                    "[STALE DATA] %s %s last candle is %.1f min old — possible data lag",
-                                    asset, _stale_label, (_now_ms - int(_last_t)) / 60_000,
-                                )
+                                _age_min = (_now_ms - int(_last_t)) / 60_000
+                                if _stale_halt:
+                                    logging.warning(
+                                        "[STALE DATA] %s %s last candle is %.1f min old — skipping asset this cycle",
+                                        asset, _stale_label, _age_min,
+                                    )
+                                    _stale_skip = True
+                                else:
+                                    logging.warning(
+                                        "[STALE DATA] %s %s last candle is %.1f min old — possible data lag",
+                                        asset, _stale_label, _age_min,
+                                    )
+                    if _stale_skip:
+                        continue
 
                     # CRITICAL-2: Accumulate OI history for oi_confirmed()
                     if asset not in _oi_history:
@@ -1999,16 +2016,25 @@ def main():
                         # on the daily and the trade opposes it). Outer loop was missing this gate.
                         _outer_trend_1d = asset_trends_1d.get(asset, "UNKNOWN")
                         _outer_adx_1d   = asset_adx_1d.get(asset)
-                        _outer_macro_trending = _outer_adx_1d is not None and float(_outer_adx_1d) > 20
+                        # BUG-v9-L4 FIX: When 1d ADX is unavailable (< 14 daily candles), apply
+                        # the macro filter based on EMA trend alone — a known BEARISH/BULLISH daily
+                        # trend is sufficient to block a counter-trend trade even without ADX
+                        # confirmation. Previously `_outer_adx_1d is None` silently bypassed the
+                        # filter for any asset without enough 1d history.
+                        _outer_macro_trending = (
+                            (_outer_adx_1d is not None and float(_outer_adx_1d) > 20)
+                            or (_outer_adx_1d is None and _outer_trend_1d != "UNKNOWN")
+                        )
                         if _outer_macro_trending:
+                            _adx_str = f"ADX={float(_outer_adx_1d):.1f}" if _outer_adx_1d is not None else "ADX=N/A (insufficient history)"
                             if _outer_trend_1d == "BEARISH" and action == "buy":
-                                logging.info("[OUTER DAILY FILTER] %s BUY blocked — daily trend BEARISH + ADX=%.1f > 20",
-                                             asset, float(_outer_adx_1d))
+                                logging.info("[OUTER DAILY FILTER] %s BUY blocked — daily trend BEARISH + %s",
+                                             asset, _adx_str)
                                 add_event(f"[OUTER DAILY FILTER] {asset} BUY blocked — daily BEARISH trend active")
                                 continue
                             if _outer_trend_1d == "BULLISH" and action == "sell":
-                                logging.info("[OUTER DAILY FILTER] %s SELL blocked — daily trend BULLISH + ADX=%.1f > 20",
-                                             asset, float(_outer_adx_1d))
+                                logging.info("[OUTER DAILY FILTER] %s SELL blocked — daily trend BULLISH + %s",
+                                             asset, _adx_str)
                                 add_event(f"[OUTER DAILY FILTER] {asset} SELL blocked — daily BULLISH trend active")
                                 continue
 
@@ -2430,6 +2456,20 @@ def main():
                 # deferred because limit order was not yet filled at entry time), check whether
                 # the position now exists on the exchange. If it does, place SL immediately.
                 # This closes the 60-minute unprotected window to ≤5 minutes.
+                # PERF-v9-2 FIX: Fetch positions once before the orphan loop instead of once
+                # per deferred trade. With 3 concurrent deferred trades this was 3 sequential
+                # REST calls per inner tick; now it is always exactly 1.
+                _orphan_all_positions = None
+                _has_deferred = any(
+                    t.get("sl_oid") is None and t.get("sl_price") and float(t.get("amount") or 0) > 0
+                    for t in active_trades
+                )
+                if _has_deferred:
+                    try:
+                        _orphan_all_positions = await hyperliquid.get_positions()
+                    except Exception as _oap_err:
+                        logging.warning("[SL ORPHAN] get_positions() failed: %s — orphan check skipped this tick", _oap_err)
+
                 for _orphan_tr in list(active_trades):
                     _orphan_asset = _orphan_tr.get("asset")
                     _orphan_sl_oid = _orphan_tr.get("sl_oid")
@@ -2441,8 +2481,11 @@ def main():
                     if _orphan_sl_oid is not None or not _orphan_sl_px or _orphan_size <= 0:
                         continue
 
+                    if _orphan_all_positions is None:
+                        continue  # positions fetch failed this tick — skip
+
                     try:
-                        _orphan_positions = await hyperliquid.get_positions()
+                        _orphan_positions = _orphan_all_positions
                         _orphan_pos_exists = any(
                             p.get("coin") == _orphan_asset and abs(float(p.get("szi") or 0)) > 0
                             for p in (_orphan_positions or [])
@@ -2840,9 +2883,31 @@ def main():
                             try:
                                 await hyperliquid.cancel_order(_ia, _i_entry_oid)
                                 logging.info("[INNER LIMIT] %s unfilled limit cancelled", _ia)
+                                state_mgr.set_state(_ia, TradeStateMachine.IDLE)
                                 continue
                             except Exception as _ice:
-                                logging.warning("[INNER LIMIT] %s cancel failed: %s", _ia, _ice)
+                                logging.warning("[INNER LIMIT] %s cancel failed: %s — checking exchange for position", _ia, _ice)
+                                # BUG-v9-L3 FIX: Cancel failed — we don't know if the order filled.
+                                # Check the exchange before deciding whether to record as ENTERED.
+                                # If no position exists, skip (don't record a phantom entry).
+                                # If a position exists, fall through and let the SL orphan check
+                                # place the SL on the next inner tick.
+                                try:
+                                    _ice_positions = await hyperliquid.get_positions()
+                                    _ice_pos = any(
+                                        p.get("coin") == _ia and abs(float(p.get("szi") or 0)) > 0
+                                        for p in (_ice_positions or [])
+                                    )
+                                    if not _ice_pos:
+                                        logging.info("[INNER LIMIT] %s no position found after cancel failure — aborting entry", _ia)
+                                        state_mgr.set_state(_ia, TradeStateMachine.IDLE)
+                                        continue
+                                    logging.warning("[INNER LIMIT] %s position exists despite cancel failure — recording as ENTERED (SL orphan check covers)", _ia)
+                                    await send_alert(f"⚠️ [{_ia}] limit cancel failed but position open — SL deferred to orphan check next tick")
+                                except Exception as _ice2:
+                                    logging.warning("[INNER LIMIT] %s position check failed after cancel failure: %s — skipping entry to be safe", _ia, _ice2)
+                                    state_mgr.set_state(_ia, TradeStateMachine.IDLE)
+                                    continue
                         # HIGH-1: Cancel partial fill remainder (mirrors outer loop CRITICAL-5 fix)
                         if _i_order_type == "limit" and 0 < _i_filled_qty < _iamt * 0.99 and _i_entry_oid:
                             try:
@@ -3155,6 +3220,24 @@ def main():
 
     async def main_async():
         """Start the aiohttp server and kick off the trading loop."""
+
+        # CHAOS-v9-1 FIX: Pre-warm Kronos inside the running event loop.
+        # asyncio.ensure_future() called from sync main() (before asyncio.run) crashes on
+        # Python 3.12+ with RuntimeError("no running event loop"). Moved here so the task
+        # is created while the event loop is already running. CHAOS-v9-3: wrap with
+        # asyncio.wait_for(timeout=120) so a hung HuggingFace download on an air-gapped VPS
+        # doesn't block the thread pool indefinitely — times out gracefully after 2 minutes.
+        async def _prewarm_kronos():
+            try:
+                from src.indicators.kronos_forecast import _load_kronos
+                await asyncio.wait_for(asyncio.to_thread(_load_kronos), timeout=120)
+                logging.info("[KRONOS] pre-warm complete")
+            except asyncio.TimeoutError:
+                logging.warning("[KRONOS] pre-warm timed out after 120s (HuggingFace unreachable?) — modifier = 0.0")
+            except Exception as _kw_err:
+                logging.warning("[KRONOS] pre-warm error (non-fatal): %s", _kw_err)
+        asyncio.ensure_future(_prewarm_kronos())
+
         # Persist bot start date once (survives diary rotation — used by dashboard "Active Since")
         _started_path = pathlib.Path(__file__).parent.parent / "bot_started.json"
         if not _started_path.exists():

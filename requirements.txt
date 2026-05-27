@@ -7,3 +7,9 @@ web3>=6.0.0,<7.0.0
 rich>=13.0.0,<14.0.0
 eth-account>=0.11.0,<1.0.0
 websocket-client>=1.7.0,<2.0.0
+
+# Kronos-mini (ACTIVE Tier 1 score modifier — MASTER RULE 1)
+# Install these for full Tier 1 operation. Bot gracefully degrades to modifier=0.0 if absent.
+torch>=2.0.0
+transformers>=4.36.0
+chronos-forecasting>=1.0.0
