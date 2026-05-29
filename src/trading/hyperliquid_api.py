@@ -613,8 +613,8 @@ class HyperliquidAPI:
         )
 
         # Enrich positions with live PnL
-        enriched_positions = []
-        for pos_wrap in positions:
+        # PERF-v10-1 FIX: fetch all prices concurrently instead of sequentially.
+        async def _fetch_price_for_pos(pos_wrap):
             pos = pos_wrap["position"]
             entry_px = float(pos.get("entryPx", 0) or 0)
             size = float(pos.get("szi", 0) or 0)
@@ -622,18 +622,37 @@ class HyperliquidAPI:
             current_px = await self.get_current_price(pos["coin"]) if entry_px and size else 0.0
             if current_px > 0:
                 pnl = (current_px - entry_px) * abs(size) if side == "long" else (entry_px - current_px) * abs(size)
+                pos["pnl_unknown"] = False
             else:
-                # Price lookup returned 0 — coin name from assetPositions may lack the
-                # dex prefix (e.g. "GOLD" instead of "xyz:GOLD"). Computing PnL against
-                # price=0 produces a 100% notional loss that triggers a false force-close.
-                pnl = 0.0
-                logging.warning(
-                    "[BALANCE] %s price lookup returned 0 — skipping PnL enrichment to avoid false force-close",
-                    pos["coin"],
-                )
+                # LB-v10-2 FIX: Price lookup returned 0 — coin name from assetPositions may
+                # lack the dex prefix (e.g. "GOLD" instead of "xyz:GOLD"). Try common prefixes
+                # before falling back. Mark pnl_unknown=True so check_losing_positions() can
+                # alert the operator rather than silently treating this as a zero-loss position.
+                for _pfx in ("xyz:", ""):
+                    _candidate = f"{_pfx}{pos['coin']}" if _pfx and ":" not in pos["coin"] else pos["coin"]
+                    try:
+                        _fallback_px = float((await self.get_current_price(_candidate)) or 0)
+                        if _fallback_px > 0:
+                            current_px = _fallback_px
+                            break
+                    except Exception:
+                        pass
+                if current_px > 0:
+                    pnl = (current_px - entry_px) * abs(size) if side == "long" else (entry_px - current_px) * abs(size)
+                    pos["pnl_unknown"] = False
+                else:
+                    pnl = 0.0
+                    pos["pnl_unknown"] = True
+                    logging.warning(
+                        "[BALANCE] %s price lookup returned 0 after prefix retry — PnL unknown; "
+                        "force-close protection disabled for this position. MANUAL CHECK REQUIRED.",
+                        pos["coin"],
+                    )
             pos["pnl"] = pnl
             pos["notional_entry"] = abs(size) * entry_px
-            enriched_positions.append(pos)
+            return pos
+
+        enriched_positions = list(await asyncio.gather(*(_fetch_price_for_pos(pw) for pw in positions)))
 
         return {
             "balance":      total_value,    # TRUE unified total — used by risk manager

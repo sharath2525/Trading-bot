@@ -20,8 +20,8 @@ removed, bypassed, or structurally altered.
   - This is intentional: a perfect-base + volume bonus setup reads as 11.0, the highest conviction tier
   - `min(raw_score, 11.0)` is the only capping operation permitted
 - Score tiers must never change:
-  - `score < 7.0` → HOLD (no trade, no Claude call)
-  - `score >= 7.0` AND `multi_timeframe_confluence()` True → call `confirm_trade()` for market analysis; must receive `VERDICT: APPROVE` before executing
+  - `score < 6.0` → HOLD (no trade, no Claude call)
+  - `score >= 6.0` AND `multi_timeframe_confluence()` True → call `confirm_trade()` for market analysis; must receive `VERDICT: APPROVE` before executing
   - There is NO "execute directly without Claude" path — ALL entries at score ≥ 7 with confluence require Claude APPROVE
 - Three config keys must always exist as **separate** keys — never merge any of them:
   - `MIN_TRADE_SCORE` (int, 0–5): `entry_confirmed()` internal gate
@@ -82,7 +82,7 @@ All trade parameters are computed deterministically by code. Claude never comput
 - Set ONLY by `_code_decide_direction()` in `src/main.py`
 - All four gates must pass (in order):
   1. 4h EMA20 > EMA50 (BUY) or EMA20 < EMA50 (SELL) — primary trend
-  2. 1h ADX > 25 — trending market confirmed (NOT ranging)
+  2. 1h ADX ≥ 15 — must show directional movement (ADX < 15 → HOLD; ADX 15–20 → half-size)
   3. Daily bias — 1d close is green and near open (BUY) / red and near open (SELL)
   4. BB width above 20-period median — trending regime, not consolidating
 - Returns `"buy"`, `"sell"`, or `None` (HOLD) — counter-trend trades are structurally impossible
@@ -94,7 +94,8 @@ All trade parameters are computed deterministically by code. Claude never comput
   - `score >= 10.0` → TP = **2.5×ATR** (perfect + bonus setup, highest conviction)
   - `score >= 9.0`  → TP = **2.2×ATR**
   - `score >= 8.0`  → TP = **2.0×ATR**
-  - `score >= 7.0`  → TP = **1.8×ATR** (minimum passing setup)
+  - `score >= 7.0`  → TP = **1.8×ATR**
+  - `score >= 6.0`  → TP = **1.6×ATR** (minimum passing setup at lowered gate)
 - Partial close levels: TP1 = 1×ATR (close 50%), TP2 = 3×ATR (close remaining 50%)
 - SL = 1×ATR from entry always — non-negotiable
 - Fee buffer from `TAKER_FEE_PCT` baked into all levels
@@ -109,8 +110,9 @@ All trade parameters are computed deterministically by code. Claude never comput
 - Claude never suggests or adjusts position size
 
 **ADX Half-Size Rule (active Tier 1 risk control):**
-- Config key: `ADX_HALF_SIZE_THRESHOLD` (default: 20)
+- Config key: `ADX_HALF_SIZE_THRESHOLD` (default: 15)
 - When 1h ADX < `ADX_HALF_SIZE_THRESHOLD` **AND** score < 9.0 → position size halved
+- Three-tier system: ADX < 15 → no trade; ADX 15–20 → half-size; ADX ≥ 20 → full-size
 - Rationale: weak ADX with moderate score = weak trend conviction; reduce exposure
 - This is applied AFTER the primary size calculation, BEFORE the risk manager check
 - Do NOT remove this from position sizing logic
@@ -135,10 +137,10 @@ Claude is a deep market analyst and confirmation gate, not a direction or number
 **Model:** `claude-sonnet-4-6`, `max_tokens=AI_MAX_TOKENS` (default 4000), `timeout=30s`
 
 **When Claude is called — ALL conditions must be true simultaneously:**
-- `score >= MIN_AI_SCORE` (default 7)
+- `score >= MIN_AI_SCORE` (default 6)
 - `multi_timeframe_confluence()` returns True
-- `CONFLUENCE_REQUIRE_30M=True` (Tier 1 default): the 30m timeframe must be included in the confluence check and aligned with direction
 - `AI_STALE_TF_MINUTES=55`: higher-TF data (4h, 1h) must not be older than 55 minutes for inner-tick Claude calls — if stale, SKIP the call (REJECT equivalent, no cache written)
+- `multi_timeframe_confluence()` checks 3 timeframes: 4h EMA + 1h EMA + 15m MACD (30m and 5m removed as redundant/noisy)
 - No valid cached verdict: APPROVE within 60 min or REJECT within 30 min (fingerprint-keyed per asset + direction)
 - Hard minimum gap: `MIN_AI_CALL_GAP_MINUTES` (30 min) since last call for this asset
 
@@ -215,8 +217,7 @@ The 8-check risk manager is non-bypassable. These parameters and their defaults 
 8. `enforce_take_profit` — ensure TP ≥ 0.27% from entry (3× round-trip fee)
 
 **Additional Tier 1 risk controls (must not be removed):**
-- `ADX_HALF_SIZE_THRESHOLD=20` — halves position size when 1h ADX < 20 AND score < 9.0
-- `CONFLUENCE_REQUIRE_30M=True` — 30m alignment required before any Claude call
+- `ADX_HALF_SIZE_THRESHOLD=15` — halves position size when 1h ADX < 15–20 range AND score < 9.0 (no-trade gate: ADX < 15; half-size: ADX 15–20; full-size: ADX ≥ 20)
 - `AI_STALE_TF_MINUTES=55` — skip Claude call if higher-TF data is stale (inner-tick protection)
 
 **What must never happen:**
@@ -253,7 +254,14 @@ explain which rule is violated before proposing any alternative.
 | 2026-05-20 | CONFLUENCE_REQUIRE_30M + AI_STALE_TF_MINUTES documented formally | Rule 3, Rule 4 |
 | 2026-05-20 | TP tiers updated for 0–11 scale (score ≥10 → 2.5×ATR tier) | Rule 2 |
 | 2026-05-20 | Position size factor capped: min(score,10)/10 not score/10 | Rule 2 |
+| 2026-05-25 | ADX no-trade gate lowered: 20 → 15 (ADX 15–20 = half-size via ADX_HALF_SIZE_THRESHOLD) | Rule 2 |
+| 2026-05-25 | Score thresholds lowered: MIN_SIGNAL_SCORE 7→6, MIN_AI_SCORE 7→6, MIN_TRADE_SCORE 3→2 | Rule 1, Rule 3 |
+| 2026-05-25 | Score 6 TP tier added: score >= 6.0 → 1.6×ATR | Rule 2 |
+| 2026-05-25 | Session gate expanded: in-session until 20:00 UTC (was 17:00); off-session threshold 8.5→7.5 | Rule 4 |
+| 2026-05-25 | entry_confirmed() volume threshold lowered 1.2× → 0.7×; BUY logic AND→OR | Rule 1 |
+| 2026-05-25 | multi_timeframe_confluence() 0.05% MACD neutral zone — prevents near-zero false blocks | Rule 3 |
+| 2026-05-25 | ADX_HALF_SIZE_THRESHOLD default corrected: 20 → 15 in all config defaults | Rule 2, Rule 4 |
 
 ---
 
-*Architecture: CODE-FIRST HYBRID · Tier 1 production config · Last updated: 2026-05-20*
+*Architecture: CODE-FIRST HYBRID · Tier 1 production config · Last updated: 2026-05-25*

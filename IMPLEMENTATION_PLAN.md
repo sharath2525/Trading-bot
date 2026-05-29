@@ -17,7 +17,7 @@ This file is preserved as a historical record. The current architecture is docum
 - [x] Model: `claude-sonnet-4-6` (hardcoded in `decision_maker.py`)
 
 ### Direction Decision (`_code_decide_direction` in main.py)
-- [x] 1h ADX > 25 gate (moved upstream from `entry_confirmed`)
+- [x] 1h ADX ≥ 15 gate (moved upstream from `entry_confirmed`; ADX 15–20 = half-size)
 - [x] Daily bias check (1d candle direction must agree)
 - [x] BB width regime gate (`is_trending_regime()` — above 20-period median)
 
@@ -26,7 +26,7 @@ This file is preserved as a historical record. The current architecture is docum
 - [x] Volume bonus: +1.0 when 5m vol ≥ 1.5× 5-period average
 - [x] Candle pattern bonus: +0.5 for engulfing or hammer/pin bar
 - [x] Kronos-mini ML modifier: ±0.5 (optional, `src/indicators/kronos_forecast.py`)
-- [x] Signal logging to `signals.jsonl` for score ≥ 7.0
+- [x] Signal logging to `signals.jsonl` for score ≥ 6.0
 
 ### Pre-Trade Filters (`market_filter` in strategy.py)
 - [x] Time gate: block UTC 00:00–05:59
@@ -63,7 +63,7 @@ This file is preserved as a historical record. The current architecture is docum
 
 ### Claude Integration (`decision_maker.py`)
 - [x] Model: `claude-sonnet-4-6`, `max_tokens=4000`, `timeout=30s`
-- [x] Structured 5-factor analysis (each 1–5), VERDICT: APPROVE if TOTAL ≥ 18
+- [x] Structured 5-factor analysis (each 1–5), VERDICT: APPROVE if TOTAL ≥ 15
 - [x] 6 auto-reject conditions (RSI divergence, round S&R, funding, events, candle body <30%)
 - [x] Last 5 completed trades context from diary.jsonl
 - [x] Verdict cache: 60-min APPROVE / 30-min REJECT per asset

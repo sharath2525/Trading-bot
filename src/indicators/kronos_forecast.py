@@ -78,8 +78,18 @@ def get_kronos_modifier(candles: list, direction: str) -> float:
 
         # ChronosPipeline path only — AutoModel fallback removed (BUG-v7-P1)
         import torch  # type: ignore
+        import concurrent.futures as _cf
         _context = torch.tensor(_closes, dtype=torch.float32).unsqueeze(0)
-        _forecast = _kronos_pipeline.predict(_context, prediction_length=1)
+        # PERF-v10-7 FIX: per-call timeout so thermal throttle / memory pressure cannot
+        # block the Kronos thread indefinitely (only the pre-warm has a timeout otherwise).
+        try:
+            with _cf.ThreadPoolExecutor(max_workers=1) as _kex:
+                _forecast = _kex.submit(
+                    _kronos_pipeline.predict, _context, 1
+                ).result(timeout=30)
+        except _cf.TimeoutError:
+            logging.warning("[KRONOS] inference timed out after 30s — returning 0.0")
+            return 0.0
         # predict() returns a tensor of shape (batch, num_samples, prediction_length)
         _forecast_val = float(_forecast[0].mean().item())
 

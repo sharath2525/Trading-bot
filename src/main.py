@@ -543,8 +543,14 @@ def main():
     invocation_count = 0
     trade_log = deque(maxlen=200)  # BUG-7 FIX: bounded — was an unbounded list, never read (Sharpe uses diary.jsonl)
     active_trades = load_active_trades()  # {'asset','is_long','amount','entry_price','tp_oid','sl_oid','exit_plan'}
-    diary_path = "diary.jsonl"
-    decisions_path = "decisions.jsonl"
+    # PERF-v10-8 FIX: Use absolute paths so log rotation and writes land in the correct
+    # directory regardless of CWD (matches the absolute-path fix in decision_maker.py).
+    _MAIN_PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    diary_path = os.path.join(_MAIN_PROJECT_ROOT, "diary.jsonl")
+    decisions_path = os.path.join(_MAIN_PROJECT_ROOT, "decisions.jsonl")
+    _llm_log_path = os.path.join(_MAIN_PROJECT_ROOT, "llm_requests.log")
+    _prompts_log_path = os.path.join(_MAIN_PROJECT_ROOT, "prompts.log")
+    _signals_path = os.path.join(_MAIN_PROJECT_ROOT, "signals.jsonl")
     initial_account_value = None
     # Perp mid-price history sampled each loop (authoritative, avoids spot/perp basis mismatch)
     price_history = {}
@@ -710,8 +716,10 @@ def main():
                                     continue
                             except Exception:
                                 pass
-                        # Closing fill is opposite direction to the entry
-                        _fbuy = bool(_fill.get('isBuy', False))
+                        # LB-v10-3 FIX: get_recent_fills() normalizes to snake_case 'is_buy';
+                        # the original API may return camelCase 'isBuy'. Use dual-lookup so
+                        # neither normalization path silently mismatches every fill direction.
+                        _fbuy = bool(_fill.get('is_buy', _fill.get('isBuy', False)))
                         if is_long and _fbuy:
                             continue   # long is closed by a sell fill
                         if not is_long and not _fbuy:
@@ -938,9 +946,9 @@ def main():
             # E-4 / V3-HIGH-1 FIX: Rotate unbounded log files before they fill the disk.
             _rotate_if_needed(diary_path)
             _rotate_if_needed(decisions_path)
-            _rotate_if_needed("llm_requests.log")   # V3-HIGH-1: was missed in E-4 fix
-            _rotate_if_needed("prompts.log")
-            _rotate_if_needed("signals.jsonl")      # BUG-v7-P5 FIX: was omitted; can grow to GB without rotation
+            _rotate_if_needed(_llm_log_path)    # PERF-v10-8: was relative path
+            _rotate_if_needed(_prompts_log_path)  # PERF-v10-8: was relative path
+            _rotate_if_needed(_signals_path)     # BUG-v7-P5 FIX: was omitted; can grow to GB without rotation
 
             positions = []
             for pos_wrap in state.get('positions', []):
@@ -962,6 +970,19 @@ def main():
 
             # --- RISK: Force-close positions that exceed max loss ---
             try:
+                # LB-v10-2 FIX: Alert on positions where price lookup returned 0 (pnl_unknown).
+                # check_losing_positions() sees pnl=0 for these and never triggers — alert operator.
+                for _pnl_unk in state.get('positions', []):
+                    if _pnl_unk.get("pnl_unknown"):
+                        _unk_coin = _pnl_unk.get("coin", "?")
+                        logging.warning(
+                            "[FORCE-CLOSE BLIND] %s price=0 after all retries — cannot assess loss. MANUAL CHECK REQUIRED.",
+                            _unk_coin,
+                        )
+                        await send_alert(
+                            f"🚨 [FORCE-CLOSE BLIND] {_unk_coin} price lookup failed — loss unknown, "
+                            f"force-close protection DISABLED. Check position manually on Hyperliquid."
+                        )
                 positions_to_close = risk_mgr.check_losing_positions(state.get('positions', []))
                 for ptc in positions_to_close:
                     coin = ptc["coin"]
@@ -972,6 +993,12 @@ def main():
                         # the force-close, leaving the position open past the loss threshold.
                         await hyperliquid.market_close(coin)
                         await hyperliquid.cancel_all_orders(coin)
+                        # LB-v10-6 FIX: Transition to COOLDOWN (not IDLE) so the bot cannot
+                        # immediately re-enter on the same adverse trend that triggered force-close.
+                        state_mgr.start_cooldown(
+                            coin,
+                            interval_seconds=int(CONFIG.get("cooldown_minutes") or 30) * 60,
+                        )
                         # Remove from active trades and log the close event
                         for tr in active_trades[:]:
                             if tr.get('asset') == coin:
@@ -1058,6 +1085,22 @@ def main():
                         continue  # TP1 order still live
                     if _tp1_tr_asset not in assets_with_positions:
                         continue  # full exit — handled by reconcile loop above
+                    # LB-v10-5 FIX: If price gapped through both TP1 and TP2 in one candle,
+                    # the position is already fully flat. Check TP2 OID too — if both are
+                    # gone and no position exists, the reconcile loop handles the full close.
+                    # Only mark tp1_hit when position truly still exists (already guarded above).
+                    _tp2_tr_oid = _tp1_tr.get("tp2_oid")
+                    _tp2_still_open = _tp2_tr_oid and any(
+                        str(o.get("oid")) == str(_tp2_tr_oid) for o in (open_orders or [])
+                    )
+                    if not _tp2_still_open and _tp2_tr_oid:
+                        # TP2 OID is also gone → both filled simultaneously.
+                        # Don't mark tp1_hit; reconcile loop already removed this from active_trades.
+                        logging.info(
+                            "[TP1+TP2 RACE] %s both TP orders gone simultaneously — full close handled by reconcile",
+                            _tp1_tr_asset,
+                        )
+                        continue
                     # TP1 filled: partial close of 50%. Update tracked amount for guardian.
                     _new_amount = float(_tp1_tr.get("half_size") or float(_tp1_tr.get("amount", 0)) / 2)
                     _tp1_tr["tp1_hit"]  = True
@@ -1215,14 +1258,23 @@ def main():
                 if _g_amount <= 0:
                     logging.warning("[GUARDIAN] %s: zero amount in diary — cannot re-place", _g_asset)
                     continue
-                # P3-M1: Re-place TP1/TP2 (two-stage exit) when both are missing from exchange
-                # Only re-place the two-stage pair when neither is present to avoid double-orders
-                _g_has_tp1 = any(
-                    o.get('coin') == _g_asset
+                # LB-v10-1 FIX: Count live TP orders and use tp1_hit state to determine
+                # the EXPECTED count so TP1 and TP2 are re-placed independently.
+                # Old code: single _g_has_tp1 flag → TP2 permanently orphaned when TP1
+                # is present but TP2 was dropped (e.g. connection reset between two places).
+                # Fix: expected TPs = 2 before TP1 fires, = 1 after TP1 fires.
+                # Re-place TP1 only when tp1 not yet hit AND no TPs present.
+                # Re-place TP2 independently whenever live count < expected count.
+                _g_tp_count = sum(
+                    1 for o in (open_orders or [])
+                    if o.get('coin') == _g_asset
                     and isinstance(o.get('orderType'), dict)
                     and (o.get('orderType', {}).get('trigger') or {}).get('tpsl') == 'tp'
-                    for o in (open_orders or [])
                 )
+                _g_tp1_hit = (_g_active_tr or {}).get('tp1_hit', False)
+                _g_expected_tp_count = 1 if _g_tp1_hit else 2
+                _g_has_tp1 = _g_tp1_hit or _g_tp_count >= 1  # TP1 satisfied if already hit or still open
+                _g_has_tp2 = _g_tp_count >= _g_expected_tp_count  # TP2 present iff live count meets expectation
                 if not _g_has_tp1 and _g_tp1_px and _g_half > 0:
                     try:
                         _g_tp1_res = await hyperliquid.place_take_profit(_g_asset, _g_is_long, _g_half, float(_g_tp1_px))
@@ -1234,7 +1286,7 @@ def main():
                         save_active_trades(active_trades)
                     except Exception as _g_tp1_err:
                         add_event(f"[GUARDIAN] {_g_asset} TP1 re-place failed: {_g_tp1_err}")
-                if not _g_has_tp1 and _g_tp2_px and _g_half > 0:
+                if not _g_has_tp2 and _g_tp2_px and _g_half > 0:
                     try:
                         _g_tp2_res = await hyperliquid.place_take_profit(_g_asset, _g_is_long, _g_half, float(_g_tp2_px))
                         _g_tp2_oid = (hyperliquid.extract_oids(_g_tp2_res) or [None])[0]
@@ -1776,7 +1828,7 @@ def main():
                     # Signal logging — log ALL scores ≥5.0 for diagnostics (not just ≥7.0)
                     if _score >= 5.0:
                         try:
-                            with open("signals.jsonl", "a", encoding="utf-8") as _sf:
+                            with open(_signals_path, "a", encoding="utf-8") as _sf:
                                 _sf.write(json.dumps({
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
                                     "asset": _asset,
@@ -1898,7 +1950,7 @@ def main():
                 # Signal logging — log approved trades to signals.jsonl for win-rate analysis (#78)
                 try:
                     import json as _sjson
-                    with open("signals.jsonl", "a", encoding="utf-8") as _sf:
+                    with open(_signals_path, "a", encoding="utf-8") as _sf:
                         _sf.write(_sjson.dumps({
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                             "asset": _asset,
@@ -2063,7 +2115,7 @@ def main():
                             # P4-E-2: log filter-blocked signals so win-rate analysis captures all score≥7 signals
                             try:
                                 import json as _fsjson
-                                with open("signals.jsonl", "a", encoding="utf-8") as _fsf:
+                                with open(_signals_path, "a", encoding="utf-8") as _fsf:
                                     _fsf.write(_fsjson.dumps({
                                         "timestamp": datetime.now(timezone.utc).isoformat(),
                                         "asset": asset, "direction": action,
@@ -2086,7 +2138,7 @@ def main():
                             # P4-E-2: log entry-confirmation blocks
                             try:
                                 import json as _ecjson
-                                with open("signals.jsonl", "a", encoding="utf-8") as _ecf:
+                                with open(_signals_path, "a", encoding="utf-8") as _ecf:
                                     _ecf.write(_ecjson.dumps({
                                         "timestamp": datetime.now(timezone.utc).isoformat(),
                                         "asset": asset, "direction": action,
@@ -2902,6 +2954,17 @@ def main():
                                         logging.info("[INNER LIMIT] %s no position found after cancel failure — aborting entry", _ia)
                                         state_mgr.set_state(_ia, TradeStateMachine.IDLE)
                                         continue
+                                    # LB-v10-4 FIX: Use actual exchange position size, not
+                                    # original order size. Cancel may have partially propagated
+                                    # leaving a partial fill — using _iamt would size SL wrong.
+                                    _ice_pos_obj = next(
+                                        (p for p in (_ice_positions or []) if p.get("coin") == _ia),
+                                        None,
+                                    )
+                                    _ice_actual_sz = abs(float((_ice_pos_obj or {}).get("szi") or 0))
+                                    if _ice_actual_sz > 0:
+                                        _i_filled_qty = _ice_actual_sz
+                                        logging.info("[INNER LIMIT] %s cancel-fail: using exchange position size %.6f for SL", _ia, _ice_actual_sz)
                                     logging.warning("[INNER LIMIT] %s position exists despite cancel failure — recording as ENTERED (SL orphan check covers)", _ia)
                                     await send_alert(f"⚠️ [{_ia}] limit cancel failed but position open — SL deferred to orphan check next tick")
                                 except Exception as _ice2:
@@ -2966,6 +3029,11 @@ def main():
                         # CRITICAL-8: record_entry (state.json) BEFORE save_active_trades
                         state_mgr.record_entry(_ia)
                         save_active_trades(active_trades)
+                        # CHAOS-v10-6 FIX: Re-check circuit breaker after each trade so a loss
+                        # that trips the breaker mid-loop blocks all remaining sibling assets.
+                        if risk_mgr.circuit_breaker_active:
+                            logging.warning("[INNER CB] circuit breaker tripped after %s trade — aborting inner loop", _ia)
+                            break
                         # MEDIUM-2: refresh date inside inner loop to handle UTC midnight crossing
                         _today_utc = datetime.now(timezone.utc).date()
                         if _today_utc != _last_daily_reset:
@@ -2996,7 +3064,7 @@ def main():
                         _save_diary_index(_diary_index)
                         # P4-E-1: Log inner-loop approved trades to signals.jsonl for win-rate analysis
                         try:
-                            with open("signals.jsonl", "a", encoding="utf-8") as _isf:
+                            with open(_signals_path, "a", encoding="utf-8") as _isf:
                                 _isf.write(json.dumps({
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
                                     "asset": _ia,

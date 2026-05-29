@@ -24,11 +24,11 @@ Code makes every trade decision. Claude performs full structured market analysis
 **Inner loop (12 ticks/hour at 5-minute intervals):**
 
 For each asset on every tick, in strict order:
-1. `_code_decide_direction()` — 4h EMA + 1h ADX>25 + daily bias + BB width regime; returns `"buy"`, `"sell"`, or None
-2. `compute_signal_score()` — weighted float 0–10 + bonuses (volume +1.0, candle pattern +0.5, Kronos ±0.5); HOLD if < 7
+1. `_code_decide_direction()` — 4h EMA + 1h ADX≥15 + daily bias + BB width regime; returns `"buy"`, `"sell"`, or None
+2. `compute_signal_score()` — weighted float 0–10 + bonuses (volume +1.0, candle pattern +0.5, Kronos ±0.5); HOLD if < 6
 3. Daily cap check — HOLD if `_daily_trade_count >= MAX_DAILY_TRADES` (20)
 4. SL cooldown check — HOLD if within `COOLDOWN_MINUTES` (30) of last SL hit
-5. `multi_timeframe_confluence()` + `confirm_trade()` — Claude structured analysis, APPROVE if ≥18/25
+5. `multi_timeframe_confluence()` + `confirm_trade()` — Claude structured analysis, APPROVE if ≥15/25
 6. `market_filter()` — ATR, spread, time gate (00:00–06:00 UTC), weekend gate, BTC correlation, S&R, funding
 7. `entry_confirmed()` — 15m/5m RSI, ADX, volume, near-EMA, stale-setup check
 8. Candle close gate — 85% of 5m candle must be elapsed
@@ -55,10 +55,10 @@ Direction is determined entirely by code. Claude never sets direction.
 | Candle pattern | +0.5 | bullish engulfing or hammer | bearish engulfing or pin bar |
 | Kronos modifier | ±0.5 | Kronos-mini agrees (optional) | — |
 
-**Score tiers (all entries at ≥7 require Claude APPROVE when confluence fires):**
-- `< 7.0` → HOLD (no trade, no Claude)
-- `≥ 7.0` without multi-TF confluence → continue to market_filter/entry_confirmed directly
-- `≥ MIN_AI_SCORE (7.0)` AND confluence True → Claude full analysis gate first
+**Score tiers (all entries at ≥6 require Claude APPROVE when confluence fires):**
+- `< 6.0` → HOLD (no trade, no Claude)
+- `≥ 6.0` without multi-TF confluence → continue to market_filter/entry_confirmed directly
+- `≥ MIN_AI_SCORE (6.0)` AND confluence True → Claude full analysis gate first
 
 **Achievable base values:** 0, 1.5, 2, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8, 8.5, 10
 (Score 9 base is mathematically unreachable. Any ≥7 requires `trend_4h` aligned.)
@@ -72,7 +72,7 @@ Direction is determined entirely by code. Claude never sets direction.
 | Gate | Condition |
 |------|-----------|
 | 4h EMA trend | EMA20 aligned with direction |
-| 1h ADX > 25 | Market is trending, not ranging |
+| 1h ADX ≥ 15 | Market is trending (ADX < 15 → HOLD; ADX 15–20 → half-size) |
 | Daily bias | 1d candle direction agrees |
 | BB width regime | BB width above 20-period median |
 
@@ -86,7 +86,7 @@ Code sets all levels — Claude never touches them.
 |-------|---------|---------|
 | TP1 | entry ± 1×ATR | Close 50% (lock profit) |
 | TP2 | entry ± 3×ATR | Close remaining 50% (let winner run) |
-| tp_main | score-adaptive: 1.8–2.5×ATR | Primary trigger order multiplier |
+| tp_main | score-adaptive: 1.6–2.5×ATR (score≥6→1.6×, ≥7→1.8×, ≥8→2.0×, ≥9→2.2×, ≥10→2.5×) | Primary trigger order multiplier |
 | SL | entry ∓ 1×ATR | Always 1:1 risk per trade |
 | Trailing | Breakeven at +1×ATR; trail at +1.5×ATR | Protect open profit |
 
@@ -169,19 +169,18 @@ INTERVAL=1h
 MAX_TRADE_HOURS=12
 
 # ── SCORE SYSTEM (THREE SEPARATE KEYS — never merge) ──────────
-MIN_TRADE_SCORE=3        # Used ONLY by entry_confirmed() — 0-5 integer system
-MIN_SIGNAL_SCORE=7       # Used ONLY by main loop pre-gate — 0-10 weighted float
-MIN_AI_SCORE=7           # Minimum score to trigger Claude structured analysis
+MIN_TRADE_SCORE=2        # Used ONLY by entry_confirmed() — 0-5 integer system
+MIN_SIGNAL_SCORE=6       # Used ONLY by main loop pre-gate — 0-11 weighted float
+MIN_AI_SCORE=6           # Minimum score to trigger Claude structured analysis
 
 # ── AI ANALYSIS CONTROLS ──────────────────────────────────────
 AI_MAX_TOKENS=4000              # Max tokens for Claude 5-factor analysis
 AI_APPROVE_CACHE_MINUTES=60     # Cache APPROVE verdicts 60 min per asset
 AI_REJECT_CACHE_MINUTES=30      # Cache REJECT verdicts 30 min
 MIN_AI_CALL_GAP_MINUTES=30      # Hard gap between Claude calls per asset
-CONFLUENCE_REQUIRE_30M=true     # Require 30m TF in confluence gate
 AI_STALE_TF_MINUTES=55          # Skip Claude if higher-TF data older than this
 NEWS_FETCH_ENABLED=true         # Fetch macro events + headlines for Claude context
-ADX_HALF_SIZE_THRESHOLD=20      # Half position size if 1h ADX below this
+ADX_HALF_SIZE_THRESHOLD=20      # Half position size if 1h ADX below this (no-trade gate: ADX < 15)
 
 # ── EXECUTION CONTROLS ────────────────────────────────────────
 TAKER_FEE_PCT=0.00045   # 0.045% per side — used in TP/SL fee buffer + risk manager

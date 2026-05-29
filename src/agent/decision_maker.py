@@ -9,11 +9,24 @@ They implemented the pre-2026-04-30 Claude-as-decision-engine architecture and
 violated MASTER RULE 2. confirm_trade() below is the only active method.
 """
 
+import os
 import re
+import threading
 import anthropic
 from src.config_loader import CONFIG
 import logging
 from datetime import datetime, timezone
+
+# SEC-v10-7 FIX: Use absolute paths anchored to project root so logs land in the
+# correct directory regardless of CWD (systemd, Docker, etc. may set CWD to /).
+_PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+_LLM_LOG_PATH = os.path.join(_PROJECT_ROOT, "llm_requests.log")
+_PROMPTS_LOG_PATH = os.path.join(_PROJECT_ROOT, "prompts.log")
+
+# PERF-v10-6 FIX: Serialize log writes across concurrent confirm_trade() calls
+# (asyncio.to_thread dispatches multiple Claude calls simultaneously when ≥2 assets
+# are in confluence; without a lock, writes interleave and garble log entries).
+_LOG_WRITE_LOCK = threading.Lock()
 
 
 class TradingAgent:
@@ -45,13 +58,24 @@ class TradingAgent:
         try:
             import json as _rj
             import os as _os
+            from collections import deque as _deque
             # BUG-P9-8 FIX: Use absolute path so diary.jsonl is found regardless of CWD.
             # Relative path fails silently when launched via systemd or from a different dir.
             _diary_path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "diary.jsonl")
             if _os.path.exists(_diary_path):
+                # PERF-v10-4 FIX: Stream the file rather than loading all lines into memory.
+                # Keep a fixed-size deque of the last 5 matching lines — O(n) I/O but O(1) memory.
+                _asset_trades = _deque(maxlen=5)
                 with open(_diary_path, "r") as _rf:
-                    _all_lines = [_rj.loads(l) for l in _rf if l.strip()]
-                _asset_trades = [t for t in _all_lines if t.get("asset") == asset][-5:]
+                    for _line in _rf:
+                        if not _line.strip():
+                            continue
+                        try:
+                            _t = _rj.loads(_line)
+                            if _t.get("asset") == asset:
+                                _asset_trades.append(_t)
+                        except Exception:
+                            pass
                 if _asset_trades:
                     _recent_trades_ctx = "\n".join(
                         f"  {t.get('timestamp','?')[:16]} {t.get('action','?').upper()} "
@@ -246,19 +270,20 @@ class TradingAgent:
             logging.info("[CONFIRM] %s score=%.1f direction=%s verdict=%s confidence=%s cost=$%.5f",
                          asset, score, direction, verdict, confidence, cost_usd)
 
-            with open("llm_requests.log", "a", encoding="utf-8") as _lf:
-                _lf.write(
-                    f"\n=== MARKET ANALYSIS {asset} score={score:.1f} {_now_utc} ===\n"
-                    f"direction={direction} verdict={verdict} confidence={confidence}/10\n"
-                    f"input_tokens={input_tokens} output_tokens={output_tokens} cost=${cost_usd:.5f}\n"
-                    f"--- ANALYSIS ---\n{answer}\n"
-                    f"{'='*60}\n"
-                )
-            with open("prompts.log", "a", encoding="utf-8") as _pl:
-                _pl.write(
-                    f"\n=== CONFIRM PROMPT {asset} {_now_utc} ===\n{_user}\n"
-                    f"=== RESPONSE ===\n{answer}\n{'='*60}\n"
-                )
+            with _LOG_WRITE_LOCK:
+                with open(_LLM_LOG_PATH, "a", encoding="utf-8") as _lf:
+                    _lf.write(
+                        f"\n=== MARKET ANALYSIS {asset} score={score:.1f} {_now_utc} ===\n"
+                        f"direction={direction} verdict={verdict} confidence={confidence}/10\n"
+                        f"input_tokens={input_tokens} output_tokens={output_tokens} cost=${cost_usd:.5f}\n"
+                        f"--- ANALYSIS ---\n{answer}\n"
+                        f"{'='*60}\n"
+                    )
+                with open(_PROMPTS_LOG_PATH, "a", encoding="utf-8") as _pl:
+                    _pl.write(
+                        f"\n=== CONFIRM PROMPT {asset} {_now_utc} ===\n{_user}\n"
+                        f"=== RESPONSE ===\n{answer}\n{'='*60}\n"
+                    )
 
             return verdict
         except Exception as _e:
