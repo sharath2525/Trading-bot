@@ -81,9 +81,38 @@ class TradeStateMachine:
         try:
             with open(self._state_file, "r") as f:
                 payload = json.load(f)
-            self._states = payload.get("states", {})
-            self._cooldown_until = {k: float(v) for k, v in payload.get("cooldown_until", {}).items()}
-            self._entry_time = {k: float(v) for k, v in payload.get("entry_time", {}).items()}
+
+            # HIGH-1 FIX: Validate structural integrity after JSON parse. Valid JSON with a
+            # null/wrong-type "states" key (e.g. written during a crash mid-serialization)
+            # would previously set self._states=None, causing AttributeError on first access
+            # and masking re-entry on open exchange positions. Fail hard on bad structure.
+            _raw_states = payload.get("states", {})
+            _raw_cooldown = payload.get("cooldown_until", {})
+            _raw_entry = payload.get("entry_time", {})
+            if not isinstance(_raw_states, dict):
+                raise ValueError(
+                    f"'states' field is {type(_raw_states).__name__}, expected dict. "
+                    "state.json is structurally corrupt."
+                )
+            if not isinstance(_raw_cooldown, dict):
+                raise ValueError(
+                    f"'cooldown_until' field is {type(_raw_cooldown).__name__}, expected dict."
+                )
+            if not isinstance(_raw_entry, dict):
+                raise ValueError(
+                    f"'entry_time' field is {type(_raw_entry).__name__}, expected dict."
+                )
+            # Validate each state value is a known string constant
+            _valid_states = {self.IDLE, self.ENTERED, self.COOLDOWN}
+            for _asset, _st in _raw_states.items():
+                if _st not in _valid_states:
+                    raise ValueError(
+                        f"Unknown state '{_st}' for asset '{_asset}' — expected one of {_valid_states}."
+                    )
+
+            self._states = _raw_states
+            self._cooldown_until = {k: float(v) for k, v in _raw_cooldown.items()}
+            self._entry_time = {k: float(v) for k, v in _raw_entry.items()}
             # Expire any cooldowns that already passed while the bot was down
             now = time.time()
             expired = [a for a, t in self._cooldown_until.items() if t <= now]
@@ -102,6 +131,17 @@ class TradeStateMachine:
             # Force a clean exit so the operator can manually inspect and repair state.json.
             logging.critical(
                 "[STATE] FATAL: state.json is corrupt (JSON parse error: %s). "
+                "Refusing to start to prevent re-entry on existing open positions. "
+                "Inspect '%s', fix or delete it, then restart.",
+                e, self._state_file,
+            )
+            import sys as _state_sys
+            _state_sys.exit(1)
+        except ValueError as e:
+            # HIGH-1 FIX: Structurally corrupt state.json (valid JSON, wrong types/values).
+            # Same risk as JSONDecodeError — halt to prevent re-entry on open positions.
+            logging.critical(
+                "[STATE] FATAL: state.json has invalid structure: %s. "
                 "Refusing to start to prevent re-entry on existing open positions. "
                 "Inspect '%s', fix or delete it, then restart.",
                 e, self._state_file,

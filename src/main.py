@@ -294,11 +294,15 @@ def _code_compute_tpsl(entry: float, atr: float, direction: str, score: float = 
     does not erode TP1 on positions held through a single funding window.
     """
     fee_buffer = entry * float(CONFIG.get("taker_fee_pct") or 0.00045) * 2
-    # One funding interval (8h) worst-case buffer; only applied when funding_rate is adverse
-    # For BUY: positive funding_rate means longs pay → add to TP; negative → shorts pay, ignore
-    # For SELL: negative funding_rate means shorts pay → add to TP; positive → longs pay, ignore
-    _fr = abs(float(funding_rate or 0))
-    funding_buffer = entry * _fr if _fr > 0 else 0.0
+    # MED-1 FIX: funding buffer is only applied when funding is ADVERSE (costs us money).
+    # abs() was discarding the sign, applying the buffer even when funding is favorable.
+    # BUY  + positive funding_rate → longs pay → adverse → add buffer to make TP harder to reach
+    # BUY  + negative funding_rate → longs receive → favorable → no buffer (TP already closer)
+    # SELL + negative funding_rate → shorts pay → adverse → add buffer (TP is lower for sells)
+    # SELL + positive funding_rate → shorts receive → favorable → no buffer
+    _fr = float(funding_rate or 0)
+    _adverse = (_fr > 0 and direction == "buy") or (_fr < 0 and direction == "sell")
+    funding_buffer = entry * abs(_fr) if _adverse else 0.0
 
     if score >= 10.0:
         tp_mult = 2.5
@@ -387,10 +391,23 @@ def _build_confluence_fingerprint(asset: str, direction: str,
 async def _fetch_macro_context() -> dict:
     """Fetch economic calendar events and news headlines from free RSS feeds.
 
-    Timeout: 3 seconds per feed. Returns empty lists on any failure — never blocks trading.
+    MED-3/PERF-1 FIX: All feeds are now fetched concurrently via asyncio.gather().
+    Old sequential fetch had a 9-second worst-case delay (3 feeds × 3s timeout each).
+    Concurrent fetch reduces worst case to a single 3-second timeout.
+
+    MED-4/SEC-1 FIX: defusedxml used instead of stdlib xml.etree to prevent XML bomb
+    (billion-laughs) attacks from compromised or MITM-intercepted RSS feeds.
+    Falls back to stdlib ET if defusedxml is not installed (logs WARNING once).
     """
-    import xml.etree.ElementTree as ET
     import aiohttp as _aiohttp
+    try:
+        import defusedxml.ElementTree as ET  # type: ignore  # pip install defusedxml
+    except ImportError:
+        import xml.etree.ElementTree as ET  # type: ignore
+        logging.warning(
+            "[MACRO] defusedxml not installed — using stdlib xml.etree (XML bomb risk). "
+            "Install with: pip install defusedxml"
+        )
 
     context: dict = {
         "events": [],
@@ -408,25 +425,39 @@ async def _fetch_macro_context() -> dict:
         ("https://feeds.reuters.com/reuters/businessNews", "headlines", "[Reuters]"),
     ]
 
+    async def _fetch_one(sess, url, bucket, prefix):
+        try:
+            async with sess.get(
+                url,
+                timeout=_aiohttp.ClientTimeout(total=3),
+                headers=_headers,
+            ) as _resp:
+                _text = await _resp.text()
+                _root = ET.fromstring(_text)
+                _items = []
+                for _item in _root.iter("item"):
+                    _title = (_item.findtext("title") or "").strip()
+                    if _title:
+                        _items.append(f"{prefix} {_title}")
+                    if len(_items) >= 8:
+                        break
+                return bucket, _items
+        except Exception as _fe:
+            logging.debug("[MACRO] feed %s failed: %s", url, _fe)
+            return bucket, []
+
     try:
         async with _aiohttp.ClientSession() as _sess:
-            for _url, _bucket, _prefix in _feeds:
-                try:
-                    async with _sess.get(
-                        _url,
-                        timeout=_aiohttp.ClientTimeout(total=3),
-                        headers=_headers,
-                    ) as _resp:
-                        _text = await _resp.text()
-                        _root = ET.fromstring(_text)
-                        for _item in _root.iter("item"):
-                            _title = (_item.findtext("title") or "").strip()
-                            if _title:
-                                context[_bucket].append(f"{_prefix} {_title}")
-                            if len(context[_bucket]) >= 8:
-                                break
-                except Exception as _fe:
-                    logging.debug("[MACRO] feed %s failed: %s", _url, _fe)
+            _results = await asyncio.gather(
+                *(_fetch_one(_sess, url, bucket, prefix) for url, bucket, prefix in _feeds),
+                return_exceptions=True,
+            )
+        for _r in _results:
+            if isinstance(_r, Exception):
+                logging.debug("[MACRO] gather error: %s", _r)
+                continue
+            _bucket, _items = _r
+            context[_bucket].extend(_items)
     except Exception as _se:
         logging.debug("[MACRO] session error: %s", _se)
 
@@ -625,7 +656,8 @@ def main():
         async def _update_stats(realized_pnl: float | None, exit_price: float | None,
                                 qty: float | None, entry_price: float | None = None) -> None:
             """Atomically update stats.json after every trade close."""
-            stats_path = "stats.json"
+            # LOW-1 FIX: Use absolute path (matches _MAIN_PROJECT_ROOT pattern for all other files).
+            stats_path = os.path.join(_MAIN_PROJECT_ROOT, "stats.json")
             async with _stats_lock:
                 try:
                     if os.path.exists(stats_path):
@@ -644,9 +676,11 @@ def main():
                         total = stats["total_trades"]
                         stats["win_rate"] = round(stats["wins"] / total, 4) if total > 0 else 0.0
                     # H-2 FIX: count both entry and exit fee legs (old code only counted exit).
+                    # Backtest-validity FIX: read fee from CONFIG so stats stay correct if fee changes.
+                    _fee_rate = float(CONFIG.get("taker_fee_pct") or 0.00045)
                     if exit_price and qty:
-                        _exit_fee = exit_price * qty * 0.00045
-                        _entry_fee = (entry_price or exit_price) * qty * 0.00045
+                        _exit_fee = exit_price * qty * _fee_rate
+                        _entry_fee = (entry_price or exit_price) * qty * _fee_rate
                         stats["total_fees"] = round(
                             stats.get("total_fees", 0.0) + _exit_fee + _entry_fee, 4
                         )
@@ -2592,15 +2626,25 @@ def main():
                         _pl_age_s = 999
                     if _pl_age_s < 240:  # give at least 4 min before cancelling (inner tick is 5 min)
                         continue
-                    # Check whether the limit filled and opened a position
-                    try:
-                        _pl_positions = await hyperliquid.get_positions()
+                    # Check whether the limit filled and opened a position.
+                    # MED-2/PERF-2 FIX: Reuse _orphan_all_positions fetched above instead of
+                    # issuing a second get_positions() call — eliminates duplicate REST call
+                    # that could exhaust rate budget before the more time-sensitive cancel check.
+                    if _orphan_all_positions is not None:
+                        _pl_positions = _orphan_all_positions
                         _pl_pos_exists = any(
                             p.get("coin") == _pl_asset and abs(float(p.get("szi") or 0)) > 0
-                            for p in (_pl_positions or [])
+                            for p in _pl_positions
                         )
-                    except Exception:
-                        _pl_pos_exists = False
+                    else:
+                        try:
+                            _pl_positions = await hyperliquid.get_positions()
+                            _pl_pos_exists = any(
+                                p.get("coin") == _pl_asset and abs(float(p.get("szi") or 0)) > 0
+                                for p in (_pl_positions or [])
+                            )
+                        except Exception:
+                            _pl_pos_exists = False
                     if _pl_pos_exists:
                         # Position opened — limit filled between ticks. Clear pending flags.
                         # SL orphan check (above this block) will place TP/SL on next tick.
@@ -2842,13 +2886,22 @@ def main():
                         _iact_ctx = next((m for m in market_sections if m.get("asset") == _ia), {})
                         _itrend_1d = asset_trends_1d.get(_ia, "UNKNOWN")
                         _iadx_1d = asset_adx_1d.get(_ia)
-                        _imacro_trending = _iadx_1d is not None and float(_iadx_1d) > 20
+                        # HIGH-2 FIX: Mirror BUG-v9-L4 fix from outer loop.
+                        # When 1d ADX is unavailable (< 14 daily candles), apply the daily
+                        # macro filter based on EMA trend alone — inner loop was silently
+                        # skipping the filter when ADX=None, allowing counter-trend entries
+                        # that the outer loop would have blocked.
+                        _imacro_trending = (
+                            (_iadx_1d is not None and float(_iadx_1d) > 20)
+                            or (_iadx_1d is None and _itrend_1d != "UNKNOWN")
+                        )
                         if _imacro_trending:
+                            _iadx_str = f"ADX={float(_iadx_1d):.1f}" if _iadx_1d is not None else "ADX=N/A (insufficient history)"
                             if _itrend_1d == "BEARISH" and _iout["action"] == "buy":
-                                logging.info("[INNER DAILY FILTER] %s BUY blocked — daily BEARISH", _ia)
+                                logging.info("[INNER DAILY FILTER] %s BUY blocked — daily BEARISH + %s", _ia, _iadx_str)
                                 continue
                             if _itrend_1d == "BULLISH" and _iout["action"] == "sell":
-                                logging.info("[INNER DAILY FILTER] %s SELL blocked — daily BULLISH", _ia)
+                                logging.info("[INNER DAILY FILTER] %s SELL blocked — daily BULLISH + %s", _ia, _iadx_str)
                                 continue
                         _iact_ctx_local = {**_iact_ctx, "candles_5m": asset_candles_5m.get(_ia, []), "_current_score": _iout.get("score", _iscr)}
                         _btc_trend_1h_inner = next(

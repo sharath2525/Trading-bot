@@ -354,11 +354,10 @@ class RiskManager:
         if alloc_usd <= 0:
             return False, "Zero or negative allocation", trade
 
-        # Hyperliquid minimum order size is $10
-        if alloc_usd < 11.0:
-            alloc_usd = 11.0
-            trade = {**trade, "allocation_usd": alloc_usd}
-            logging.info("RISK: Bumped allocation to $11 (Hyperliquid $10 minimum)")
+        # Hyperliquid minimum order size is $10.
+        # HIGH-3 FIX: Only bump to minimum AFTER the ATR cap is computed and applied.
+        # Bumping here (before ATR sizing) would override the 1% risk rule silently —
+        # moved minimum enforcement to AFTER the ATR cap check below.
 
         account_value = float(account_state.get("total_value", 0))
         balance = float(account_state.get("balance", 0))
@@ -408,13 +407,28 @@ class RiskManager:
             sizing_label = f"pct_cap=${pct_cap:.2f} (no sl_price, no entry_price — pct only)"
 
         if alloc_usd > max_alloc:
-            if max_alloc < 11.0:
-                max_alloc = 11.0
+            # HIGH-3 FIX: Do NOT bump max_alloc to $11 here — that overrides the ATR 1% risk
+            # rule (MASTER RULE 4) when ATR sizing computes a safe allocation below $11.
+            # The minimum-order bump is applied below, AFTER capping, as a separate step.
             logging.warning(
                 "RISK: Capping allocation from $%.2f to $%.2f (%s)",
                 alloc_usd, max_alloc, sizing_label,
             )
             alloc_usd = max_alloc
+            trade = {**trade, "allocation_usd": alloc_usd}
+
+        # Hyperliquid minimum order size is $10 (exchange hard requirement, non-negotiable).
+        # HIGH-3 FIX: Apply minimum bump AFTER ATR cap so it only affects cases where ATR
+        # sizing produces a valid but sub-$11 allocation. Log when this overrides ATR sizing
+        # so operators can tune risk parameters rather than silently exceeding the 1% rule.
+        if alloc_usd < 11.0:
+            if alloc_usd > 0:
+                logging.warning(
+                    "RISK: ATR sizing produced $%.2f — bumped to $11 minimum (Hyperliquid requirement). "
+                    "Consider widening SL or increasing account size to avoid minimum-bump overrides.",
+                    alloc_usd,
+                )
+            alloc_usd = 11.0
             trade = {**trade, "allocation_usd": alloc_usd}
 
         # 4. Total exposure
