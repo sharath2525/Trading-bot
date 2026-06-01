@@ -2,20 +2,16 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install dependencies directly (no poetry needed)
-RUN pip install --no-cache-dir \
-    hyperliquid-python-sdk \
-    anthropic \
-    python-dotenv \
-    aiohttp \
-    requests \
-    web3 \
-    rich
+# Copy requirements first for layer caching
+COPY requirements.txt .
 
-# Copy source
+# Install all dependencies from requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code
 COPY src ./src
 
-# API defaults
+# API defaults (override via docker run -e or --env-file .env)
 ENV APP_PORT=3000
 EXPOSE 3000
 

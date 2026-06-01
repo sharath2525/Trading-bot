@@ -2963,23 +2963,6 @@ def main():
     async def main_async():
         """Start the aiohttp server and kick off the trading loop."""
 
-        # CHAOS-v9-1 FIX: Pre-warm Kronos inside the running event loop.
-        # asyncio.ensure_future() called from sync main() (before asyncio.run) crashes on
-        # Python 3.12+ with RuntimeError("no running event loop"). Moved here so the task
-        # is created while the event loop is already running. CHAOS-v9-3: wrap with
-        # asyncio.wait_for(timeout=120) so a hung HuggingFace download on an air-gapped VPS
-        # doesn't block the thread pool indefinitely — times out gracefully after 2 minutes.
-        async def _prewarm_kronos():
-            try:
-                from src.indicators.kronos_forecast import _load_kronos
-                await asyncio.wait_for(asyncio.to_thread(_load_kronos), timeout=120)
-                logging.info("[KRONOS] pre-warm complete")
-            except asyncio.TimeoutError:
-                logging.warning("[KRONOS] pre-warm timed out after 120s (HuggingFace unreachable?) — modifier = 0.0")
-            except Exception as _kw_err:
-                logging.warning("[KRONOS] pre-warm error (non-fatal): %s", _kw_err)
-        asyncio.ensure_future(_prewarm_kronos())
-
         # Persist bot start date once (survives diary rotation — used by dashboard "Active Since")
         _started_path = pathlib.Path(__file__).parent.parent / "bot_started.json"
         if not _started_path.exists():

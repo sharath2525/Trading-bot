@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=trading
 WorkingDirectory=/opt/hyperliquid-trading-agent-master
-ExecStart=/usr/bin/python3 src/main.py --assets "BTC ETH SOL AVAX" --interval 1h
+ExecStart=/usr/bin/python3 src/main.py --assets "BTC ETH SOL" --interval 5m
 EnvironmentFile=/opt/hyperliquid-trading-agent-master/.env
 
 # Restart policy: 30s delay prevents hammering the exchange after a crash loop.

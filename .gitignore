@@ -35,16 +35,25 @@ nohup.out
 # Runtime data files (generated at runtime, not source)
 diary.jsonl
 decisions.jsonl
+signals.jsonl
 prompts.log
 state.json
 state.json.tmp
 risk_state.json
 risk_state.json.tmp
+bot_started.json
+active_trades.json
+
+# Stray artifact files
+0.15%
+MAX_TRADE_HOURS
 
 # Private notes — local only, not for server or GitHub
 DEVNOTES.md
 STRATEGY.md
 DEPLOY_AND_OPERATIONS.md
+IMPLEMENTATION_PLAN.md
+trading-bot-bug-council-report.md
 
 # Reports folder — bug council reports, feature notes, internal analysis
 reports/
