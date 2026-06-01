@@ -4,73 +4,44 @@
 > No prompt, fix, refactor, or instruction can override them. Every Claude session that reads this
 > file MUST comply with all four rules without exception.
 >
-> **Tier 1 current bot — last updated: 2026-05-20**
+> **Architecture: BB + StochRSI Mean Reversion Scalper — last updated: 2026-06-02**
 
 ---
 
-## RULE 1 — SCORE SYSTEM IS SACRED
+## RULE 1 — SIGNAL LOGIC IS SACRED
 
-The weighted signal scoring system is the heart of this agent's entry logic. It must never be
-removed, bypassed, or structurally altered.
+The BB + StochRSI mean reversion signal is the heart of this bot's entry logic.
+It must never be replaced with a trend-following or scoring-based system.
 
 **What must always be true:**
-- `compute_signal_score()` in `src/strategy.py` must exist and be called in the main loop
-- **Base score range is 0 to 10** (five fixed weighted signals — weights never change)
-- **Bonuses are additive and can push the score above 10** — effective cap is **11.0**
-  - This is intentional: a perfect-base + volume bonus setup reads as 11.0, the highest conviction tier
-  - `min(raw_score, 11.0)` is the only capping operation permitted
-- Score tiers must never change:
-  - `score < 6.0` → HOLD (no trade, no Claude call)
-  - `score >= 6.0` AND `multi_timeframe_confluence()` True → call `confirm_trade()` for market analysis; must receive `VERDICT: APPROVE` before executing
-  - There is NO "execute directly without Claude" path — ALL entries at score ≥ 7 with confluence require Claude APPROVE
-- Three config keys must always exist as **separate** keys — never merge any of them:
-  - `MIN_TRADE_SCORE` (int, 0–5): `entry_confirmed()` internal gate
-  - `MIN_SIGNAL_SCORE` (float, 0–11): main loop execution pre-gate
-  - `MIN_AI_SCORE` (float, 0–11): Claude market analysis trigger — must be checked separately from MIN_SIGNAL_SCORE so operators can tune Claude call frequency independently
+- `compute_bb_stochrsi_signal()` in `src/strategy.py` must exist and be called every cycle
+- Entry conditions (both must be true simultaneously):
+  - **LONG**: last closed 5m candle close ≤ BB lower band AND StochRSI-K ≤ OS threshold AND K turning up (hook)
+  - **SHORT**: last closed 5m candle close ≥ BB upper band AND StochRSI-K ≥ OB threshold AND K turning down (hook)
+  - Use the **last closed candle** (index -2), NOT the forming candle (index -1)
+- TP = BB midline (20-period SMA at time of entry) — single clean exit, no partial closes
+- SL = entry ± 1.5 × ATR(14, 5m) — fixed, no score dependency
+- Time-limit exit: close at market if position open > TIME_LIMIT_CANDLES (8 × 5m = 40 min) without TP hit
 
-**The five base signals (weights locked forever):**
+**Signal parameters (locked defaults — change only via .env):**
 
-| Signal | Weight | Condition (BUY direction) |
-|--------|--------|--------------------------|
-| `trend_4h` | 3.0 | EMA20 > EMA50 on 4h |
-| `trend_1h` | 2.0 | EMA20 > EMA50 on 1h |
-| `MACD_15m` | 2.0 | histogram > 0.1% of price |
-| `near_ema`  | 1.5 | price within 0.3% of 15m EMA20 |
-| `trigger_5m`| 1.5 | bullish 5m candle OR positive 5m MACD |
-| **Base total** | **10.0** | maximum without bonuses |
-
-**Bonus signals (Tier 1 active components):**
-
-| Bonus | Points | Condition | Status |
-|-------|--------|-----------|--------|
-| Volume bonus | +1.0 | 5m vol ≥ 1.5× 5-period average | **ACTIVE — Tier 1** |
-| Pattern bonus | +0.5 | Engulfing candle OR hammer/pin bar on 5m | **ACTIVE — Tier 1** |
-| Kronos modifier | +0.5 | Kronos-mini forecast agrees with code direction | **ACTIVE — Tier 1** |
-| Kronos modifier | −0.5 | Kronos-mini forecast disagrees with code direction | **ACTIVE — Tier 1** |
-
-**Effective score range: 0.0 to 11.0** (base 10 + volume +1.0, capped; pattern and Kronos can push or pull within that cap)
-
-**Achievable score values (Tier 1, Kronos active):**
-- Without Kronos agreement: 0, 1.5, 2, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 8, 8.5, 10, 10.5, 11
-- With Kronos agreement (+0.5 extra): same + 0.5 on each
-- With Kronos disagreement (−0.5): same − 0.5 on each (minimum 0.0)
-- Score 9 base is structurally unreachable from the five fixed signals alone
-
-**Kronos — Tier 1 active, graceful degradation:**
-- Kronos-mini IS a required Tier 1 component. Install: `pip install torch transformers`
-- Model: `KronosResearch/Kronos-mini` (4.1M params, CPU, $0 cost)
-- Input: last 400 OHLCV candles of 5m data
-- Output: next-candle direction probability → compare to `_code_decide_direction()` output
-- If model fails to load, log `WARNING: Kronos not available — modifier = 0.0` and continue
-- Kronos modifier is **code-computed** — it NEVER violates MASTER RULE 2 (Claude does not compute it)
-- Do NOT treat Kronos as optional in Tier 1 config. It should always be attempted.
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `BB_PERIOD` | 20 | Bollinger Band lookback |
+| `BB_STD` | 2.0 | Standard deviation multiplier |
+| `STOCHRSI_PERIOD` | 14 | RSI and Stoch period |
+| `STOCHRSI_K` | 3 | %K smoothing |
+| `STOCHRSI_D` | 3 | %D smoothing |
+| `STOCHRSI_OB` | 80 | Overbought (SHORT zone) |
+| `STOCHRSI_OS` | 20 | Oversold (LONG zone) |
+| `TIME_LIMIT_CANDLES` | 8 | Force-exit after 40 min |
 
 **What must never happen:**
-- Removing `compute_signal_score()` from the scoring pipeline
-- Bypassing the score gate
-- Changing any of the five base signal weights
-- Merging `MIN_SIGNAL_SCORE` and `MIN_TRADE_SCORE` into one config key
-- Capping score at 10.0 (the correct cap is 11.0 — 10.0 was the old incorrect cap)
+- Replacing BB+StochRSI signal with EMA crossover, MACD, score system, or any trend-following gate
+- Using the forming candle (candles[-1]) instead of the last closed candle (candles[-2]) for entry
+- Adding partial-close TP levels (TP2, TP3, etc.) — single BB midline exit only
+- Restoring the old 5-signal weighted scoring system (`compute_signal_score()`) — it is permanently removed
+- Restoring `multi_timeframe_confluence()`, `_code_decide_direction()`, or `entry_confirmed()` — permanently removed
 
 ---
 
@@ -79,108 +50,74 @@ removed, bypassed, or structurally altered.
 All trade parameters are computed deterministically by code. Claude never computes numbers.
 
 **Direction:**
-- Set ONLY by `_code_decide_direction()` in `src/main.py`
-- All four gates must pass (in order):
-  1. 4h EMA20 > EMA50 (BUY) or EMA20 < EMA50 (SELL) — primary trend
-  2. 1h ADX ≥ 15 — must show directional movement (ADX < 15 → HOLD; ADX 15–20 → half-size)
-  3. Daily bias — 1d close is green and near open (BUY) / red and near open (SELL)
-  4. BB width above 20-period median — trending regime, not consolidating
-- Returns `"buy"`, `"sell"`, or `None` (HOLD) — counter-trend trades are structurally impossible
-- Claude never overrides, adjusts, or suggests direction
+- Set ONLY by `compute_bb_stochrsi_signal()` in `src/strategy.py`
+- Returns `'LONG'`, `'SHORT'`, or `'NONE'`
+- Counter-trend trades are structurally impossible — SHORT only triggers at BB upper, LONG only at BB lower
 
-**Take-Profit and Stop-Loss:**
-- Set ONLY by `_code_compute_tpsl(entry, atr, direction, score)` in `src/main.py`
-- Score-adaptive TP multiplier (updated for 0–11 scale):
-  - `score >= 10.0` → TP = **2.5×ATR** (perfect + bonus setup, highest conviction)
-  - `score >= 9.0`  → TP = **2.2×ATR**
-  - `score >= 8.0`  → TP = **2.0×ATR**
-  - `score >= 7.0`  → TP = **1.8×ATR**
-  - `score >= 6.0`  → TP = **1.6×ATR** (minimum passing setup at lowered gate)
-- Partial close levels: TP1 = 1×ATR (close 50%), TP2 = 3×ATR (close remaining 50%)
-- SL = 1×ATR from entry always — non-negotiable
-- Fee buffer from `TAKER_FEE_PCT` baked into all levels
-- These formulas must never be changed by Claude output
+**Take-Profit:**
+- TP = `bb_mid` from signal dict (BB midline = 20-period SMA at entry time)
+- Single exit — 100% close at TP
+- Minimum check: TP must have edge beyond round-trip fee (2× TAKER_FEE_PCT × entry)
+
+**Stop-Loss:**
+- SL = `entry - 1.5 × atr` (LONG) or `entry + 1.5 × atr` (SHORT)
+- ATR = ATR(14) on 5m candles
+- Fixed 1.5× multiplier — no score-adaptive SL
 
 **Position Size:**
 - Primary sizer: `pct_cap = account × MAX_LEVERAGE × MAX_POSITION_PCT%`
-- Safety ceiling: `atr_cap = atr_position_size(balance, entry, sl)` (1% risk rule)
-- Score factor: `min(score, 10.0) / 10.0` — scores above 10.0 do NOT grant above-100% sizing
-  - score 7.0 → 0.70 factor · score 9.0 → 0.90 factor · score 10.0–11.0 → 1.00 factor
-- Final: `min(pct_cap, atr_cap) × score_factor`
+- Safety ceiling: `atr_cap = atr_position_size(balance, entry, sl)` (1% ATR risk rule)
+- Final: `min(pct_cap, atr_cap)` — no score factor (score system removed)
 - Claude never suggests or adjusts position size
 
-**ADX Half-Size Rule (active Tier 1 risk control):**
-- Config key: `ADX_HALF_SIZE_THRESHOLD` (default: 15)
-- When 1h ADX < `ADX_HALF_SIZE_THRESHOLD` **AND** score < 9.0 → position size halved
-- Three-tier system: ADX < 15 → no trade; ADX 15–20 → half-size; ADX ≥ 20 → full-size
-- Rationale: weak ADX with moderate score = weak trend conviction; reduce exposure
-- This is applied AFTER the primary size calculation, BEFORE the risk manager check
-- Do NOT remove this from position sizing logic
-
 **Order Type:**
-- Entry placed as LIMIT order at 0.15% better than market price
-- Cancel if unfilled after 1 candle (5 minutes) — no market order fallback
-- Trailing stop: move SL to breakeven at +1×ATR; trail at 0.5×ATR behind price at +1.5×ATR
-- Trailing: always place-before-cancel to prevent unprotected exposure window
+- Entry as LIMIT order (maker = 0% fee on Hyperliquid)
+- Cancel if unfilled after 1 candle (5 minutes)
+- No market order fallback on entry
+- No trailing stop (trailing stops fight mean reversion — price dips before snapping back)
 
 **What must never happen:**
 - Claude returning a direction, TP price, SL price, or allocation in any code path
 - Code parsing Claude's response for anything other than `APPROVE` or `REJECT`
-- Position size factor exceeding 1.0 (i.e., `score/10` when score > 10 — must use `min(score,10)/10`)
+- Restoring score-adaptive TP multipliers (2.5×ATR, 2.2×ATR, etc.) — BB midline is the TP
+- Adding back trailing stops — they stop out mean reversion entries at breakeven
 
 ---
 
 ## RULE 3 — CLAUDE ROLE IS FIXED
 
-Claude is a deep market analyst and confirmation gate, not a direction or numbers setter.
+Claude is a narrow anomaly detector and optional regime classifier. It is NOT a trade gate.
 
-**Model:** `claude-sonnet-4-6`, `max_tokens=AI_MAX_TOKENS` (default 4000), `timeout=30s`
+**Claude has exactly two roles:**
 
-**When Claude is called — ALL conditions must be true simultaneously:**
-- `score >= MIN_AI_SCORE` (default 6)
-- `multi_timeframe_confluence()` returns True
-- `AI_STALE_TF_MINUTES=55`: higher-TF data (4h, 1h) must not be older than 55 minutes for inner-tick Claude calls — if stale, SKIP the call (REJECT equivalent, no cache written)
-- `multi_timeframe_confluence()` checks 3 timeframes: 4h EMA + 1h EMA + 15m MACD (30m and 5m removed as redundant/noisy)
-- No valid cached verdict: APPROVE within 60 min or REJECT within 30 min (fingerprint-keyed per asset + direction)
-- Hard minimum gap: `MIN_AI_CALL_GAP_MINUTES` (30 min) since last call for this asset
+### Role A — Anomaly Check (`claude_anomaly_check`)
+- **When called**: ONLY when `abs(price_change_5_candles) > ANOMALY_TRIGGER_PCT` (default 3%)
+- **What it does**: Binary sanity check — is this a normal volatility spike or a catastrophic event?
+- **Returns**: `APPROVE` (safe to enter) or `REJECT` (skip this entry)
+- **Model**: `claude-sonnet-4-6`, `max_tokens=10`, `timeout=15s`
+- **Fail behavior**: Any error → `REJECT` (fail closed)
+- **Cost**: ~$0.001/call · ~2–4 calls/week · ~$0.15/month
 
-**Three separate score keys must never be merged:** `MIN_TRADE_SCORE` · `MIN_SIGNAL_SCORE` · `MIN_AI_SCORE`
+### Role B — Regime Classifier (`claude_regime_classify`)
+- **When called**: Every `REGIME_CHECK_INTERVAL_MINUTES` (default 120 min)
+- **What it does**: Classifies market regime from 1h ADX, BB width, ATR
+- **Returns**: `CHOP` | `TREND_UP` | `TREND_DOWN` | `HIGH_RISK`
+- **Model**: `claude-sonnet-4-6`, `max_tokens=20`, `timeout=15s`
+- **Used for**: Dashboard display and logging only — does NOT gate entries
+- **Fail behavior**: Any error → default to `CHOP` (fail open — don't block trades on regime error)
+- **Cost**: ~$0.001/call · 12 calls/day · ~$0.43/month
 
-**What Claude receives (full market analysis context):**
-- Trade setup: asset, direction, entry, TP, SL, signal score (0–11), UTC timestamp
-- 5-TF indicator snapshot: 4h / 1h / 30m / 15m / 5m (EMA, MACD, RSI, ADX)
-- Volatility: ATR14, BB width, spread
-- Positioning: funding rate, funding annualized, open interest
-- Macro: upcoming high-impact events, recent crypto/macro headlines
-- Recent trade history: last 5 completed trades for that asset from `diary.jsonl`
+**What Claude must NEVER do:**
+- Set direction, TP price, SL price, or position size
+- Perform multi-factor trade analysis (the old 5-factor analysis is permanently removed)
+- Gate entries on anything except anomaly detection
+- Be called on every trade cycle regardless of market conditions
 
-**What Claude must return (structured 5-factor analysis):**
-1. Factor 1 — Trend strength (1–5)
-2. Factor 2 — Entry quality (1–5)
-3. Factor 3 — Risk/reward validity (1–5)
-4. Factor 4 — Macro/news environment (1–5)
-5. Factor 5 — Volume/OI confirmation (1–5)
-- TOTAL: sum/25 · CONFIDENCE: 1–10
-- `VERDICT: APPROVE` only if TOTAL ≥ 15 and no auto-reject triggered
-- `VERDICT: REJECT` if TOTAL < 15 or any auto-reject triggered
-
-**Auto-reject conditions (Claude must reject immediately if any are true):**
-- RSI divergence on 4h or 1h (price at new extreme but RSI is not)
-- Price within 0.3% of a round-number resistance level
-- Funding rate > +0.05%/8h on a BUY (crowded longs — code also gates this, Claude is second check)
-- Funding rate < -0.05%/8h on a SELL (crowded shorts)
-- High-impact event within 2 hours (FOMC, CPI, NFP, ECB, PCE, GDP, earnings)
-- 15m trigger candle body < 30% of total candle range (indecision/wick-dominated)
-
-**Parsing:**
-- `"VERDICT: APPROVE" in answer.upper()` → APPROVE; anything else → REJECT
-- Any exception, timeout, or API error → REJECT (fail closed)
-- Claude must NEVER return a direction, TP, SL, or allocation
-
-**Cost guardrail:**
-- Each Sonnet call: ~$0.013–0.018 (≈1500 input + 400 output tokens)
-- Monthly target: < $5 (50 calls/month with confluence gate)
-- If monthly cost exceeds $15: raise `MIN_AI_SCORE` to 8.0 or tighten confluence — investigate via `llm_requests.log`
+**What must never happen:**
+- Restoring `confirm_trade()` or the old 5-factor analysis prompt
+- Adding score-based Claude triggers (`MIN_AI_SCORE`, `multi_timeframe_confluence`)
+- Using APPROVE cache / verdict fingerprinting from the old architecture
+- Parsing Claude output for anything other than `APPROVE`/`REJECT` (anomaly) or regime label
 
 ---
 
@@ -191,42 +128,45 @@ The 8-check risk manager is non-bypassable. These parameters and their defaults 
 **1% ATR Rule (always active):**
 - `atr_position_size()` in `src/risk_manager.py` implements:
   `(account_value × 0.01) / sl_distance_pct`
-- Used as safety ceiling against the pct_cap primary sizer
+- Used as safety ceiling against pct_cap primary sizer
 
 **Fee Buffer (always active):**
 - `TAKER_FEE_PCT=0.00045` (0.045% per side) must always exist in config
-- Risk manager must always enforce minimum TP = 3× round-trip fee (0.27% from entry)
+- Minimum TP must exceed 2× round-trip fee from entry
 
 **Daily Trade Cap (always active):**
-- `MAX_DAILY_TRADES` must always exist in config (default 20)
-- `_daily_trade_count` must always be incremented on each executed trade
+- `MAX_DAILY_TRADES=40` must always exist in config
+- Counter must always increment on each executed trade
 - Counter must always reset at UTC midnight
 
 **Per-Asset SL Cooldown (always active):**
-- `COOLDOWN_MINUTES` must always exist in config (default 30)
+- `COOLDOWN_MINUTES=15` must always exist in config
 - `_sl_cooldown_map` must always block re-entry after SL hit or force-close
 
 **The 8 hard checks — all must remain in this order:**
-1. `check_daily_drawdown` — circuit breaker at `DAILY_LOSS_CIRCUIT_BREAKER_PCT` (default 12%)
-2. `check_balance_reserve` — floor at `MIN_BALANCE_RESERVE_PCT` (default 20%) of starting balance
-3. `check_position_size` — cap at `MAX_POSITION_PCT` (default 15%)
-4. `check_leverage` — cap at `MAX_LEVERAGE` (default 5×)
-5. `check_total_exposure` — cap at `MAX_TOTAL_EXPOSURE_PCT` (default 50%)
-6. `check_concurrent_positions` — cap at `MAX_CONCURRENT_POSITIONS` (default 3)
-7. `enforce_stop_loss` — auto-set SL at `MANDATORY_SL_PCT` (default 3%) if missing or too wide
-8. `enforce_take_profit` — ensure TP ≥ 0.27% from entry (3× round-trip fee)
+1. `check_daily_drawdown` — circuit breaker at `DAILY_LOSS_CIRCUIT_BREAKER_PCT` (12%)
+2. `check_balance_reserve` — floor at `MIN_BALANCE_RESERVE_PCT` (20%) of starting balance
+3. `check_position_size` — cap at `MAX_POSITION_PCT` (15%)
+4. `check_leverage` — cap at `MAX_LEVERAGE` (5×)
+5. `check_total_exposure` — cap at `MAX_TOTAL_EXPOSURE_PCT` (50%)
+6. `check_concurrent_positions` — cap at `MAX_CONCURRENT_POSITIONS` (3)
+7. `enforce_stop_loss` — auto-set SL at `MANDATORY_SL_PCT` (3%) if missing or too wide
+8. `enforce_take_profit` — ensure TP ≥ 2× round-trip fee from entry
 
-**Additional Tier 1 risk controls (must not be removed):**
-- `ADX_HALF_SIZE_THRESHOLD=15` — halves position size when 1h ADX < 15–20 range AND score < 9.0 (no-trade gate: ADX < 15; half-size: ADX 15–20; full-size: ADX ≥ 20)
-- `AI_STALE_TF_MINUTES=55` — skip Claude call if higher-TF data is stale (inner-tick protection)
+**Additional risk controls (must not be removed):**
+- `TREND_PAUSE_ADX=30.0` — pause new entries when 1h ADX > 30 (strong trend = bad for reversion)
+  Note: ADX logic is **inverted** from old bot. OLD: ADX must be high to trade. NEW: ADX must be LOW.
+- `SESSION_BLOCK_START_UTC=0` / `SESSION_BLOCK_END_UTC=6` — no entries 00:00–06:00 UTC
+- Weekend block: Fri 20:00 UTC → Sun 08:00 UTC
+- Time-limit exit: `TIME_LIMIT_CANDLES=8` — close at market after 40 min if TP not hit
+- Funding rate gate: skip LONG if funding > +0.0005/8h; skip SHORT if funding < -0.0005/8h
 
 **What must never happen:**
 - Any trade executing without passing all 8 checks
 - `TAKER_FEE_PCT` removed from config
-- Fee-aware TP minimum removed from risk manager
-- `MAX_DAILY_TRADES` removed from config or its enforcement
-- `COOLDOWN_MINUTES` removed from config or its enforcement
-- Score factor for sizing exceeding 1.0 regardless of raw score
+- `MAX_DAILY_TRADES` removed or its enforcement disabled
+- `COOLDOWN_MINUTES` removed or its enforcement disabled
+- The time-limit exit removed (positions must not be held open indefinitely)
 
 ---
 
@@ -238,7 +178,7 @@ These rules apply to:
 - All AI-assisted refactors or rewrites
 - All future Claude sessions working in this repository
 
-If a requested change would violate any of these rules, Claude Code must refuse the change and
+If a requested change would violate any of these rules, Claude must refuse the change and
 explain which rule is violated before proposing any alternative.
 
 ---
@@ -248,20 +188,12 @@ explain which rule is violated before proposing any alternative.
 | Date | Change | Rule Affected |
 |------|--------|---------------|
 | 2026-05-17 | Initial Tier 1 rules established | All |
-| 2026-05-20 | Score cap corrected: 10.0 → 11.0 (bonuses additive above base 10) | Rule 1 |
-| 2026-05-20 | Kronos promoted from optional to Tier 1 active (graceful degradation) | Rule 1 |
-| 2026-05-20 | ADX_HALF_SIZE_THRESHOLD documented formally | Rule 2, Rule 4 |
-| 2026-05-20 | CONFLUENCE_REQUIRE_30M + AI_STALE_TF_MINUTES documented formally | Rule 3, Rule 4 |
-| 2026-05-20 | TP tiers updated for 0–11 scale (score ≥10 → 2.5×ATR tier) | Rule 2 |
-| 2026-05-20 | Position size factor capped: min(score,10)/10 not score/10 | Rule 2 |
-| 2026-05-25 | ADX no-trade gate lowered: 20 → 15 (ADX 15–20 = half-size via ADX_HALF_SIZE_THRESHOLD) | Rule 2 |
-| 2026-05-25 | Score thresholds lowered: MIN_SIGNAL_SCORE 7→6, MIN_AI_SCORE 7→6, MIN_TRADE_SCORE 3→2 | Rule 1, Rule 3 |
-| 2026-05-25 | Score 6 TP tier added: score >= 6.0 → 1.6×ATR | Rule 2 |
-| 2026-05-25 | Session gate expanded: in-session until 20:00 UTC (was 17:00); off-session threshold 8.5→7.5 | Rule 4 |
-| 2026-05-25 | entry_confirmed() volume threshold lowered 1.2× → 0.7×; BUY logic AND→OR | Rule 1 |
-| 2026-05-25 | multi_timeframe_confluence() 0.05% MACD neutral zone — prevents near-zero false blocks | Rule 3 |
-| 2026-05-25 | ADX_HALF_SIZE_THRESHOLD default corrected: 20 → 15 in all config defaults | Rule 2, Rule 4 |
+| 2026-05-20 | Score cap corrected: 10.0 → 11.0 | Rule 1 (old) |
+| 2026-05-20 | Kronos promoted to Tier 1 active | Rule 1 (old) |
+| 2026-05-20 | ADX_HALF_SIZE_THRESHOLD documented | Rule 2, Rule 4 (old) |
+| 2026-05-25 | Score thresholds lowered: MIN_SIGNAL_SCORE 7→6 | Rule 1, Rule 3 (old) |
+| 2026-06-02 | **FULL ARCHITECTURE PIVOT** — Old trend-following scoring system removed entirely. New architecture: BB + StochRSI mean reversion scalper on 5m. compute_signal_score, multi_timeframe_confluence, _code_decide_direction, entry_confirmed, confirm_trade, Kronos, ADX_HALF_SIZE_THRESHOLD all removed. Claude demoted to binary anomaly detector only. TP = BB midline. SL = 1.5×ATR. Time-limit exit = 8 candles. COOLDOWN halved to 15 min. MAX_DAILY_TRADES doubled to 40. INTERVAL changed to 5m. | All |
 
 ---
 
-*Architecture: CODE-FIRST HYBRID · Tier 1 production config · Last updated: 2026-05-25*
+*Architecture: BB + StochRSI MEAN REVERSION SCALPER · Last updated: 2026-06-02*

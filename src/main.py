@@ -25,7 +25,7 @@ from src.alerts import send_alert
 from src.config_loader import CONFIG
 from src.indicators.local_indicators import compute_all, last_n, latest
 from src.risk_manager import RiskManager
-from src.strategy import entry_confirmed, market_filter, compute_signal_score, oi_confirmed
+from src.strategy import compute_bb_stochrsi_signal, is_trend_regime_active, funding_rate_ok, session_gate_ok
 from src.trade_state import TradeStateMachine, load_active_trades, save_active_trades
 from src.trading.hyperliquid_api import HyperliquidAPI
 from src.utils.prompt_utils import json_default, round_or_none, round_series
@@ -227,165 +227,20 @@ def get_interval_seconds(interval_str):
         raise ValueError(f"Unsupported interval: {interval_str}")
 
 
-def _code_decide_direction(asset_data: dict) -> str | None:
-    """Return 'buy', 'sell', or None from 4h/1h trend alignment plus ADX gate.
-
-    Gates (all must pass before any direction is returned):
-    1. 4h EMA20/50 trend alignment
-    2. 1h trend agrees with 4h direction
-    3. 1h ADX ≥ 15 — must be trending (ADX < 15 → HOLD; 15–20 → half-size via ADX_HALF_SIZE_THRESHOLD)
-    Returns None when any gate fails.
-    """
-    trend_4h = asset_data.get("trend_4h", "UNKNOWN")
-    trend_1h = asset_data.get("trend_1h", "UNKNOWN")
-    if trend_4h == "UNKNOWN":
-        return None
-    # BUG-P9-3 FIX: Fail closed on UNKNOWN 1h trend — UNKNOWN means insufficient
-    # candle history (startup/data gap). Allowing UNKNOWN bypasses the 1h EMA gate
-    # entirely. Both 4h and 1h must have confirmed trend direction before proceeding.
-    if trend_1h == "UNKNOWN":
-        return None
-    if trend_4h == "BULLISH" and trend_1h == "BULLISH":
-        _direction = "buy"
-    elif trend_4h == "BEARISH" and trend_1h == "BEARISH":
-        _direction = "sell"
-    else:
-        return None  # conflicting trends
-
-    # ADX gate — must show some directional movement on 1h (ADX ≥ 15 to proceed).
-    # Threshold lowered from 20 → 15: purely ranging markets (ADX < 15) are blocked.
-    # Markets with ADX 15–20 are weakly trending — allowed but sized at 50% by
-    # ADX_HALF_SIZE_THRESHOLD=20 in risk sizing. Markets with ADX ≥ 20 get full size.
-    # This creates three layers: no-trade (< 15), half-size (15–20), full-size (≥ 20).
-    # BUG-P9-3 FIX preserved: Fail closed when ADX is None.
-    _adx_1h = asset_data.get("intraday_1h", {}).get("adx")
-    if _adx_1h is None:
-        logging.info(
-            "[DIRECTION] %s blocked — 1h ADX unavailable (insufficient 1h candle data)",
-            asset_data.get("asset", "?")
-        )
-        return None
-    if float(_adx_1h) < 15:
-        logging.info(
-            "[DIRECTION] %s blocked — 1h ADX %.1f < 15 (too flat, no directional move)",
-            asset_data.get("asset", "?"), float(_adx_1h)
-        )
-        print(f"[DIRECTION] {asset_data.get('asset', '?')} blocked — 1h ADX {float(_adx_1h):.1f} < 15 (flat)")
-        return None
-
-    return _direction
+# _code_decide_direction() REMOVED — 2026-06-01
+# New architecture: direction set by compute_bb_stochrsi_signal() in strategy.py.
+# BB lower band touch + StochRSI oversold hook → LONG
+# BB upper band touch + StochRSI overbought hook → SHORT
 
 
-def _code_compute_tpsl(entry: float, atr: float, direction: str, score: float = 7.0, funding_rate: float = 0.0) -> tuple[float, float, float, float]:
-    """Return (tp1, tp2, sl, tp_main) — score-adaptive TP with partial-close levels.
-
-    tp1     = 1.0×ATR  — close 50% of position (lock profit)
-    tp2     = 3.0×ATR  — let remaining 50% run
-    tp_main = score-adaptive single TP level used for primary trigger order:
-              score >= 10.0 → 2.5×ATR  (perfect base + volume bonus — highest conviction)
-              score >= 9.0  → 2.2×ATR
-              score >= 8.0  → 2.0×ATR
-              score >= 7.0  → 1.8×ATR
-              score >= 6.0  → 1.6×ATR  (minimum passing setup at lowered gate)
-    sl      = 1.0×ATR from entry always (MASTER RULE 4)
-    Fee buffer + funding buffer baked into all levels. Code owns all TP/SL (MASTER RULE 2).
-    Score scale is 0–11; tiers anchored to updated scale (MASTER RULES 2026-05-20).
-    CHAOS-8 FIX: funding_rate (per 8h) factored in as one-interval buffer so funding cost
-    does not erode TP1 on positions held through a single funding window.
-    """
-    fee_buffer = entry * float(CONFIG.get("taker_fee_pct") or 0.00045) * 2
-    # MED-1 FIX: funding buffer is only applied when funding is ADVERSE (costs us money).
-    # abs() was discarding the sign, applying the buffer even when funding is favorable.
-    # BUY  + positive funding_rate → longs pay → adverse → add buffer to make TP harder to reach
-    # BUY  + negative funding_rate → longs receive → favorable → no buffer (TP already closer)
-    # SELL + negative funding_rate → shorts pay → adverse → add buffer (TP is lower for sells)
-    # SELL + positive funding_rate → shorts receive → favorable → no buffer
-    _fr = float(funding_rate or 0)
-    _adverse = (_fr > 0 and direction == "buy") or (_fr < 0 and direction == "sell")
-    funding_buffer = entry * abs(_fr) if _adverse else 0.0
-
-    if score >= 10.0:
-        tp_mult = 2.5
-    elif score >= 9.0:
-        tp_mult = 2.2
-    elif score >= 8.0:
-        tp_mult = 2.0
-    elif score >= 7.0:
-        tp_mult = 1.8
-    elif score >= 6.0:
-        tp_mult = 1.6
-    else:
-        tp_mult = 1.6  # fallback — should not reach here below MIN_SIGNAL_SCORE
-
-    total_buf = fee_buffer + funding_buffer
-    if direction == "buy":
-        tp1     = round(entry + 1.0 * atr + total_buf, 6)
-        tp2     = round(entry + 3.0 * atr + total_buf, 6)
-        tp_main = round(entry + tp_mult * atr + total_buf, 6)
-        sl      = round(entry - 1.0 * atr - fee_buffer, 6)  # SL: fees only, funding not relevant if stopped out
-    else:
-        tp1     = round(entry - 1.0 * atr - total_buf, 6)
-        tp2     = round(entry - 3.0 * atr - total_buf, 6)
-        tp_main = round(entry - tp_mult * atr - total_buf, 6)
-        sl      = round(entry + 1.0 * atr + fee_buffer, 6)
-
-    return tp1, tp2, sl, tp_main
+# _code_compute_tpsl() REMOVED — 2026-06-01
+# New architecture: TP = BB midline (mean reversion target), SL = entry ± 1.5×ATR(5m)
+# Both computed inline in the scoring pipeline from compute_bb_stochrsi_signal() output.
 
 
-def multi_timeframe_confluence(asset_data: dict, direction: str) -> bool:
-    """Return True when 4h, 1h, and 15m MACD all agree on direction.
-
-    Reduced from 5 timeframes to 3: 4h (macro trend) + 1h (intraday trend) + 15m MACD
-    (short-term momentum). 30m is correlated with 4h/1h (redundant). 5m candle direction
-    is noise — bullish 5m candles occur 40-50% of the time even in strong downtrends.
-    """
-    is_buy = direction == "buy"
-
-    # 4h: macro trend alignment
-    trend_4h = asset_data.get("trend_4h", "UNKNOWN")
-    if is_buy and trend_4h != "BULLISH":
-        return False
-    if not is_buy and trend_4h != "BEARISH":
-        return False
-
-    # 1h: intraday trend alignment
-    # BUG-v7-L5 FIX: also block UNKNOWN — defense-in-depth against direction-logic refactors.
-    # _code_decide_direction() already rejects UNKNOWN 1h; confluence is a backstop.
-    trend_1h = asset_data.get("trend_1h", "UNKNOWN")
-    if is_buy and trend_1h != "BULLISH":
-        return False
-    if not is_buy and trend_1h != "BEARISH":
-        return False
-
-    # 15m: short-term momentum confirmation via MACD histogram.
-    # Tolerance widened to 0.5% of price (was 0.05%):
-    # In pullback entries during a strong trend, 15m MACD can be -0.2 to -0.5% of price
-    # while the trade is still valid (4h+1h trend aligned). The entry_confirmed() function
-    # handles MACD more precisely via OR logic with near_ema. Confluence should only block
-    # when 15m MACD is STRONGLY against direction (>0.5% of price) — a genuine reversal signal.
-    # At BTC=$90k, 0.5% = $450 — this only blocks clear counter-trend 15m momentum.
-    macd_15m = asset_data.get("setup_15m", {}).get("macd_histogram")
-    if macd_15m is not None:
-        _price = float(asset_data.get("current_price") or 0)
-        _tol = _price * 0.005 if _price > 0 else 0.0  # 0.5% of price — only block strong counter-trend
-        if is_buy and float(macd_15m) < -_tol:
-            return False
-        if not is_buy and float(macd_15m) > _tol:
-            return False
-
-    return True
-
-
-def _build_confluence_fingerprint(asset: str, direction: str,
-                                   trend_4h: str, trend_1h: str, score: float) -> str:
-    """Cache key that changes when market character genuinely shifts.
-
-    score_bucket rounds to nearest 0.5 — avoids cache misses from tiny score drift.
-    date_hour component expires the key after ~1 hour regardless.
-    """
-    score_bucket = round(score * 2) / 2
-    date_hour = datetime.now(timezone.utc).strftime("%Y%m%d%H")
-    return f"{asset}_{direction}_{trend_4h}_{trend_1h}_{score_bucket}_{date_hour}"
+# multi_timeframe_confluence() REMOVED — 2026-06-01
+# Mean reversion does NOT require trend alignment — it trades AGAINST the trend.
+# _build_confluence_fingerprint() REMOVED — no longer used (anomaly check is stateless).
 
 
 async def _fetch_macro_context() -> dict:
@@ -1538,7 +1393,7 @@ def main():
                         hyperliquid.get_candles(asset, "4h",  60),
                         hyperliquid.get_candles(asset, "30m", 40),
                         hyperliquid.get_candles(asset, "15m", 30),
-                        hyperliquid.get_candles(asset, "5m",  400),  # BUG-v8-L2 FIX: 400 candles for Kronos-mini context window (was 100 — degraded forecast)
+                        hyperliquid.get_candles(asset, "5m",  100),  # 100 candles sufficient for BB(20)+StochRSI(14,14) warmup
                         hyperliquid.get_candles(asset, "1d",  50),
                     )
                     asset_prices[asset] = current_price
@@ -1766,7 +1621,7 @@ def main():
                         "spread_pct": round(spread_pct, 4),
                         "candles_4h": candles_4h,
                         "candles_1h": candles_1h,   # CRITICAL-4: needed for S&R swing H/L gate
-                        "candles_5m": candles_5m,   # BUG-B: required for volume/pattern bonuses in compute_signal_score()
+                        "candles_5m": candles_5m,   # required for BB+StochRSI signal and regime ADX check
                         "daily_1d": candles_1d[-2] if len(candles_1d) >= 2 else (candles_1d[-1] if candles_1d else {}),  # BUG-C: use yesterday's closed candle not today's incomplete
                     })
                 except Exception as e:
@@ -1798,14 +1653,13 @@ def main():
                 except Exception as _btc_err:
                     logging.warning("[BTC CORR] BTC correlation fetch failed — filter will use UNKNOWN: %s", _btc_err)
 
-            add_event(f"[CYCLE {invocation_count}] scoring {len(market_sections)} asset(s) — code-first pipeline")
+            add_event(f"[CYCLE {invocation_count}] BB+StochRSI scan — {len(market_sections)} asset(s)")
 
-            # ── Score-gated code-first pipeline (replaces unconditional Claude call) ──
-            # Claude is called when score >= MIN_AI_SCORE and multi-timeframe confluence is confirmed.
-            # All direction/TP/SL/size decisions are made by code.
+            # ── BB + StochRSI mean reversion pipeline ─────────────────────────────────
+            # Direction set by BB band touch + StochRSI hook — code only.
+            # TP = BB midline. SL = 1.5×ATR(5m). Claude only called on >3% price spikes.
             outputs = {"reasoning": "", "trade_decisions": []}
-            _min_sig = float(CONFIG.get("min_signal_score") or 6)
-            _max_dt  = int(CONFIG.get("max_daily_trades") or 10)
+            _max_dt = int(CONFIG.get("max_daily_trades") or 40)
 
             def _make_hold(asset_name: str, reason: str) -> dict:
                 return {"asset": asset_name, "action": "hold", "allocation_usd": 0.0,
@@ -1813,10 +1667,18 @@ def main():
                         "tp_price": None, "sl_price": None,
                         "exit_plan": "", "rationale": reason}
 
+            # Session gate — check once for all assets (same time applies to all)
+            _sess_ok, _sess_reason = session_gate_ok(CONFIG)
+
             for _asset in args.assets:
                 _ac = next((m for m in market_sections if m.get("asset") == _asset), None)
                 if not _ac:
                     outputs["trade_decisions"].append(_make_hold(_asset, "no market data"))
+                    continue
+
+                # Session gate (00:00–06:00 UTC + weekends)
+                if not _sess_ok:
+                    outputs["trade_decisions"].append(_make_hold(_asset, _sess_reason))
                     continue
 
                 # Daily trade cap
@@ -1831,191 +1693,133 @@ def main():
                     outputs["trade_decisions"].append(_make_hold(_asset, f"SL cooldown {_mins_left}min remaining"))
                     continue
 
-                # 4h hard gate — direction must align with trend_4h or return None
-                _direction = _code_decide_direction(_ac)
-                if _direction is None:
-                    _t4h = _ac.get('trend_4h', 'UNKNOWN')
-                    _t1h = _ac.get('trend_1h', 'UNKNOWN')
-                    _gate_label = "trend conflict" if _t4h != _t1h else "secondary gate blocked (ADX)"
+                # Regime pause: 1h ADX > TREND_PAUSE_ADX (30) = strong trend = skip reversion
+                if is_trend_regime_active(_ac, CONFIG):
+                    _adx_val = _ac.get("intraday_1h", {}).get("adx", "?")
                     outputs["trade_decisions"].append(_make_hold(
-                        _asset,
-                        f"4h gate: trend_4h={_t4h} trend_1h={_t1h} — {_gate_label}"
-                    ))
+                        _asset, f"regime pause: 1h ADX={_adx_val} > {CONFIG.get('trend_pause_adx', 30)} (trend too strong)"))
                     continue
 
-                # Weighted score gate (0-10 float)
-                _score = compute_signal_score(_ac, _direction)
-                # Kronos-mini forecast modifier (±0.5, code-only, clamped to [0,11] — MASTER RULE 1)
-                # BUG-P11-4 FIX: Kronos requires 5m candles (MASTER RULE 1). Was incorrectly
-                # passing candles_4h (60 candles, wrong timeframe). Now passes candles_5m.
-                try:
-                    from src.indicators.kronos_forecast import get_kronos_modifier
-                    _kmod = get_kronos_modifier(candles=_ac.get("candles_5m", []), direction=_direction)
-                    if _kmod != 0.0:
-                        logging.info("[KRONOS] %s modifier=%.1f score %.1f → %.1f", _asset, _kmod, _score, _score + _kmod)
-                    _score = min(11.0, max(0.0, _score + _kmod))
-                except ImportError:
-                    pass
-                if _score < _min_sig:
-                    logging.info("[SCORE] %s %s score=%.1f < %.1f → HOLD", _asset, _direction, _score, _min_sig)
-                    outputs["trade_decisions"].append(_make_hold(_asset, f"score={_score:.1f} < min {_min_sig:.0f}"))
-                    # Signal logging — log ALL scores ≥5.0 for diagnostics (not just ≥7.0)
-                    if _score >= 5.0:
-                        try:
-                            with open(_signals_path, "a", encoding="utf-8") as _sf:
-                                _sf.write(json.dumps({
-                                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                                    "asset": _asset,
-                                    "direction": _direction,
-                                    "score": round(_score, 2),
-                                    "action": "below_threshold",
-                                    "score_needed": _min_sig,
-                                    "reason": f"score={_score:.1f} min={_min_sig}",
-                                    "trend_4h": _ac.get("trend_4h"),
-                                    "trend_1h": _ac.get("trend_1h"),
-                                }) + "\n")
-                            logging.info(
-                                "[SIGNAL LOG] %s %s score=%.1f (min=%.1f) — logged to signals.jsonl for diagnostics",
-                                _asset, _direction, _score, _min_sig
-                            )
-                        except Exception:
-                            pass
+                # BB + StochRSI signal
+                _candles_5m_data = _ac.get("candles_5m", [])
+                _sig = compute_bb_stochrsi_signal(_candles_5m_data, CONFIG)
+                _direction = _sig.get("signal", "NONE")
+
+                if _direction == "NONE":
+                    logging.debug("[BB/SRSI] %s no signal K=%.1f",
+                                  _asset, _sig.get("stochrsi_k") or 0)
+                    outputs["trade_decisions"].append(_make_hold(
+                        _asset, f"no BB/StochRSI signal (K={_sig.get('stochrsi_k')})"))
                     continue
 
-                # Code computes trade parameters
-                _entry = float(_ac.get("current_price") or 0)
-                _atr   = float(_ac.get("long_term_4h", {}).get("atr14") or 0)
-                if _entry <= 0 or _atr <= 0:
-                    outputs["trade_decisions"].append(_make_hold(_asset, "missing price or ATR14"))
+                # Convert LONG/SHORT → buy/sell
+                _direction_str = "buy" if _direction == "LONG" else "sell"
+
+                # Funding rate gate
+                _funding_val = float(_ac.get("funding_rate") or 0)
+                if not funding_rate_ok(_funding_val, _direction_str):
+                    outputs["trade_decisions"].append(_make_hold(
+                        _asset, f"funding gate: {_funding_val:.5f}/8h blocks {_direction_str}"))
                     continue
 
-                _tp1, _tp2, _sl, _tp = _code_compute_tpsl(_entry, _atr, _direction, _score, funding_rate=float(_ac.get("funding_rate") or 0))
-                # Position sizing: target = 15% of buying_power (account × leverage).
-                # ATR 1% risk rule acts as a safety ceiling — reduces size when SL is distant.
+                # Compute TP and SL
+                _entry  = float(_ac.get("current_price") or 0)
+                _atr_5m = float(_sig.get("atr") or 0)
+                _bb_mid = float(_sig.get("bb_mid") or 0)
+                _fee_buf = _entry * float(CONFIG.get("taker_fee_pct") or 0.00045) * 2
+
+                if _entry <= 0 or _atr_5m <= 0 or _bb_mid <= 0:
+                    outputs["trade_decisions"].append(_make_hold(_asset, "missing price, ATR5m, or BB mid"))
+                    continue
+
+                if _direction_str == "buy":
+                    _tp = round(_bb_mid, 6)          # BB midline above entry
+                    _sl = round(_entry - 1.5 * _atr_5m, 6)
+                    _tp1 = _tp  # single TP for mean reversion (no partial close split)
+                    _tp2 = _tp
+                    # Validate: TP must be above entry (mean reversion target)
+                    if _tp <= _entry + _fee_buf:
+                        outputs["trade_decisions"].append(_make_hold(
+                            _asset, f"TP {_tp:.4f} ≤ entry+fees {_entry+_fee_buf:.4f} — no edge"))
+                        continue
+                else:
+                    _tp = round(_bb_mid, 6)          # BB midline below entry
+                    _sl = round(_entry + 1.5 * _atr_5m, 6)
+                    _tp1 = _tp
+                    _tp2 = _tp
+                    if _tp >= _entry - _fee_buf:
+                        outputs["trade_decisions"].append(_make_hold(
+                            _asset, f"TP {_tp:.4f} ≥ entry-fees {_entry-_fee_buf:.4f} — no edge"))
+                        continue
+
+                # Position sizing: ATR 1% risk rule + pct cap (risk manager unchanged)
                 _buying_power = account_value * float(CONFIG.get("max_leverage") or 5)
                 _pct_cap = _buying_power * (float(CONFIG.get("max_position_pct") or 15) / 100.0)
                 _atr_sized = risk_mgr.atr_position_size(account_value, _entry, _sl)
                 _alloc = min(_pct_cap, _atr_sized)
-                # Scale allocation by signal strength (min(score,10)/10): score-7 → 70%, score-10..11 → 100%
-                # Scores above 10.0 do NOT grant above-100% sizing (MASTER RULE 2)
-                _alloc = _alloc * (min(_score, 10.0) / 10.0)
-                # ADX ranging market guard: half-size if ADX weak and score not at maximum
-                _adx_1h_val = float(_ac.get("intraday_1h", {}).get("adx") or 15)
-                _adx_thr    = float(CONFIG.get("adx_half_size_threshold") or 20)  # BUG-v7-O3 FIX: default was 15 but .env is 20; aligned to authoritative .env value
-                if _adx_1h_val < _adx_thr and _score < 9.0:
-                    _alloc *= 0.5
-                    logging.info("[SIZE] %s ADX %.1f < %.0f + score %.1f < 9 → half-size applied",
-                                 _asset, _adx_1h_val, _adx_thr, _score)
 
-                # Confluence gate: all timeframes must agree before calling Claude
-                _confluence_ok = multi_timeframe_confluence(_ac, _direction)
-                if not _confluence_ok:
-                    logging.info("[CONFLUENCE] %s %s — TFs not aligned → HOLD", _asset, _direction)
-                    outputs["trade_decisions"].append(_make_hold(_asset, "confluence failed — TFs not aligned"))
-                    continue
+                # Claude anomaly check — only on sharp moves (>ANOMALY_TRIGGER_PCT in 5 candles)
+                _anomaly_pct = float(CONFIG.get("anomaly_trigger_pct") or 3.0)
+                _price_chg_5c = 0.0
+                if len(_candles_5m_data) >= 5:
+                    _p_now  = float(_candles_5m_data[-1]["close"])
+                    _p_5ago = float(_candles_5m_data[-5]["close"])
+                    if _p_5ago > 0:
+                        _price_chg_5c = abs(_p_now - _p_5ago) / _p_5ago * 100
 
-                # MIN_AI_SCORE gate — separate from MIN_SIGNAL_SCORE so Claude call frequency is independently tunable
-                _min_ai = float(CONFIG.get("min_ai_score") or 6)
-                if _score < _min_ai:
-                    logging.info("[AI GATE] %s score=%.1f < MIN_AI_SCORE %.1f → HOLD", _asset, _score, _min_ai)
-                    outputs["trade_decisions"].append(_make_hold(_asset, f"score={_score:.1f} < MIN_AI_SCORE {_min_ai:.1f}"))
-                    continue
-
-                # Build fingerprint and check AI verdict cache
-                _fingerprint = _build_confluence_fingerprint(
-                    _asset, _direction,
-                    _ac.get("trend_4h", "UNKNOWN"), _ac.get("trend_1h", "UNKNOWN"), _score
-                )
-                _now_utc = datetime.now(timezone.utc)
-                _cache_entry = _ai_verdict_cache.get(_asset)
-                _use_cached = False
-                if _cache_entry:
-                    _cfp     = _cache_entry.get("fingerprint")
-                    _cexp    = _cache_entry.get("expires_at")
-                    if _cfp == _fingerprint and _cexp and _now_utc < _cexp:
-                        if _cache_entry.get("verdict") == "APPROVE":
-                            logging.info("[AI CACHE] %s APPROVE (exp %s)", _asset, _cexp.isoformat())
-                            _use_cached = True
-                        else:
-                            logging.info("[AI CACHE] %s REJECT → HOLD", _asset)
-                            outputs["trade_decisions"].append(_make_hold(_asset, "AI cached REJECT"))
-                            continue
-
-                if not _use_cached:
-                    # Hard minimum gap between Claude calls per asset
-                    _gap_mins   = int(CONFIG.get("min_ai_call_gap_minutes") or 30)
-                    _last_ts    = _last_ai_call_time.get(_asset, 0)
-                    _gap_elapsed = time.time() - _last_ts
-                    if _last_ts > 0 and _gap_elapsed < _gap_mins * 60:
-                        _prev = _ai_verdict_cache.get(_asset)
-                        if _prev and _prev.get("verdict") == "APPROVE":
-                            logging.info("[AI GAP] %s — %.0f min gap (min %d) → using prev APPROVE",
-                                         _asset, _gap_elapsed / 60, _gap_mins)
-                            _use_cached = True
-                        else:
-                            logging.info("[AI GAP] %s — %.0f min gap (min %d) → HOLD",
-                                         _asset, _gap_elapsed / 60, _gap_mins)
-                            outputs["trade_decisions"].append(
-                                _make_hold(_asset, f"AI call gap {_gap_elapsed/60:.0f}min < {_gap_mins}min"))
-                            continue
-
-                if not _use_cached:
-                    # Call Claude with full market analysis context
+                if _price_chg_5c > _anomaly_pct:
                     _verdict = await asyncio.to_thread(
-                        agent.confirm_trade, _asset, _direction, _entry, _tp, _sl, _score, {},
-                        _macro_context_cache, _ac
+                        agent.claude_anomaly_check,
+                        _asset, _price_chg_5c, _direction_str
                     )
-                    _last_ai_call_time[_asset] = time.time()
-                    _app_mins = int(CONFIG.get("ai_approve_cache_minutes") or 60)
-                    _rej_mins = int(CONFIG.get("ai_reject_cache_minutes") or 30)
-                    _cm = _app_mins if _verdict == "APPROVE" else _rej_mins
-                    _ai_verdict_cache[_asset] = {
-                        "verdict":     _verdict,
-                        "fingerprint": _fingerprint,
-                        "expires_at":  _now_utc + timedelta(minutes=_cm),
-                    }
                     if _verdict != "APPROVE":
-                        add_event(f"[CLAUDE] {_asset} score={_score:.1f} REJECTED by market analysis")
-                        outputs["trade_decisions"].append(
-                            _make_hold(_asset, f"AI REJECT score={_score:.1f}"))
+                        add_event(f"[CLAUDE ANOMALY] {_asset} REJECTED — {_price_chg_5c:.1f}% move in 5 candles")
+                        outputs["trade_decisions"].append(_make_hold(
+                            _asset, f"anomaly REJECT: {_price_chg_5c:.1f}% in 5 candles"))
                         continue
+                    add_event(f"[CLAUDE ANOMALY] {_asset} APPROVED — {_price_chg_5c:.1f}% move ok")
 
-                add_event(f"[SCORE] {_asset} {_direction} score={_score:.1f} → queuing trade")
-                # Signal logging — log approved trades to signals.jsonl for win-rate analysis (#78)
+                # Signal is clean — queue the trade
+                bb_touch = "lower" if _direction_str == "buy" else "upper"
+                add_event(f"[BB/SRSI] {_asset} {_direction_str} — BB {bb_touch} touch K={_sig.get('stochrsi_k')} TP={_tp:.4f} SL={_sl:.4f}")
+
+                # Log to signals.jsonl for win-rate tracking
                 try:
-                    import json as _sjson
                     with open(_signals_path, "a", encoding="utf-8") as _sf:
-                        _sf.write(_sjson.dumps({
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "asset": _asset,
-                            "direction": _direction,
-                            "score": round(_score, 2),
-                            "action": "queued",
-                            "reason": f"score={_score:.1f} APPROVED",
-                            "trend_4h": _ac.get("trend_4h"),
-                            "trend_1h": _ac.get("trend_1h"),
+                        _sf.write(json.dumps({
+                            "timestamp":    datetime.now(timezone.utc).isoformat(),
+                            "asset":        _asset,
+                            "direction":    _direction_str,
+                            "stochrsi_k":   _sig.get("stochrsi_k"),
+                            "bb_touch":     bb_touch,
+                            "atr_5m":       round(_atr_5m, 6),
+                            "tp":           round(_tp, 6),
+                            "sl":           round(_sl, 6),
+                            "action":       "queued",
                         }) + "\n")
                 except Exception:
                     pass
-                # Limit order: buy 0.15% below ask, sell 0.15% above bid
+
+                # LIMIT order — 0.15% better than market (0% maker fee on Hyperliquid)
                 _lim_off = _entry * 0.0015
-                _lim_px  = round(_entry - _lim_off, 6) if _direction == "buy" else round(_entry + _lim_off, 6)
+                _lim_px = round(_entry - _lim_off, 6) if _direction_str == "buy" else round(_entry + _lim_off, 6)
+
                 outputs["trade_decisions"].append({
-                    "asset":        _asset,
-                    "action":       _direction,
+                    "asset":          _asset,
+                    "action":         _direction_str,
                     "allocation_usd": _alloc,
-                    "order_type":   "limit",
-                    "limit_price":  _lim_px,
-                    "tp_price":     _tp,
-                    "tp1_price":    _tp1,
-                    "tp2_price":    _tp2,
-                    "sl_price":     _sl,
-                    "atr14":        _atr,
-                    "current_price": _entry,
-                    "score":        round(_score, 2),  # P6-HIGH-1: store per-asset score so execution loop uses correct value
-                    "exit_plan":    f"code TP={_tp:.4f} TP1={_tp1:.4f} TP2={_tp2:.4f} SL={_sl:.4f} score={_score:.1f}",
-                    "rationale":    (f"score={_score:.1f} trend_4h={_ac.get('trend_4h')} "
-                                     f"trend_1h={_ac.get('trend_1h')}"),
+                    "order_type":     "limit",
+                    "limit_price":    _lim_px,
+                    "tp_price":       _tp,
+                    "tp1_price":      _tp1,
+                    "tp2_price":      _tp2,
+                    "sl_price":       _sl,
+                    "atr14":          _atr_5m,   # 5m ATR used for SL sizing
+                    "current_price":  _entry,
+                    "score":          8.0,        # fixed score placeholder (not score-based system)
+                    "exit_plan":      f"BB-reversion TP={_tp:.4f} SL={_sl:.4f} K={_sig.get('stochrsi_k')}",
+                    "rationale":      (f"BB {bb_touch} touch StochRSI K={_sig.get('stochrsi_k')} "
+                                      f"direction={_direction_str} atr5m={_atr_5m:.6f}"),
                 })
             # ─────────────────────────────────────────────────────────────────────────
 
@@ -2078,127 +1882,22 @@ def main():
                             logging.info("[STATE GATE] %s skipped — state=%s", asset, _sm_state)
                             add_event(f"[STATE GATE] {asset} skipped — state={_sm_state}, no new entry")
                             continue
-                        # Block entirely when 4h EMA data is unavailable — UNKNOWN means
-                        # insufficient candle history (startup or exchange gap). Both
-                        # inversion guards below evaluate to False for UNKNOWN, so without
-                        # this check Claude's action passes through with no validation.
-                        if trend_4h == "UNKNOWN":
-                            logging.warning(
-                                "[TREND GUARD] %s blocked — trend_4h=UNKNOWN (insufficient 4h candle data)",
-                                asset,
-                            )
-                            add_event(f"[TREND GUARD] {asset} {action} blocked — trend_4h=UNKNOWN, candle data insufficient")
-                            continue
-                        # Inversion assertion — fires if trend and order direction are opposite.
-                        # BULLISH (EMA20>EMA50) must produce buy; BEARISH must produce sell.
-                        # If this raises, an inversion is still present somewhere in the signal chain.
-                        if trend_4h == "BULLISH" and action == "sell":
-                            raise ValueError(f"INVERSION BUG DETECTED: {asset} trend=BULLISH but action=sell")
-                        if trend_4h == "BEARISH" and action == "buy":
-                            raise ValueError(f"INVERSION BUG DETECTED: {asset} trend=BEARISH but action=buy")
-
-                        # BUG-P9-7 FIX: Mirror the daily macro trend filter from the inner loop.
-                        # Inner loop blocks counter-trend trades when 1d ADX > 20 (market is trending
-                        # on the daily and the trade opposes it). Outer loop was missing this gate.
-                        _outer_trend_1d = asset_trends_1d.get(asset, "UNKNOWN")
-                        _outer_adx_1d   = asset_adx_1d.get(asset)
-                        # BUG-v9-L4 FIX: When 1d ADX is unavailable (< 14 daily candles), apply
-                        # the macro filter based on EMA trend alone — a known BEARISH/BULLISH daily
-                        # trend is sufficient to block a counter-trend trade even without ADX
-                        # confirmation. Previously `_outer_adx_1d is None` silently bypassed the
-                        # filter for any asset without enough 1d history.
-                        _outer_macro_trending = (
-                            (_outer_adx_1d is not None and float(_outer_adx_1d) > 20)
-                            or (_outer_adx_1d is None and _outer_trend_1d != "UNKNOWN")
-                        )
-                        if _outer_macro_trending:
-                            _adx_str = f"ADX={float(_outer_adx_1d):.1f}" if _outer_adx_1d is not None else "ADX=N/A (insufficient history)"
-                            if _outer_trend_1d == "BEARISH" and action == "buy":
-                                logging.info("[OUTER DAILY FILTER] %s BUY blocked — daily trend BEARISH + %s",
-                                             asset, _adx_str)
-                                add_event(f"[OUTER DAILY FILTER] {asset} BUY blocked — daily BEARISH trend active")
-                                continue
-                            if _outer_trend_1d == "BULLISH" and action == "sell":
-                                logging.info("[OUTER DAILY FILTER] %s SELL blocked — daily trend BULLISH + %s",
-                                             asset, _adx_str)
-                                add_event(f"[OUTER DAILY FILTER] {asset} SELL blocked — daily BULLISH trend active")
-                                continue
-
+                        # Spread pre-check — skip entry if spread is unusually wide
                         asset_ctx = next((m for m in market_sections if m.get("asset") == asset), {})
-                        # Attach raw 5m candles for volume confirmation inside entry_confirmed.
-                        # Done here, not in market_sections, so they are never serialised into
-                        # the Claude context payload (which would waste tokens on raw OHLCV data).
-                        # Inject score so market_filter() can apply the off-session score≥9 gate (#3)
-                        asset_ctx_local = {**asset_ctx, "candles_5m": asset_candles_5m.get(asset, []), "_current_score": output.get("score", _score)}
-                        # ATR spike + spread pre-flight — market_filter() was dead code (only
-                        # called from make_decision() which is never invoked); wire it directly.
-                        _btc_trend_1h = next(
-                            (m.get("trend_1h", "UNKNOWN") for m in market_sections if m.get("asset") == "BTC"),
-                            "UNKNOWN"
-                        )
-                        _btc_5m_candles = asset_candles_5m.get("BTC", [])
-                        _mf_pass, _mf_reason = market_filter(
-                            asset_ctx_local,
-                            btc_trend_1h=_btc_trend_1h,
-                            btc_candles_5m=_btc_5m_candles,
-                            direction=action
-                        )
-                        if not _mf_pass:
-                            logging.warning("[MARKET FILTER] %s %s blocked — %s", asset, action, _mf_reason)
-                            add_event(f"[MARKET FILTER] {asset} {action} blocked — {_mf_reason}")
-                            # P4-E-2: log filter-blocked signals so win-rate analysis captures all score≥7 signals
-                            try:
-                                import json as _fsjson
-                                with open(_signals_path, "a", encoding="utf-8") as _fsf:
-                                    _fsf.write(_fsjson.dumps({
-                                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                                        "asset": asset, "direction": action,
-                                        "score": round(output.get("score", _score), 2), "action": "filtered",
-                                        "reason": f"market_filter: {_mf_reason}",
-                                        "trend_4h": asset_ctx.get("trend_4h"),
-                                        "trend_1h": asset_ctx.get("trend_1h"),
-                                    }) + "\n")
-                            except Exception:
-                                pass
+                        _spread = float(asset_ctx.get("spread_pct") or 0)
+                        if _spread > 0.15:
+                            logging.info("[SPREAD] %s blocked — spread %.3f%% > 0.15%%", asset, _spread)
+                            add_event(f"[SPREAD] {asset} blocked — spread {_spread:.3f}% too wide")
                             continue
-                        # Entry confirmation (15m/5m layers + volume gate)
-                        if not entry_confirmed(asset_ctx_local, action):
-                            logging.info(
-                                "[ENTRY] %s direction=%s blocked — "
-                                "15m/5m not confirmed, waiting for pullback",
-                                asset, action
-                            )
-                            add_event(f"[ENTRY] {asset} {action} blocked — 15m/5m not confirmed")
-                            # P4-E-2: log entry-confirmation blocks
-                            try:
-                                import json as _ecjson
-                                with open(_signals_path, "a", encoding="utf-8") as _ecf:
-                                    _ecf.write(_ecjson.dumps({
-                                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                                        "asset": asset, "direction": action,
-                                        "score": round(output.get("score", _score), 2), "action": "filtered",
-                                        "reason": "entry_confirmed: 15m/5m not confirmed",
-                                        "trend_4h": asset_ctx.get("trend_4h"),
-                                        "trend_1h": asset_ctx.get("trend_1h"),
-                                    }) + "\n")
-                            except Exception:
-                                pass
-                            continue
-                        # Candle close gate — only fire when the 5m trigger candle has fully closed
-                        # Prevents entering mid-candle on false signals that reverse before close
+
+                        # Candle close gate — signal already used [-2] closed candle, but
+                        # confirm the current candle is at least 30% complete before entry
+                        # to avoid entering at the very start of a new candle.
                         _secs_into_5m = (datetime.now(timezone.utc).minute % 5) * 60 + datetime.now(timezone.utc).second
                         _candle_age_pct = _secs_into_5m / 300  # 0.0 = just opened, 1.0 = about to close
-                        if _candle_age_pct < 0.70:  # candle must be at least 70% complete (210 of 300s)
-                            logging.info(
-                                "[CANDLE GATE] %s waiting — 5m candle only %.0f%% complete",
-                                asset, _candle_age_pct * 100
-                            )
-                            continue
-                        # OI confirmation gate — requires OI increasing, blocks spikes
-                        _oi_ok, _oi_reason = oi_confirmed(asset_ctx_local, action)
-                        if not _oi_ok:
-                            logging.info("[OI GATE] %s blocked — %s", asset, _oi_reason)
-                            add_event(f"[OI GATE] {asset} blocked — {_oi_reason}")
+                        if _candle_age_pct < 0.30:
+                            logging.info("[CANDLE GATE] %s waiting — 5m candle only %.0f%% complete (need 30%%)",
+                                         asset, _candle_age_pct * 100)
                             continue
                         is_buy = action == "buy"
                         alloc_usd = float(output.get("allocation_usd", 0.0))
@@ -2208,9 +1907,10 @@ def main():
 
                         # --- RISK: Validate trade before execution ---
                         output["current_price"] = current_price
-                        # Inject ATR14 from 4h data so enforce_stop_loss can use
-                        # max(pct_floor, 1×ATR) instead of a flat percentage only.
-                        output["atr14"] = asset_ctx.get("long_term_4h", {}).get("atr14")
+                        # atr14 is 5m ATR (already set by BB+StochRSI pipeline).
+                        # Ensure it's present so enforce_stop_loss can use it for SL validation.
+                        if not output.get("atr14"):
+                            output["atr14"] = asset_ctx.get("long_term_4h", {}).get("atr14")
 
                         allowed, reason, output = risk_mgr.validate_trade(
                             output, state, initial_account_value or 0
@@ -2736,7 +2436,7 @@ def main():
                 # Refresh 5m candles and recompute trigger_5m per asset
                 for _i_asset in args.assets:
                     try:
-                        _f5m = await hyperliquid.get_candles(_i_asset, "5m", 400)  # BUG-v8-L2 FIX: 400 for full Kronos context (was 100)
+                        _f5m = await hyperliquid.get_candles(_i_asset, "5m", 100)  # 100 candles sufficient for BB(20)+StochRSI(14,14) warmup
                         if not _f5m:
                             continue
                         _i5m = compute_all(_f5m)
@@ -2754,123 +2454,81 @@ def main():
                     except Exception as _i5e:
                         logging.warning("[INNER] 5m refresh %s: %s", _i_asset, _i5e)
 
-                # Re-run score-gated pipeline with fresh 5m data
+                # Re-run BB+StochRSI pipeline with fresh 5m data
                 _inner_outputs: dict = {"reasoning": "", "trade_decisions": []}
+                _isess_ok, _isess_reason = session_gate_ok(CONFIG)
                 for _i_asset in args.assets:
                     _iac = next((m for m in market_sections if m.get("asset") == _i_asset), None)
                     if not _iac:
                         continue
-                    # P4-E-5: Circuit breaker re-checked per-asset so a breaker tripped mid-loop
-                    # (e.g. after a loss updates risk_mgr) blocks remaining assets in the same tick.
                     if risk_mgr.circuit_breaker_active:
                         logging.info("[INNER CB] circuit breaker active — skipping %s tick %d", _i_asset, _tick + 1)
                         continue
-                    if _daily_trade_count >= int(CONFIG.get("max_daily_trades") or 10):
+                    if _daily_trade_count >= int(CONFIG.get("max_daily_trades") or 40):
                         break
+                    if not _isess_ok:
+                        continue
                     _cd = _sl_cooldown_map.get(_i_asset)
                     if _cd and datetime.now(timezone.utc) < _cd:
                         continue
-                    _idir = _code_decide_direction(_iac)
-                    if _idir is None:
+                    if is_trend_regime_active(_iac, CONFIG):
                         continue
-                    _iscr = compute_signal_score(_iac, _idir)
-                    try:
-                        from src.indicators.kronos_forecast import get_kronos_modifier
-                        # BUG-P11-4 FIX: pass candles_5m, not candles_4h (MASTER RULE 1)
-                        _iscr = min(11.0, max(0.0, _iscr + get_kronos_modifier(candles=_iac.get("candles_5m", []), direction=_idir)))
-                    except ImportError:
-                        pass
-                    if _iscr < float(CONFIG.get("min_signal_score") or 6):
+                    _i_candles_5m = _iac.get("candles_5m", [])
+                    _isig = compute_bb_stochrsi_signal(_i_candles_5m, CONFIG)
+                    _idir = _isig.get("signal", "NONE")
+                    if _idir == "NONE":
                         continue
-                    # BUG-2 FIX: Use the fresh price already refreshed by the C-3/C-4 block above,
-                    # not the stale outer-loop price. TP/SL were anchored to an old price, placing
-                    # the SL up to 1 full ATR away from the actual fill price during volatile moves.
+                    _idir_str = "buy" if _idir == "LONG" else "sell"
+                    _ifund = float(_iac.get("funding_rate") or 0)
+                    if not funding_rate_ok(_ifund, _idir_str):
+                        continue
                     _ie = float(asset_prices.get(_i_asset) or _iac.get("current_price") or 0)
-                    _iatr = float(_iac.get("long_term_4h", {}).get("atr14") or 0)
-                    if _ie <= 0 or _iatr <= 0:
+                    _iatr_5m = float(_isig.get("atr") or 0)
+                    _ibb_mid = float(_isig.get("bb_mid") or 0)
+                    _ifee_buf = _ie * float(CONFIG.get("taker_fee_pct") or 0.00045) * 2
+                    if _ie <= 0 or _iatr_5m <= 0 or _ibb_mid <= 0:
                         continue
-                    _itp1, _itp2, _isl, _itp = _code_compute_tpsl(_ie, _iatr, _idir, _iscr, funding_rate=float(_iac.get("funding_rate") or 0))
+                    if _idir_str == "buy":
+                        _itp = round(_ibb_mid, 6)
+                        _isl = round(_ie - 1.5 * _iatr_5m, 6)
+                        if _itp <= _ie + _ifee_buf:
+                            continue
+                    else:
+                        _itp = round(_ibb_mid, 6)
+                        _isl = round(_ie + 1.5 * _iatr_5m, 6)
+                        if _itp >= _ie - _ifee_buf:
+                            continue
+                    _itp1 = _itp
+                    _itp2 = _itp
                     _i_buying_power = account_value * float(CONFIG.get("max_leverage") or 5)
                     _i_pct_cap = _i_buying_power * (float(CONFIG.get("max_position_pct") or 15) / 100.0)
                     _i_atr_sized = risk_mgr.atr_position_size(account_value, _ie, _isl)
-                    _ialloc = min(_i_pct_cap, _i_atr_sized) * (min(_iscr, 10.0) / 10.0)
-                    # ADX ranging market guard (inner loop)
-                    _iadx_1h = float(_iac.get("intraday_1h", {}).get("adx") or 15)
-                    _iadx_thr = float(CONFIG.get("adx_half_size_threshold") or 20)  # BUG-v7-O3 FIX: default was 15 but .env is 20; aligned to authoritative .env value
-                    if _iadx_1h < _iadx_thr and _iscr < 9.0:
-                        _ialloc *= 0.5
-                        logging.info("[INNER SIZE] %s ADX %.1f < %.0f + score %.1f < 9 → half-size",
-                                     _i_asset, _iadx_1h, _iadx_thr, _iscr)
-
-                    # Confluence gate (inner loop)
-                    if not multi_timeframe_confluence(_iac, _idir):
-                        continue
-
-                    # MIN_AI_SCORE gate (inner loop)
-                    _imin_ai = float(CONFIG.get("min_ai_score") or 6)
-                    if _iscr < _imin_ai:
-                        logging.info("[INNER AI GATE] %s score=%.1f < MIN_AI_SCORE %.1f → HOLD", _i_asset, _iscr, _imin_ai)
-                        continue
-
-                    # AI verdict: cache → gap → stale-TF check → call Claude
-                    _ifp  = _build_confluence_fingerprint(
-                        _i_asset, _idir,
-                        _iac.get("trend_4h", "UNKNOWN"), _iac.get("trend_1h", "UNKNOWN"), _iscr
-                    )
-                    _inow = datetime.now(timezone.utc)
-                    _ic   = _ai_verdict_cache.get(_i_asset)
-                    _iuse = False
-                    if _ic:
-                        _icfp, _icexp = _ic.get("fingerprint"), _ic.get("expires_at")
-                        if _icfp == _ifp and _icexp and _inow < _icexp:
-                            if _ic.get("verdict") == "APPROVE":
-                                _iuse = True
-                            else:
-                                continue  # cached REJECT
-                    if not _iuse:
-                        _igap  = int(CONFIG.get("min_ai_call_gap_minutes") or 30)
-                        _ilast = _last_ai_call_time.get(_i_asset, 0)
-                        _igsec = time.time() - _ilast
-                        if _ilast > 0 and _igsec < _igap * 60:
-                            _ipc = _ai_verdict_cache.get(_i_asset)
-                            if _ipc and _ipc.get("verdict") == "APPROVE":
-                                _iuse = True
-                            else:
-                                continue
-                    if not _iuse:
-                        # Block AI call if higher-TF data is too stale
-                        _istale = int(CONFIG.get("ai_stale_tf_minutes") or 55)
-                        _iage   = time.monotonic() - _outer_cycle_timestamp
-                        if _iage > _istale * 60:
-                            logging.info("[INNER AI STALE] %s %.0f min old → HOLD", _i_asset, _iage / 60)
-                            continue
+                    _ialloc = min(_i_pct_cap, _i_atr_sized)
+                    # Anomaly check
+                    _i_chg_5c = 0.0
+                    if len(_i_candles_5m) >= 5:
+                        _ip_now = float(_i_candles_5m[-1]["close"])
+                        _ip_5a = float(_i_candles_5m[-5]["close"])
+                        if _ip_5a > 0:
+                            _i_chg_5c = abs(_ip_now - _ip_5a) / _ip_5a * 100
+                    _i_anm_pct = float(CONFIG.get("anomaly_trigger_pct") or 3.0)
+                    if _i_chg_5c > _i_anm_pct:
                         _iverd = await asyncio.to_thread(
-                            agent.confirm_trade, _i_asset, _idir, _ie, _itp, _isl, _iscr, {},
-                            _macro_context_cache, _iac
-                        )
-                        _last_ai_call_time[_i_asset] = time.time()
-                        _iapm = int(CONFIG.get("ai_approve_cache_minutes") or 60)
-                        _irjm = int(CONFIG.get("ai_reject_cache_minutes") or 30)
-                        _icm  = _iapm if _iverd == "APPROVE" else _irjm
-                        _ai_verdict_cache[_i_asset] = {
-                            "verdict": _iverd, "fingerprint": _ifp,
-                            "expires_at": _inow + timedelta(minutes=_icm),
-                        }
+                            agent.claude_anomaly_check, _i_asset, _i_chg_5c, _idir_str)
                         if _iverd != "APPROVE":
                             continue
-
-                    _ilim_px = round(_ie * (1 - 0.0015), 6) if _idir == "buy" else round(_ie * (1 + 0.0015), 6)
+                    _ilim_px = round(_ie * (1 - 0.0015), 6) if _idir_str == "buy" else round(_ie * (1 + 0.0015), 6)
                     _inner_outputs["trade_decisions"].append({
-                        "asset": _i_asset, "action": _idir,
-                        "allocation_usd": _ialloc, "order_type": "limit",   # BONUS-2
+                        "asset": _i_asset, "action": _idir_str,
+                        "allocation_usd": _ialloc, "order_type": "limit",
                         "limit_price": _ilim_px, "tp_price": _itp, "tp1_price": _itp1, "tp2_price": _itp2,
-                        "sl_price": _isl, "atr14": _iatr, "current_price": _ie,
-                        "score": round(_iscr, 2),  # P5-HIGH-1: store per-asset score so execution loop uses correct value
-                        "exit_plan": f"inner TP={_itp:.4f} TP1={_itp1:.4f} TP2={_itp2:.4f} SL={_isl:.4f} score={_iscr:.1f}",
-                        "rationale": f"inner score={_iscr:.1f}",
+                        "sl_price": _isl, "atr14": _iatr_5m, "current_price": _ie,
+                        "score": 8.0,
+                        "exit_plan": f"inner BB-rev TP={_itp:.4f} SL={_isl:.4f} K={_isig.get('stochrsi_k')}",
+                        "rationale": f"inner BB+StochRSI K={_isig.get('stochrsi_k')} {_idir_str}",
                     })
 
-                # Execute inner-loop trades (state gate + market_filter + entry_confirmed + risk)
+                # Execute inner-loop trades (state gate + spread + candle gate + risk)
                 for _iout in _inner_outputs.get("trade_decisions", []):
                     _ia = _iout.get("asset")
                     if not _ia or _iout.get("action") not in ("buy", "sell"):
@@ -2879,59 +2537,22 @@ def main():
                         _ism = state_mgr.get_state(_ia)
                         if _ism in ("ENTERED", "COOLDOWN"):
                             continue
-                        # C-4: use refreshed price (updated above for this tick)
                         _iprice = asset_prices.get(_ia, 0)
                         if not _iprice or _iprice <= 0:
                             continue
                         _iact_ctx = next((m for m in market_sections if m.get("asset") == _ia), {})
-                        _itrend_1d = asset_trends_1d.get(_ia, "UNKNOWN")
-                        _iadx_1d = asset_adx_1d.get(_ia)
-                        # HIGH-2 FIX: Mirror BUG-v9-L4 fix from outer loop.
-                        # When 1d ADX is unavailable (< 14 daily candles), apply the daily
-                        # macro filter based on EMA trend alone — inner loop was silently
-                        # skipping the filter when ADX=None, allowing counter-trend entries
-                        # that the outer loop would have blocked.
-                        _imacro_trending = (
-                            (_iadx_1d is not None and float(_iadx_1d) > 20)
-                            or (_iadx_1d is None and _itrend_1d != "UNKNOWN")
-                        )
-                        if _imacro_trending:
-                            _iadx_str = f"ADX={float(_iadx_1d):.1f}" if _iadx_1d is not None else "ADX=N/A (insufficient history)"
-                            if _itrend_1d == "BEARISH" and _iout["action"] == "buy":
-                                logging.info("[INNER DAILY FILTER] %s BUY blocked — daily BEARISH + %s", _ia, _iadx_str)
-                                continue
-                            if _itrend_1d == "BULLISH" and _iout["action"] == "sell":
-                                logging.info("[INNER DAILY FILTER] %s SELL blocked — daily BULLISH + %s", _ia, _iadx_str)
-                                continue
-                        _iact_ctx_local = {**_iact_ctx, "candles_5m": asset_candles_5m.get(_ia, []), "_current_score": _iout.get("score", _iscr)}
-                        _btc_trend_1h_inner = next(
-                            (m.get("trend_1h", "UNKNOWN") for m in market_sections if m.get("asset") == "BTC"),
-                            "UNKNOWN"
-                        )
-                        _mf_ok, _mf_why = market_filter(
-                            _iact_ctx_local,
-                            btc_trend_1h=_btc_trend_1h_inner,
-                            btc_candles_5m=asset_candles_5m.get("BTC", []),
-                            direction=_iout["action"]
-                        )
-                        if not _mf_ok:
-                            logging.info("[INNER MKTFILTER] %s blocked: %s", _ia, _mf_why)
+                        # Spread check
+                        _ispread = float(_iact_ctx.get("spread_pct") or 0)
+                        if _ispread > 0.15:
+                            logging.info("[INNER SPREAD] %s blocked — spread %.3f%%", _ia, _ispread)
                             continue
-                        if not entry_confirmed(_iact_ctx_local, _iout["action"]):
-                            logging.info("[INNER ENTRY] %s entry_confirmed failed — 15m/5m conditions not met", _ia)
-                            continue
-                        # BONUS-1: Candle-close gate (same 70% logic as outer loop)
+                        # Candle gate — need at least 30% of 5m candle complete
                         _i_secs_into_5m = (datetime.now(timezone.utc).minute % 5) * 60 + datetime.now(timezone.utc).second
-                        if (_i_secs_into_5m / 300) < 0.70:
+                        if (_i_secs_into_5m / 300) < 0.30:
                             logging.info("[INNER CANDLE GATE] %s candle only %.0f%% complete", _ia, _i_secs_into_5m / 3)
                             continue
-                        # BONUS-1: OI confirmation gate
-                        _i_oi_ok, _i_oi_reason = oi_confirmed(_iact_ctx_local, _iout["action"])
-                        if not _i_oi_ok:
-                            logging.info("[INNER OI GATE] %s blocked — %s", _ia, _i_oi_reason)
-                            continue
                         _iout["current_price"] = _iprice
-                        _iout["atr14"] = _iact_ctx.get("long_term_4h", {}).get("atr14")
+                        # atr14 already set from 5m signal
                         _iallowed, _ireason, _iout = risk_mgr.validate_trade(_iout, state, initial_account_value or 0)
                         if not _iallowed:
                             add_event(f"[INNER RISK] {_ia}: {_ireason}")
