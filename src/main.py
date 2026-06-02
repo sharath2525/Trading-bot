@@ -53,22 +53,11 @@ _root_logger.addHandler(_log_file_handler)
 _dashboard_token = os.getenv("DASHBOARD_TOKEN", "").strip()
 _api_host = os.getenv("API_HOST", "127.0.0.1").strip()
 _api_host_is_local = _api_host in ("127.0.0.1", "localhost", "::1")
-if not _dashboard_token:
-    if not _api_host_is_local:
-        print(
-            "[SECURITY] FATAL: DASHBOARD_TOKEN is not set and API_HOST is not localhost.\n"
-            "  The dashboard exposes live account balance, positions, and trade history.\n"
-            "  Either set DASHBOARD_TOKEN in .env (recommended) or change API_HOST to 127.0.0.1.\n"
-            "  Refusing to start to protect your funds."
-        )
-        import sys as _sys
-        _sys.exit(1)
+if not _dashboard_token and not _api_host_is_local:
     logging.warning(
-        "[SECURITY] ⚠️  DASHBOARD_TOKEN not set — HTTP dashboard is unauthenticated. "
-        "The /logs endpoint serves account balance and position data. "
-        "Set DASHBOARD_TOKEN in .env and restrict port 3000 to localhost."
+        "[SECURITY] ⚠️  DASHBOARD_TOKEN not set — dashboard accessible without auth on 0.0.0.0. "
+        "Set DASHBOARD_TOKEN in .env if you want to protect the dashboard."
     )
-    print("[SECURITY] ⚠️  DASHBOARD_TOKEN not set — dashboard has no auth. Set it in .env to protect account data.")
 
 # Telegram alert status — warn at startup if not configured
 from src.alerts import _ENABLED as _telegram_enabled
