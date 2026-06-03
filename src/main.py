@@ -2847,16 +2847,33 @@ def main():
             _live_av = state.get('total_value') or 0.0
             _live_init = _load_initial_balance()
             _live_ret = round(((_live_av - _live_init) / _live_init * 100.0), 2) if _live_init and _live_av else None
+            # Fetch funding rates for all tracked assets
+            funding_rates = {}
+            try:
+                _meta_ctx = await hyperliquid.get_meta_and_ctxs()
+                if _meta_ctx and len(_meta_ctx) >= 2:
+                    _universe = _meta_ctx[0].get("universe", [])
+                    _ctxs     = _meta_ctx[1]
+                    _name_map = {a["name"]: i for i, a in enumerate(_universe)}
+                    for _fa in (args.assets or []):
+                        _fi = _name_map.get(_fa)
+                        if _fi is not None and _fi < len(_ctxs):
+                            _fr = _ctxs[_fi].get("funding")
+                            if _fr is not None:
+                                funding_rates[_fa] = round(float(_fr) * 100, 6)
+            except Exception:
+                pass
             return web.json_response({
                 "account_value":    round_or_none(_live_av, 2),
                 "balance":          round_or_none(state.get('balance'), 2),
                 "perps_value":      round_or_none(state.get('perps_value'), 2),
                 "spot_usdc":        round_or_none(state.get('spot_usdc'), 2),
                 "withdrawable":     round_or_none(state.get('withdrawable'), 2),
-                "total_return_pct": _live_ret,   # server-authoritative return vs initial deposit
+                "total_return_pct": _live_ret,
                 "positions":        positions,
                 "open_orders":      open_orders,
                 "recent_fills":     recent_fills,
+                "funding_rates":    funding_rates,
                 "timestamp":        datetime.now(timezone.utc).isoformat()
             })
         except Exception as e:
@@ -2989,6 +3006,109 @@ def main():
         except Exception as e:
             return web.json_response([], status=200)
 
+    # ── /indicators cache — refreshed at most once per 60s ────────────────────
+    _ind_cache: dict = {"ts": 0.0, "data": {}}
+
+    async def handle_indicators(request):
+        """Current BB position %, StochRSI-K, ADX per asset. Cached 60s."""
+        try:
+            if time.time() - _ind_cache["ts"] < 60 and _ind_cache["data"]:
+                return web.json_response(_ind_cache["data"])
+            result = {}
+            for _a in (args.assets or []):
+                try:
+                    c5 = await hyperliquid.get_candles(_a, "5m", 50)
+                    c1h = await hyperliquid.get_candles(_a, "1h", 30)
+                    if not c5 or len(c5) < 20:
+                        result[_a] = {"error": "no data"}; continue
+                    i5 = compute_all(c5)
+                    i1 = compute_all(c1h) if c1h and len(c1h) >= 14 else {}
+                    price = float(c5[-1][4])
+                    bbu = (i5.get("bb_upper") or [None])[-1]
+                    bbl = (i5.get("bb_lower") or [None])[-1]
+                    bbm = (i5.get("bb_mid")   or [None])[-1]
+                    sk  = (i5.get("stochrsi_k") or [None])[-1]
+                    adx = (i1.get("adx") or [None])[-1]
+                    pct = None
+                    if bbu and bbl and float(bbu) != float(bbl):
+                        pct = round((price - float(bbl)) / (float(bbu) - float(bbl)) * 100, 1)
+                    result[_a] = {
+                        "price": round(price, 6),
+                        "bb_upper": round_or_none(bbu, 4),
+                        "bb_lower": round_or_none(bbl, 4),
+                        "bb_mid":   round_or_none(bbm, 4),
+                        "bb_pct":   pct,
+                        "stochrsi_k": round_or_none(sk, 2),
+                        "adx_1h": round_or_none(adx, 1),
+                    }
+                except Exception as _ae:
+                    result[_a] = {"error": str(_ae)}
+            _ind_cache["data"] = result
+            _ind_cache["ts"]   = time.time()
+            return web.json_response(result)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=200)
+
+    async def handle_health(request):
+        """Bot health: uptime, cycles, memory, last cycle, signal count."""
+        try:
+            _sp = pathlib.Path(__file__).parent.parent / "bot_started.json"
+            started_at = None
+            if _sp.exists():
+                started_at = json.loads(_sp.read_text(encoding="utf-8")).get("started_at")
+            uptime_secs = None
+            if started_at:
+                _s = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                uptime_secs = int((datetime.now(timezone.utc) - _s).total_seconds())
+            total_cycles, today_cycles, last_ts = 0, 0, None
+            _today = datetime.now(timezone.utc).date().isoformat()
+            if os.path.exists(decisions_path):
+                with open(decisions_path, "r", encoding="utf-8") as _f:
+                    _lines = [l for l in _f if l.strip()]
+                total_cycles = len(_lines)
+                for _l in _lines:
+                    try:
+                        if (json.loads(_l).get("timestamp") or "").startswith(_today):
+                            today_cycles += 1
+                    except Exception:
+                        pass
+                if _lines:
+                    try: last_ts = json.loads(_lines[-1]).get("timestamp")
+                    except Exception: pass
+            last_ago = None
+            if last_ts:
+                try:
+                    _lc = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+                    last_ago = int((datetime.now(timezone.utc) - _lc).total_seconds())
+                except Exception: pass
+            mem_mb = None
+            try:
+                with open("/proc/self/status") as _ms:
+                    for _ml in _ms:
+                        if _ml.startswith("VmRSS:"):
+                            mem_mb = round(int(_ml.split()[1]) / 1024, 1); break
+            except Exception: pass
+            sig_count = 0
+            if os.path.exists(_signals_path):
+                with open(_signals_path) as _sf:
+                    sig_count = sum(1 for _ in _sf)
+            return web.json_response({
+                "started_at":       started_at,
+                "uptime_seconds":   uptime_secs,
+                "total_cycles":     total_cycles,
+                "today_cycles":     today_cycles,
+                "last_cycle_ts":    last_ts,
+                "last_cycle_ago":   last_ago,
+                "memory_mb":        mem_mb,
+                "assets":           args.assets or [],
+                "interval":         args.interval,
+                "total_signals":    sig_count,
+                "max_daily_trades": CONFIG.get("max_daily_trades", 40),
+                "max_concurrent":   CONFIG.get("max_concurrent_positions", 3),
+            })
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=200)
+
     async def start_api(app):
         """Register HTTP endpoints for observing diary entries and logs."""
         app.router.add_get('/', handle_index)
@@ -3000,6 +3120,8 @@ def main():
         app.router.add_get('/signals', handle_signals)
         app.router.add_get('/stats', handle_stats)
         app.router.add_get('/trades', handle_trades)
+        app.router.add_get('/indicators', handle_indicators)
+        app.router.add_get('/health', handle_health)
         app.router.add_route('OPTIONS', '/{path_info:.*}', lambda r: web.Response())
 
     async def main_async():
