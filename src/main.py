@@ -1654,11 +1654,12 @@ def main():
                     outputs["trade_decisions"].append(_make_hold(_asset, f"SL cooldown {_mins_left}min remaining"))
                     continue
 
-                # Regime pause: 1h ADX > TREND_PAUSE_ADX (30) = strong trend = skip reversion
+                # Regime pause: 1h ADX > per-asset threshold = strong trend = skip reversion
                 if is_trend_regime_active(_ac, CONFIG):
                     _adx_val = _ac.get("intraday_1h", {}).get("adx", "?")
+                    _adx_threshold = CONFIG.get(f"adx_override_{_asset.lower()}") or CONFIG.get("trend_pause_adx", 30)
                     outputs["trade_decisions"].append(_make_hold(
-                        _asset, f"regime pause: 1h ADX={_adx_val} > {CONFIG.get('trend_pause_adx', 30)} (trend too strong)"))
+                        _asset, f"regime pause: 1h ADX={_adx_val} > {_adx_threshold} (trend too strong)"))
                     continue
 
                 # BB + StochRSI signal
@@ -2907,8 +2908,8 @@ def main():
             pass
         return web.json_response({
             "bot_started": _started.get("started_at") if _started else None,
-
             "network": (CONFIG.get("hyperliquid_network") or "mainnet").upper(),
+            "assets": args.assets or [],
         })
 
     async def handle_signals(request):
