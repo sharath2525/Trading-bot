@@ -118,19 +118,32 @@ def compute_bb_stochrsi_signal(candles_5m: list, cfg: dict) -> dict:
 
 
 def is_trend_regime_active(asset_data: dict, cfg: dict) -> bool:
-    """Return True if 1h ADX is above TREND_PAUSE_ADX — strong trend, bad for mean reversion.
+    """Return True if 1h ADX is above the asset's ADX threshold — strong trend, bad for mean reversion.
 
-    When True, skip all new entries for this asset this cycle.
+    Per-asset thresholds set in .env as ADX_OVERRIDE_<ASSET>=<value>
+    e.g. ADX_OVERRIDE_PAXG=50, ADX_OVERRIDE_SPX=48, ADX_OVERRIDE_BTC=38
+    Falls back to TREND_PAUSE_ADX (default 30) if no per-asset override exists.
     Returns False (allow entry) when ADX data is unavailable — fail open for data gaps.
     """
     adx_1h = asset_data.get("intraday_1h", {}).get("adx")
     if adx_1h is None:
         return False  # no data → don't block
-    trend_pause = float(cfg.get("trend_pause_adx") or 30.0)
+
+    asset_name = (asset_data.get("asset", "") or "").upper()
+    # Check per-asset override first: ADX_OVERRIDE_PAXG=50, ADX_OVERRIDE_SPX=48, etc.
+    override_key = f"adx_override_{asset_name.lower()}"
+    per_asset = cfg.get(override_key)
+    trend_pause = float(per_asset) if per_asset is not None else float(cfg.get("trend_pause_adx") or 30.0)
+
     is_trending = float(adx_1h) > trend_pause
     if is_trending:
         logging.info(
             "[REGIME] %s 1h ADX=%.1f > %.0f — strong trend active, pausing reversion entries",
+            asset_data.get("asset", "?"), float(adx_1h), trend_pause,
+        )
+    else:
+        logging.info(
+            "[REGIME] %s 1h ADX=%.1f <= %.0f — regime OK, entries allowed",
             asset_data.get("asset", "?"), float(adx_1h), trend_pause,
         )
     return is_trending

@@ -103,6 +103,14 @@ CONFIG = {
     "session_block_start_utc": _get_int("SESSION_BLOCK_START_UTC", 0),
     "session_block_end_utc": _get_int("SESSION_BLOCK_END_UTC", 6),
 
+    # Per-asset ADX overrides — set in .env as ADX_OVERRIDE_<ASSET>=<value>
+    # Gold/stocks trend slower → higher threshold. Crypto → use TREND_PAUSE_ADX default.
+    **{
+        f"adx_override_{k[13:].lower()}": float(v)
+        for k, v in os.environ.items()
+        if k.upper().startswith("ADX_OVERRIDE_") and v.strip()
+    },
+
     # AI anomaly detector + regime classifier
     "anomaly_trigger_pct": float(_get_env("ANOMALY_TRIGGER_PCT", "3.0")),
     "ai_anomaly_max_tokens": _get_int("AI_ANOMALY_MAX_TOKENS", 10),
