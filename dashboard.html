@@ -152,47 +152,34 @@ tr:last-child td { border-bottom: none; }
 // Open it via http://localhost:3000 (or SSH tunnel for remote servers).
 const API = '';
 
-// ── Auth (V4-HIGH-1) ──────────────────────────────────────────────────────────
-// If DASHBOARD_TOKEN is set in .env the server requires "Authorization: Bearer <token>".
-// The token is stored in localStorage so it persists across page reloads.
-let _tok = localStorage.getItem('dash_token') || '';
-function authHeaders() { return _tok ? {'Authorization': 'Bearer '+_tok} : {}; }
 function apiFetch(url, opts={}) {
-  return fetch(API+url, {...opts, headers: {...authHeaders(), ...(opts.headers||{})}});
+  return fetch(API+url, opts);
 }
 
-// Prompt for token on 401 — only shown when server has auth enabled.
 async function checkAuth() {
   try {
     const r = await apiFetch('/meta');
-    if (r.status === 401) {
-      const t = prompt('Dashboard token required (set DASHBOARD_TOKEN in .env):', '');
-      if (t) { localStorage.setItem('dash_token', t); _tok = t; }
-    } else {
-      const m = await r.json();
-      if (m.bot_started) {
-        const el = document.getElementById('sAct');
-        if (el) {
-          const d = new Date(m.bot_started);
-          if (!isNaN(d.getTime()))
-            el.textContent = d.toLocaleDateString([], {month:'short', day:'numeric', year:'numeric'});
-        }
+    const m = await r.json();
+    if (m.bot_started) {
+      const el = document.getElementById('sAct');
+      if (el) {
+        const d = new Date(m.bot_started);
+        if (!isNaN(d.getTime()))
+          el.textContent = d.toLocaleDateString([], {month:'short', day:'numeric', year:'numeric'});
       }
-      // Network indicator — prominent warning when on testnet
-      if (m.network) {
-        const netEl = document.getElementById('sNet');
-        if (netEl) {
-          netEl.textContent = m.network;
-          const isTestnet = m.network === 'TESTNET';
-          netEl.style.background = isTestnet ? '#854d0e' : '#14532d';
-          netEl.style.color = isTestnet ? '#fef08a' : '#bbf7d0';
-          netEl.style.display = 'inline-block';
-        }
+    }
+    if (m.network) {
+      const netEl = document.getElementById('sNet');
+      if (netEl) {
+        netEl.textContent = m.network;
+        const isTestnet = m.network === 'TESTNET';
+        netEl.style.background = isTestnet ? '#854d0e' : '#14532d';
+        netEl.style.color = isTestnet ? '#fef08a' : '#bbf7d0';
+        netEl.style.display = 'inline-block';
       }
     }
   } catch(e) { /* offline */ }
 }
-// ─────────────────────────────────────────────────────────────────────────────
 
 let entries = [];   // diary entries
 let live    = {};   // /live data

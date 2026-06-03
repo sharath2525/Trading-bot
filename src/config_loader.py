@@ -73,9 +73,8 @@ CONFIG = {
     "min_balance_reserve_pct": _get_env("MIN_BALANCE_RESERVE_PCT", "20"),
 
     # API server
-    "api_host": _get_env("API_HOST", "127.0.0.1"),
+    "api_host": _get_env("API_HOST", "0.0.0.0"),
     "api_port": _get_env("APP_PORT") or _get_env("API_PORT") or "3000",
-    "dashboard_token": _get_env("DASHBOARD_TOKEN"),
 
     # Telegram
     "telegram_bot_token": _get_env("TELEGRAM_BOT_TOKEN", ""),

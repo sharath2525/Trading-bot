@@ -45,19 +45,7 @@ _log_file_handler.setLevel(logging.INFO)
 _log_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 _root_logger.addHandler(_log_file_handler)
 
-# BUG-P9-5 FIX: Warn at startup when DASHBOARD_TOKEN is not set.
-# The /logs endpoint serves decisions.jsonl which contains account value, positions,
-# and allocation amounts. Without a token the dashboard is fully unauthenticated.
-# BUG-v7-S3 FIX: Refuse to start if DASHBOARD_TOKEN is unset and API_HOST is not localhost.
-# An open dashboard on 0.0.0.0 with no auth exposes live position data to any host on port 3000.
-_dashboard_token = os.getenv("DASHBOARD_TOKEN", "").strip()
-_api_host = os.getenv("API_HOST", "127.0.0.1").strip()
-_api_host_is_local = _api_host in ("127.0.0.1", "localhost", "::1")
-if not _dashboard_token and not _api_host_is_local:
-    logging.warning(
-        "[SECURITY] ⚠️  DASHBOARD_TOKEN not set — dashboard accessible without auth on 0.0.0.0. "
-        "Set DASHBOARD_TOKEN in .env if you want to protect the dashboard."
-    )
+_api_host = os.getenv("API_HOST", "0.0.0.0").strip()
 
 # Telegram alert status — warn at startup if not configured
 from src.alerts import _ENABLED as _telegram_enabled
@@ -332,25 +320,9 @@ async def cors_middleware(request, handler):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# ── Auth middleware (V4-HIGH-1) ───────────────────────────────────────────────
 @web.middleware
 async def auth_middleware(request, handler):
-    """Bearer-token gate for all non-OPTIONS routes.
-
-    Set DASHBOARD_TOKEN in .env to enable. Unset = no auth (backward compatible).
-    The dashboard HTML reads the token from localStorage and sends it as
-    'Authorization: Bearer <token>' on every API request.
-    The root '/' route (dashboard HTML itself) is always allowed so operators
-    can load the page to enter their token.
-    """
-    _token = CONFIG.get("dashboard_token")
-    if not _token or request.method == "OPTIONS" or request.path == "/":
-        return await handler(request)
-    _auth = request.headers.get("Authorization", "")
-    if _auth == f"Bearer {_token}":
-        return await handler(request)
-    return web.json_response({"error": "Unauthorized"}, status=401)
-# ─────────────────────────────────────────────────────────────────────────────
+    return await handler(request)
 
 
 def main():
@@ -2935,7 +2907,7 @@ def main():
             pass
         return web.json_response({
             "bot_started": _started.get("started_at") if _started else None,
-            "auth_enabled": bool(CONFIG.get("dashboard_token")),
+
             "network": (CONFIG.get("hyperliquid_network") or "mainnet").upper(),
         })
 
