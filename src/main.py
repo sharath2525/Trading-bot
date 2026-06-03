@@ -2911,6 +2911,83 @@ def main():
             "network": (CONFIG.get("hyperliquid_network") or "mainnet").upper(),
         })
 
+    async def handle_signals(request):
+        """Return last N entries from signals.jsonl for the Signal Status panel."""
+        try:
+            limit = min(int(request.query.get('limit', '100')), 1000)
+            sigs = []
+            if os.path.exists(_signals_path):
+                with open(_signals_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                for line in lines[max(0, len(lines) - limit):]:
+                    try:
+                        sigs.append(json.loads(line))
+                    except Exception:
+                        pass
+            return web.json_response(sigs)
+        except Exception as e:
+            return web.json_response([], status=200)
+
+    async def handle_stats(request):
+        """Compute trade stats from diary.jsonl: win rate, avg profit, avg loss, profit factor, by exit type."""
+        try:
+            wins, losses, total_pnl = [], [], 0.0
+            by_exit = {"tp": 0, "sl": 0, "time_limit": 0, "unknown": 0}
+            if os.path.exists(diary_path):
+                with open(diary_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            e = json.loads(line)
+                            if e.get("event") == "trade_closed" and e.get("realized_pnl") is not None:
+                                pnl = float(e["realized_pnl"])
+                                total_pnl = round(total_pnl + pnl, 4)
+                                if pnl > 0:
+                                    wins.append(pnl)
+                                else:
+                                    losses.append(pnl)
+                                et = e.get("exit_type", "unknown")
+                                by_exit[et] = by_exit.get(et, 0) + 1
+                        except Exception:
+                            pass
+            total = len(wins) + len(losses)
+            avg_win  = round(sum(wins) / len(wins), 4) if wins else 0
+            avg_loss = round(sum(losses) / len(losses), 4) if losses else 0
+            gross_profit = sum(wins)
+            gross_loss   = abs(sum(losses))
+            profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else None
+            return web.json_response({
+                "total_trades":   total,
+                "wins":           len(wins),
+                "losses":         len(losses),
+                "win_rate":       round(len(wins) / total * 100, 1) if total else 0,
+                "avg_win":        avg_win,
+                "avg_loss":       avg_loss,
+                "total_pnl":      round(total_pnl, 4),
+                "profit_factor":  profit_factor,
+                "by_exit_type":   by_exit,
+            })
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=200)
+
+    async def handle_trades(request):
+        """Return closed trade events from diary.jsonl for the Trade History tab."""
+        try:
+            limit = min(int(request.query.get('limit', '100')), 1000)
+            trades = []
+            if os.path.exists(diary_path):
+                with open(diary_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                for line in lines:
+                    try:
+                        e = json.loads(line)
+                        if e.get("event") == "trade_closed":
+                            trades.append(e)
+                    except Exception:
+                        pass
+            return web.json_response(trades[-limit:])
+        except Exception as e:
+            return web.json_response([], status=200)
+
     async def start_api(app):
         """Register HTTP endpoints for observing diary entries and logs."""
         app.router.add_get('/', handle_index)
@@ -2919,6 +2996,9 @@ def main():
         app.router.add_get('/live', handle_live)
         app.router.add_get('/fills', handle_fills)
         app.router.add_get('/logs', handle_logs)
+        app.router.add_get('/signals', handle_signals)
+        app.router.add_get('/stats', handle_stats)
+        app.router.add_get('/trades', handle_trades)
         app.router.add_route('OPTIONS', '/{path_info:.*}', lambda r: web.Response())
 
     async def main_async():

@@ -8,28 +8,66 @@
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: 'Georgia', serif; background: #f5f4ef; color: #1a1a1a; }
-.container { max-width: 1200px; margin: 0 auto; padding: 28px 20px; }
+.container { max-width: 1280px; margin: 0 auto; padding: 28px 20px; }
 
+/* ── Header ── */
 .header { text-align: center; border-bottom: 2px solid #1a1a1a; padding-bottom: 14px; margin-bottom: 24px; }
 .header h1 { font-size: 28px; font-weight: 700; letter-spacing: 6px; text-transform: uppercase; }
-.header-sub { display: flex; justify-content: space-between; margin-top: 8px; font-size: 12px; color: #888; font-style: italic; }
+.header-sub { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; font-size: 12px; color: #888; font-style: italic; }
 .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #ccc; margin-right: 5px; vertical-align: middle; }
 .dot.on { background: #22c55e; animation: pulse 2s infinite; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+.refresh-timer { font-size: 10px; color: #aaa; font-style: normal; }
 
+/* ── Stat grid ── */
 .stat-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 1px; background: #ccc; border: 1px solid #ccc; margin-bottom: 1px; }
 .stat { background: #fff; padding: 18px 14px; text-align: center; }
 .stat-lbl { font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: #888; margin-bottom: 8px; }
 .stat-val { font-size: 22px; font-weight: 700; }
+.stat-sub { font-size: 0.72rem; color: #888; margin-top: 2px; }
 .g { color: #15803d; } .r { color: #dc2626; } .n { color: #888; }
 
-.pnl-row { display: grid; grid-template-columns: repeat(4,1fr); gap: 1px; background: #1a1a1a; border: 1px solid #1a1a1a; margin-bottom: 24px; }
+/* ── P&L row ── */
+.pnl-row { display: grid; grid-template-columns: repeat(4,1fr); gap: 1px; background: #1a1a1a; border: 1px solid #1a1a1a; margin-bottom: 16px; }
 .pnl-card { background: #1a1a1a; padding: 14px; text-align: center; }
 .pnl-lbl { font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: #555; margin-bottom: 7px; }
 .pnl-usd { font-size: 18px; font-weight: 700; }
 .pnl-pct { font-size: 11px; margin-top: 3px; color: #666; }
+.pnl-note { font-size: 10px; color: #aaa; grid-column: 1/-1; text-align: center; padding: 4px 14px 8px; }
 
-.charts-row { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; margin-bottom: 22px; }
+/* ── Trade stats bar ── */
+.stats-bar { display: grid; grid-template-columns: repeat(6,1fr); gap: 1px; background: #e5e3dc; border: 1px solid #ccc; margin-bottom: 16px; }
+.sb { background: #fafaf7; padding: 12px 10px; text-align: center; }
+.sb-lbl { font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: #888; margin-bottom: 6px; }
+.sb-val { font-size: 16px; font-weight: 700; }
+
+/* ── Signal status panel ── */
+.signal-panel { background: #fff; border: 1px solid #ccc; padding: 16px; margin-bottom: 16px; }
+.panel-title { font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: #888; margin-bottom: 12px; display: flex; justify-content: space-between; }
+.sig-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; }
+.sig-card { border: 1px solid #e5e3dc; padding: 12px; background: #fafaf7; }
+.sig-asset { font-size: 13px; font-weight: 700; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+.sig-rows { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; }
+.sig-row { font-size: 10px; color: #555; }
+.sig-key { color: #aaa; font-size: 9px; display: block; text-transform: uppercase; letter-spacing: 1px; }
+.sig-badge { font-size: 9px; padding: 2px 6px; border: 1px solid; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+.sig-badge.long { border-color: #15803d; color: #15803d; }
+.sig-badge.short { border-color: #dc2626; color: #dc2626; }
+.sig-badge.none { border-color: #aaa; color: #aaa; }
+
+/* ── Gate status ── */
+.gate-panel { background: #fff; border: 1px solid #ccc; padding: 16px; margin-bottom: 16px; }
+.gate-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; }
+.gate-card { border: 1px solid #e5e3dc; padding: 12px; background: #fafaf7; }
+.gate-asset { font-size: 13px; font-weight: 700; margin-bottom: 8px; }
+.gate-rows { display: flex; flex-wrap: wrap; gap: 5px; }
+.gate-item { font-size: 9px; padding: 3px 7px; border-radius: 2px; letter-spacing: 1px; text-transform: uppercase; font-weight: 700; }
+.gate-ok  { background: #dcfce7; color: #15803d; }
+.gate-off { background: #fee2e2; color: #dc2626; }
+.gate-unk { background: #f3f4f6; color: #888; }
+
+/* ── Charts ── */
+.charts-row { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; margin-bottom: 16px; }
 .chart-box { background: #fff; border: 1px solid #ccc; padding: 16px; }
 .chart-lbl { font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: #888; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
 .tbns { display: flex; gap: 3px; }
@@ -37,21 +75,29 @@ body { font-family: 'Georgia', serif; background: #f5f4ef; color: #1a1a1a; }
 .tbn.active { background: #1a1a1a; color: #fff; border-color: #1a1a1a; }
 .chart-wrap { height: 190px; position: relative; }
 
+/* ── Tabs ── */
 .tabs { display: flex; border-bottom: 2px solid #1a1a1a; margin-bottom: 16px; }
 .tab { padding: 8px 16px; font-size: 10px; letter-spacing: 2px; text-transform: uppercase; cursor: pointer; color: #888; border-bottom: 2px solid transparent; margin-bottom: -2px; background: none; border-top: none; border-left: none; border-right: none; font-family: Georgia,serif; }
 .tab.active { color: #1a1a1a; border-bottom-color: #1a1a1a; font-weight: 700; }
 
+/* ── Tables ── */
 table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #ccc; font-size: 12px; }
 th { padding: 10px 14px; text-align: left; font-size: 9px; letter-spacing: 2px; text-transform: uppercase; color: #999; border-bottom: 1px solid #ccc; background: #fafaf7; font-weight: 400; }
 td { padding: 12px 14px; border-bottom: 1px solid #f0ede6; }
 tr:last-child td { border-bottom: none; }
 .empty td { text-align: center; color: #aaa; font-style: italic; padding: 28px; }
 
+/* ── Badges ── */
 .badge { display: inline-block; padding: 2px 8px; font-size: 10px; letter-spacing: 1px; border: 1px solid; font-weight: 700; text-transform: uppercase; }
 .long,.buy { border-color: #15803d; color: #15803d; }
 .short,.sell { border-color: #dc2626; color: #dc2626; }
 .hold { border-color: #888; color: #888; }
+.exit-tp { background: #dcfce7; color: #15803d; border-radius: 2px; padding: 2px 6px; font-size: 10px; font-weight: 700; }
+.exit-sl { background: #fee2e2; color: #dc2626; border-radius: 2px; padding: 2px 6px; font-size: 10px; font-weight: 700; }
+.exit-time { background: #fef9c3; color: #92400e; border-radius: 2px; padding: 2px 6px; font-size: 10px; font-weight: 700; }
+.exit-unk  { background: #f3f4f6; color: #888; border-radius: 2px; padding: 2px 6px; font-size: 10px; font-weight: 700; }
 
+/* ── AI Log cards ── */
 .dcard { background: #fff; border: 1px solid #ccc; padding: 13px 15px; margin-bottom: 8px; }
 .dcard-hdr { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px; }
 .dcard-time { font-size: 10px; color: #888; white-space: nowrap; margin-left: 10px; }
@@ -59,36 +105,66 @@ tr:last-child td { border-bottom: none; }
 .reason.open { max-height: none; }
 .tog { background: none; border: none; color: #999; font-size: 10px; cursor: pointer; text-decoration: underline; margin-top: 3px; display: block; font-family: Georgia,serif; }
 
+/* ── Toolbar ── */
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
 .btn { background: #1a1a1a; color: #fff; border: none; padding: 7px 16px; font-size: 10px; letter-spacing: 1px; text-transform: uppercase; cursor: pointer; font-family: Georgia,serif; }
 .btn:hover { background: #333; }
-.upd { font-size: 11px; color: #888; }
 
-@media(max-width:700px) { .stat-grid,.pnl-row { grid-template-columns: repeat(2,1fr); } .charts-row { grid-template-columns: 1fr; } }
+@media(max-width:700px) {
+  .stat-grid,.pnl-row,.stats-bar { grid-template-columns: repeat(2,1fr); }
+  .charts-row,.sig-grid,.gate-grid { grid-template-columns: 1fr; }
+}
 </style>
 </head>
 <body>
 <div class="container">
 
+<!-- Header -->
 <div class="header">
   <h1>Trading Desk</h1>
   <div class="header-sub">
     <span><span class="dot" id="dot1"></span><span id="s1">Connecting...</span></span>
     <span id="sNet" style="font-size:11px;font-weight:700;padding:2px 8px;border-radius:4px;display:none;"></span>
-    <span id="upd">—</span>
+    <span class="refresh-timer">Updated: <span id="upd">—</span> &nbsp;·&nbsp; next in <span id="countdown">—</span>s</span>
   </div>
 </div>
 
-<!-- Stats -->
+<!-- Account Stats -->
 <div class="stat-grid">
-  <div class="stat"><div class="stat-lbl">Account Value</div><div class="stat-val" id="sVal">—</div><div class="stat-sub" id="sValSub" style="font-size:0.72rem;color:#888;margin-top:2px"></div></div>
-  <div class="stat"><div class="stat-lbl">Withdrawable</div><div class="stat-val" id="sBal">—</div><div class="stat-sub" id="sBalSub" style="font-size:0.72rem;color:#888;margin-top:2px"></div></div>
-  <div class="stat"><div class="stat-lbl">Total Return</div><div class="stat-val" id="sRet">—</div></div>
-  <div class="stat"><div class="stat-lbl">Open Positions</div><div class="stat-val" id="sPos">—</div></div>
-  <div class="stat"><div class="stat-lbl">Unrealized PnL</div><div class="stat-val" id="sUpnl">—</div></div>
-  <div class="stat"><div class="stat-lbl">Bot Cycles</div><div class="stat-val" id="sCyc">—</div></div>
-  <div class="stat"><div class="stat-lbl">Total Trades</div><div class="stat-val" id="sTrd">—</div></div>
-  <div class="stat"><div class="stat-lbl">Active Since</div><div class="stat-val" id="sAct" style="font-size:14px;">—</div></div>
+  <div class="stat">
+    <div class="stat-lbl">Account Value</div>
+    <div class="stat-val" id="sVal">—</div>
+    <div class="stat-sub" id="sValSub">Total Equity</div>
+  </div>
+  <div class="stat">
+    <div class="stat-lbl">Withdrawable</div>
+    <div class="stat-val" id="sBal">—</div>
+    <div class="stat-sub">avail. to withdraw</div>
+  </div>
+  <div class="stat">
+    <div class="stat-lbl">Total Return</div>
+    <div class="stat-val" id="sRet">—</div>
+  </div>
+  <div class="stat">
+    <div class="stat-lbl">Open Positions</div>
+    <div class="stat-val" id="sPos">—</div>
+  </div>
+  <div class="stat">
+    <div class="stat-lbl">Unrealized PnL</div>
+    <div class="stat-val" id="sUpnl">—</div>
+  </div>
+  <div class="stat">
+    <div class="stat-lbl">Bot Cycles</div>
+    <div class="stat-val" id="sCyc">—</div>
+  </div>
+  <div class="stat">
+    <div class="stat-lbl">Total Trades</div>
+    <div class="stat-val" id="sTrd">—</div>
+  </div>
+  <div class="stat">
+    <div class="stat-lbl">Active Since</div>
+    <div class="stat-val" id="sAct" style="font-size:14px;">—</div>
+  </div>
 </div>
 
 <!-- P&L -->
@@ -97,6 +173,43 @@ tr:last-child td { border-bottom: none; }
   <div class="pnl-card"><div class="pnl-lbl">7-Day P&L</div><div class="pnl-usd" id="p7">—</div><div class="pnl-pct" id="p7p">—</div></div>
   <div class="pnl-card"><div class="pnl-lbl">30-Day P&L</div><div class="pnl-usd" id="p30">—</div><div class="pnl-pct" id="p30p">—</div></div>
   <div class="pnl-card"><div class="pnl-lbl">All-Time P&L</div><div class="pnl-usd" id="pa">—</div><div class="pnl-pct" id="pap">—</div></div>
+  <div class="pnl-note">* Includes unrealized mark-to-market P&L from open positions</div>
+</div>
+
+<!-- Trade Stats Bar -->
+<div class="stats-bar">
+  <div class="sb"><div class="sb-lbl">Win Rate</div><div class="sb-val" id="stWin">—</div></div>
+  <div class="sb"><div class="sb-lbl">Profit Factor</div><div class="sb-val" id="stPF">—</div></div>
+  <div class="sb"><div class="sb-lbl">Avg Win</div><div class="sb-val g" id="stAvgW">—</div></div>
+  <div class="sb"><div class="sb-lbl">Avg Loss</div><div class="sb-val r" id="stAvgL">—</div></div>
+  <div class="sb"><div class="sb-lbl">TP Exits</div><div class="sb-val g" id="stTP">—</div></div>
+  <div class="sb"><div class="sb-lbl">SL Exits</div><div class="sb-val r" id="stSL">—</div></div>
+</div>
+
+<!-- Signal Status Panel -->
+<div class="signal-panel">
+  <div class="panel-title">
+    <span>BB + StochRSI Signal Status — Last Fired</span>
+    <span id="sigAge" style="font-size:10px;color:#aaa;font-style:italic;">loading...</span>
+  </div>
+  <div class="sig-grid" id="sigGrid">
+    <div class="sig-card"><div class="sig-asset">BTC <span class="sig-badge none">—</span></div><div style="font-size:10px;color:#aaa;">No signal data yet</div></div>
+    <div class="sig-card"><div class="sig-asset">ETH <span class="sig-badge none">—</span></div><div style="font-size:10px;color:#aaa;">No signal data yet</div></div>
+    <div class="sig-card"><div class="sig-asset">SOL <span class="sig-badge none">—</span></div><div style="font-size:10px;color:#aaa;">No signal data yet</div></div>
+  </div>
+</div>
+
+<!-- Gate Status Panel -->
+<div class="gate-panel">
+  <div class="panel-title">
+    <span>Entry Gate Status — Current Cycle</span>
+    <span id="gateAge" style="font-size:10px;color:#aaa;font-style:italic;">from latest cycle</span>
+  </div>
+  <div class="gate-grid" id="gateGrid">
+    <div class="gate-card"><div class="gate-asset">BTC</div><div class="gate-rows"><span class="gate-item gate-unk">Loading...</span></div></div>
+    <div class="gate-card"><div class="gate-asset">ETH</div><div class="gate-rows"><span class="gate-item gate-unk">Loading...</span></div></div>
+    <div class="gate-card"><div class="gate-asset">SOL</div><div class="gate-rows"><span class="gate-item gate-unk">Loading...</span></div></div>
+  </div>
 </div>
 
 <!-- Charts -->
@@ -125,6 +238,8 @@ tr:last-child td { border-bottom: none; }
     <button class="tab active" onclick="show('pos',this)">Positions</button>
     <button class="tab" onclick="show('fills',this)">Fills</button>
     <button class="tab" onclick="show('orders',this)">Orders</button>
+    <button class="tab" onclick="show('trades',this)">Trade History</button>
+    <button class="tab" onclick="show('signals',this)">Signals</button>
     <button class="tab" onclick="show('ai',this)">AI Log</button>
   </div>
   <button class="btn" onclick="init()">&#8635; Refresh</button>
@@ -142,119 +257,139 @@ tr:last-child td { border-bottom: none; }
   <table><thead><tr><th>Asset</th><th>Side</th><th>Size</th><th>Price</th><th>Trigger</th><th>Type</th></tr></thead>
   <tbody id="tOrd"><tr class="empty"><td colspan="6">Loading...</td></tr></tbody></table>
 </div>
+<div id="tab-trades" style="display:none">
+  <table><thead><tr><th>Time</th><th>Asset</th><th>Dir</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Exit Type</th><th>Duration</th></tr></thead>
+  <tbody id="tTrades"><tr class="empty"><td colspan="8">No closed trades yet</td></tr></tbody></table>
+</div>
+<div id="tab-signals" style="display:none">
+  <table><thead><tr><th>Time</th><th>Asset</th><th>Direction</th><th>StochRSI-K</th><th>BB Touch</th><th>TP</th><th>SL</th></tr></thead>
+  <tbody id="tSigs"><tr class="empty"><td colspan="7">No signals fired yet</td></tr></tbody></table>
+</div>
 <div id="tab-ai" style="display:none">
   <div id="aiCont" style="color:#aaa;font-style:italic;font-size:12px;padding:10px 0;">Loading...</div>
 </div>
 
-</div><!-- /container -->
+</div>
 <script>
-// Dashboard is always served from the bot's own HTTP server at '/'.
-// Open it via http://localhost:3000 (or SSH tunnel for remote servers).
 const API = '';
+function apiFetch(url, opts={}) { return fetch(API+url, opts); }
 
-function apiFetch(url, opts={}) {
-  return fetch(API+url, opts);
+// ── State ──────────────────────────────────────────────────────────────────
+let entries=[], live={}, signals=[], trades=[], stats={};
+let cRange='1d', cMain=null, cDaily=null;
+let _countdown=60, _countdownTimer=null;
+
+// ── Formatters ──────────────────────────────────────────────────────────────
+const f2   = (n,d=2)=>{ const x=parseFloat(n); return isNaN(x)?null:x.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}); };
+const fu   = (n,d=2)=>{ const v=f2(n,d); return v!==null?'$'+v:'—'; };
+const fpnl = n=>{ const x=parseFloat(n); return isNaN(x)?'—':(x>=0?'+':'')+fu(x); };
+const fpct = n=>{ const x=parseFloat(n); return isNaN(x)?'—':(x>=0?'+':'')+f2(x,2)+'%'; };
+const pc   = n=>parseFloat(n)>=0?'g':'r';
+const lev  = l=>{ if(!l) return '—'; if(typeof l==='number') return l+'x'; if(typeof l==='object') return (l.value||'')+'x'+(l.type?' '+l.type:''); return l; };
+const safeDate=(ts,fmt)=>{ if(!ts) return '—'; const d=new Date(ts); return isNaN(d.getTime())?'—':fmt(d); };
+const ago=(ts)=>{ if(!ts) return ''; const s=Math.floor((Date.now()-new Date(ts).getTime())/1000); if(s<60) return s+'s ago'; if(s<3600) return Math.floor(s/60)+'m ago'; return Math.floor(s/3600)+'h ago'; };
+
+// ── Countdown timer ─────────────────────────────────────────────────────────
+function startCountdown(secs) {
+  _countdown = secs;
+  if (_countdownTimer) clearInterval(_countdownTimer);
+  _countdownTimer = setInterval(()=>{
+    _countdown--;
+    const el = document.getElementById('countdown');
+    if(el) el.textContent = Math.max(0,_countdown);
+    if(_countdown<=0) clearInterval(_countdownTimer);
+  }, 1000);
 }
 
+// ── Auth / Meta ─────────────────────────────────────────────────────────────
 async function checkAuth() {
   try {
     const r = await apiFetch('/meta');
     const m = await r.json();
-    if (m.bot_started) {
-      const el = document.getElementById('sAct');
-      if (el) {
-        const d = new Date(m.bot_started);
-        if (!isNaN(d.getTime()))
-          el.textContent = d.toLocaleDateString([], {month:'short', day:'numeric', year:'numeric'});
-      }
+    if(m.bot_started) {
+      const el=document.getElementById('sAct');
+      if(el){ const d=new Date(m.bot_started); if(!isNaN(d.getTime())) el.textContent=d.toLocaleDateString([],{month:'short',day:'numeric',year:'numeric'}); }
     }
-    if (m.network) {
-      const netEl = document.getElementById('sNet');
-      if (netEl) {
-        netEl.textContent = m.network;
-        const isTestnet = m.network === 'TESTNET';
-        netEl.style.background = isTestnet ? '#854d0e' : '#14532d';
-        netEl.style.color = isTestnet ? '#fef08a' : '#bbf7d0';
-        netEl.style.display = 'inline-block';
-      }
+    if(m.network) {
+      const ne=document.getElementById('sNet');
+      if(ne){ ne.textContent=m.network; const t=m.network==='TESTNET'; ne.style.background=t?'#854d0e':'#14532d'; ne.style.color=t?'#fef08a':'#bbf7d0'; ne.style.display='inline-block'; }
     }
-  } catch(e) { /* offline */ }
+  } catch(e) {}
 }
 
-let entries = [];   // diary entries
-let live    = {};   // /live data
-let cRange  = '1d';
-let cMain   = null, cDaily = null;
-
-const f2   = (n,d=2) => { const x=parseFloat(n); return isNaN(x)?null:x.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}); };
-const fu   = (n,d=2) => { const v=f2(n,d); return v!==null?'$'+v:'—'; };
-const fpnl = n => { const x=parseFloat(n); return isNaN(x)?'—':(x>=0?'+':'')+fu(x); };
-const fpct = n => { const x=parseFloat(n); return isNaN(x)?'—':(x>=0?'+':'')+f2(x,2)+'%'; };
-const pc   = n => parseFloat(n)>=0?'g':'r';
-const lev  = l => { if(!l) return '—'; if(typeof l==='number') return l+'x'; if(typeof l==='object') return (l.value||'')+'x'+(l.type?' '+l.type:''); return l; };
-// V4-LOW-4: safe date — returns '—' for null/invalid timestamps
-const safeDate = (ts, fmt) => { if(!ts) return '—'; const d=new Date(ts); return isNaN(d.getTime())?'—':fmt(d); };
-
-// ── Load diary first — shows data immediately ─────────────────────────────────
+// ── Load diary ──────────────────────────────────────────────────────────────
 async function loadDiary() {
   try {
-    // V4-MEDIUM-2: reduced from 5000 to 200 entries — prevents 25MB payloads blocking the event loop
     const r = await apiFetch('/diary?limit=200');
-    if (!r.ok) { if(r.status===401){await checkAuth();} throw new Error('HTTP '+r.status); }
+    if(!r.ok){ if(r.status===401){await checkAuth();} throw new Error('HTTP '+r.status); }
     const d = await r.json();
-    entries = Array.isArray(d) ? d : (d.entries||[]);
-
-    document.getElementById('dot1').className = 'dot on';
-    document.getElementById('s1').textContent = 'Bot running';
-    document.getElementById('upd').textContent = 'Updated: '+new Date().toLocaleTimeString();
-
-    renderStatsFast();   // show last known values immediately
-    renderPnL();
-    renderCharts();
-    renderAI();
+    entries = Array.isArray(d)?d:(d.entries||[]);
+    document.getElementById('dot1').className='dot on';
+    document.getElementById('s1').textContent='Bot running';
+    document.getElementById('upd').textContent=new Date().toLocaleTimeString();
+    renderStatsFast(); renderPnL(); renderCharts(); renderAI();
   } catch(e) {
-    document.getElementById('s1').textContent = 'Backend offline';
+    document.getElementById('s1').textContent='Backend offline';
   }
 }
 
-// ── Load live data in background (slower, makes HL API call) ─────────────────
+// ── Load live ───────────────────────────────────────────────────────────────
 async function loadLive() {
   try {
     const r = await apiFetch('/live');
-    if (!r.ok) return;
+    if(!r.ok) return;
     live = await r.json();
-    if (live.error) return;
-    renderStatsLive();   // update with fresh values
-    renderPositions();
-    renderOrders();
-    renderFills();
-  } catch(e) { /* silently fail — diary data already shown */ }
+    if(live.error) return;
+    renderStatsLive(); renderPositions(); renderOrders(); renderFills();
+  } catch(e) {}
 }
 
-// Show last-known values from diary immediately
+// ── Load signals ────────────────────────────────────────────────────────────
+async function loadSignals() {
+  try {
+    const r = await apiFetch('/signals?limit=100');
+    if(!r.ok) return;
+    signals = await r.json();
+    renderSignalPanel();
+    renderSignalsTab();
+  } catch(e) {}
+}
+
+// ── Load stats ──────────────────────────────────────────────────────────────
+async function loadStats() {
+  try {
+    const r = await apiFetch('/stats');
+    if(!r.ok) return;
+    stats = await r.json();
+    renderStatsBar();
+  } catch(e) {}
+}
+
+// ── Load closed trades ───────────────────────────────────────────────────────
+async function loadTrades() {
+  try {
+    const r = await apiFetch('/trades?limit=100');
+    if(!r.ok) return;
+    trades = await r.json();
+    renderTradesTab();
+  } catch(e) {}
+}
+
+// ── Render: Account stats (fast from diary) ──────────────────────────────────
 function renderStatsFast() {
-  let latest = null;
-  for (let i=entries.length-1;i>=0;i--) {
-    if (parseFloat(entries[i].account_value)>0) { latest=entries[i]; break; }
-  }
-  if (!latest) return;
+  let latest=null;
+  for(let i=entries.length-1;i>=0;i--){ if(parseFloat(entries[i].account_value)>0){latest=entries[i];break;} }
+  if(!latest) return;
 
-  const av  = parseFloat(latest.account_value);
-  const pos = Array.isArray(latest.positions)?latest.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
+  const av=parseFloat(latest.account_value);
+  const pos=Array.isArray(latest.positions)?latest.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
 
-  document.getElementById('sVal').textContent = fu(av);
-  // Sub-line: show perps equity + spot breakdown under Account Value
-  const _perps=parseFloat(latest.perps_value||0);
-  const _spotF=parseFloat(latest.spot_usdc||0);
-  const _valSub=document.getElementById('sValSub');
-  if(_valSub){
-    if(_spotF>0) _valSub.textContent='perps '+fu(_perps)+' + spot '+fu(_spotF);
-    else if(_perps>0) _valSub.textContent='perps equity';
-  }
-  const _w=parseFloat(latest.withdrawable||0);
-  document.getElementById('sBal').textContent=_w>0?fu(_w):'$0.00';
-  document.getElementById('sBalSub').textContent='avail. to withdraw';
-  document.getElementById('sPos').textContent = latest.positions_count||pos.length||'0';
+  document.getElementById('sVal').textContent=fu(av);
+  // Unified account: just show total equity, no perps/spot split
+  document.getElementById('sValSub').textContent='Total Equity';
+  const w=parseFloat(latest.withdrawable||0);
+  document.getElementById('sBal').textContent=w>0?fu(w):'$0.00';
+  document.getElementById('sPos').textContent=latest.positions_count||pos.length||'0';
 
   let upnl=0; pos.forEach(p=>{const v=parseFloat(p.unrealized_pnl||0);if(!isNaN(v))upnl+=v;});
   const uel=document.getElementById('sUpnl'); uel.textContent=upnl?fpnl(upnl):'$0.00'; uel.className='stat-val '+(upnl>=0?'g':'r');
@@ -262,65 +397,153 @@ function renderStatsFast() {
   const first=entries.find(e=>parseFloat(e.account_value)>0);
   if(first){ const ret=((av-parseFloat(first.account_value))/parseFloat(first.account_value))*100; const re=document.getElementById('sRet'); re.textContent=fpct(ret); re.className='stat-val '+pc(ret); }
 
-  let b=0,s=0; entries.forEach(e=>(e.decisions||[]).forEach(d=>{const a=(d.action||'').toLowerCase();if(a==='buy')b++;else if(a==='sell')s++;}));
+  // Cycle and trade count
   document.getElementById('sCyc').textContent=entries.length;
-  document.getElementById('sTrd').textContent=b+s;
-  // V4-LOW-3: "Active Since" is set from /meta (bot_started.json) in checkAuth().
-  // Fall back to first diary entry only if meta hasn't loaded yet.
-  if(entries.length) {
+  // Count trades from diary buy/sell decisions
+  let b=0,s=0;
+  entries.forEach(e=>(e.decisions||[]).forEach(d=>{const a=(d.action||'').toLowerCase();if(a==='buy')b++;else if(a==='sell')s++;}));
+  document.getElementById('sTrd').textContent=b+s || (stats.total_trades||'0');
+
+  if(entries.length){
     const el=document.getElementById('sAct');
-    if(el && el.textContent==='—') {
-      const d=new Date(entries[0].timestamp);
-      if(!isNaN(d.getTime())) el.textContent=d.toLocaleDateString([],{month:'short',day:'numeric',year:'numeric'});
-    }
+    if(el&&el.textContent==='—'){ const d=new Date(entries[0].timestamp); if(!isNaN(d.getTime())) el.textContent=d.toLocaleDateString([],{month:'short',day:'numeric',year:'numeric'}); }
   }
+
+  // Gate status from latest cycle decisions
+  renderGatePanel(latest);
 }
 
-// Update with fresh live values (called after /live API responds)
+// ── Render: Account stats (live) ──────────────────────────────────────────────
 function renderStatsLive() {
-  const av  = parseFloat(live.account_value||0);
-  const pos = Array.isArray(live.positions)?live.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
+  const av=parseFloat(live.account_value||0);
+  const pos=Array.isArray(live.positions)?live.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
 
   if(av>0) document.getElementById('sVal').textContent=fu(av);
+  document.getElementById('sValSub').textContent='Total Equity';
 
-  // Sub-line under Account Value: perps equity + spot breakdown
-  const _lp=parseFloat(live.perps_value||0);
-  const _ls=parseFloat(live.spot_usdc||0);
-  const _valSub=document.getElementById('sValSub');
-  if(_valSub){
-    if(_ls>0) _valSub.textContent='perps '+fu(_lp)+' + spot '+fu(_ls);
-    else if(_lp>0) _valSub.textContent='cross-margin equity';
-  }
-
-  // Withdrawable — amount available without closing positions
-  const _lw=parseFloat(live.withdrawable||0);
-  document.getElementById('sBal').textContent=_lw>0?fu(_lw):'$0.00';
-  document.getElementById('sBalSub').textContent='avail. to withdraw';
-
+  const w=parseFloat(live.withdrawable||0);
+  document.getElementById('sBal').textContent=w>0?fu(w):'$0.00';
   document.getElementById('sPos').textContent=pos.length;
 
   let upnl=0; pos.forEach(p=>{const v=parseFloat(p.unrealized_pnl||0);if(!isNaN(v))upnl+=v;});
   const uel=document.getElementById('sUpnl'); uel.textContent=fpnl(upnl); uel.className='stat-val '+(upnl>=0?'g':'r');
 
-  // Total Return: prefer server-computed value (based on initial_balance.json, not diary).
-  // Diary-based fallback can show wrong % if early diary entries had corrupted account_value.
   const re=document.getElementById('sRet');
-  if(live.total_return_pct!=null){
-    const ret=parseFloat(live.total_return_pct);
-    re.textContent=fpct(ret); re.className='stat-val '+pc(ret);
-  } else {
+  if(live.total_return_pct!=null){ const ret=parseFloat(live.total_return_pct); re.textContent=fpct(ret); re.className='stat-val '+pc(ret); }
+  else {
     const first=entries.find(e=>parseFloat(e.account_value)>0);
     if(first&&av>0){ const ret=((av-parseFloat(first.account_value))/parseFloat(first.account_value))*100; re.textContent=fpct(ret); re.className='stat-val '+pc(ret); }
   }
 }
 
-// ── P&L (V4-MEDIUM-3: label clarifies unrealized is included) ─────────────────
+// ── Render: Trade Stats Bar ──────────────────────────────────────────────────
+function renderStatsBar() {
+  if(!stats||stats.total_trades===0) return;
+  const wr=document.getElementById('stWin');
+  const pf=document.getElementById('stPF');
+  if(stats.win_rate!=null){ wr.textContent=stats.win_rate+'%'; wr.className='sb-val '+(stats.win_rate>=50?'g':'r'); }
+  if(stats.profit_factor!=null){ pf.textContent=stats.profit_factor; pf.className='sb-val '+(stats.profit_factor>=1?'g':'r'); }
+  document.getElementById('stAvgW').textContent=stats.avg_win?fu(stats.avg_win):'—';
+  document.getElementById('stAvgL').textContent=stats.avg_loss?fu(stats.avg_loss):'—';
+  const by=stats.by_exit_type||{};
+  document.getElementById('stTP').textContent=by.tp||0;
+  document.getElementById('stSL').textContent=by.sl||0;
+}
+
+// ── Render: Signal Status Panel ──────────────────────────────────────────────
+function renderSignalPanel() {
+  const assets=['BTC','ETH','SOL'];
+  // Get latest signal per asset
+  const latest={};
+  signals.forEach(s=>{ latest[s.asset]=s; });
+
+  const grid=document.getElementById('sigGrid');
+  const mostRecent=signals.length?signals[signals.length-1]:null;
+  if(mostRecent) document.getElementById('sigAge').textContent='Last signal: '+ago(mostRecent.timestamp);
+
+  grid.innerHTML=assets.map(a=>{
+    const s=latest[a];
+    if(!s) return `<div class="sig-card"><div class="sig-asset">${a} <span class="sig-badge none">NONE</span></div><div style="font-size:10px;color:#aaa;">No signal fired yet</div></div>`;
+    const dir=(s.direction||'').toLowerCase();
+    const badge=dir==='buy'?'long':dir==='sell'?'short':'none';
+    const label=dir==='buy'?'LONG':dir==='sell'?'SHORT':'NONE';
+    const k=s.stochrsi_k!=null?parseFloat(s.stochrsi_k).toFixed(1):'—';
+    const tp=s.tp?fu(s.tp):'—';
+    const sl=s.sl?fu(s.sl):'—';
+    const t=ago(s.timestamp);
+    return `<div class="sig-card">
+      <div class="sig-asset">${a} <span class="sig-badge ${badge}">${label}</span></div>
+      <div class="sig-rows">
+        <div class="sig-row"><span class="sig-key">StochRSI-K</span>${k}</div>
+        <div class="sig-row"><span class="sig-key">BB Touch</span>${s.bb_touch||'—'}</div>
+        <div class="sig-row"><span class="sig-key">TP Target</span>${tp}</div>
+        <div class="sig-row"><span class="sig-key">SL Level</span>${sl}</div>
+        <div class="sig-row" style="grid-column:1/-1"><span class="sig-key">Fired</span>${t}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ── Render: Gate Status Panel ─────────────────────────────────────────────────
+function renderGatePanel(latestEntry) {
+  const assets=['BTC','ETH','SOL'];
+  const grid=document.getElementById('gateGrid');
+
+  // Extract gate info from latest decisions entry
+  // The decisions array has per-asset action + rationale
+  const decisions={};
+  if(latestEntry && Array.isArray(latestEntry.decisions)){
+    latestEntry.decisions.forEach(d=>{ decisions[d.asset]=d; });
+  }
+
+  // Gates we can infer from the rationale text
+  const gateKeys=[
+    ['session','SESSION'],
+    ['regime','REGIME'],
+    ['funding','FUNDING'],
+    ['cooldown','COOLDOWN'],
+    ['signal','SIGNAL'],
+    ['risk','RISK'],
+  ];
+
+  grid.innerHTML=assets.map(a=>{
+    const dec=decisions[a];
+    if(!dec) return `<div class="gate-card"><div class="gate-asset">${a}</div><div class="gate-rows"><span class="gate-item gate-unk">No data</span></div></div>`;
+    const action=(dec.action||'hold').toLowerCase();
+    const rationale=(dec.rationale||dec.reasoning||'').toLowerCase();
+
+    // Infer gate states from rationale text
+    const gates=[];
+    // Session gate
+    if(rationale.includes('session') && (rationale.includes('block')||rationale.includes('outside')||rationale.includes('00:00'))) gates.push({k:'SESSION',ok:false});
+    else gates.push({k:'SESSION',ok:true});
+    // Regime gate
+    if(rationale.includes('adx') && (rationale.includes('skip')||rationale.includes('pause')||rationale.includes('trend regime'))) gates.push({k:'REGIME',ok:false});
+    else gates.push({k:'REGIME',ok:true});
+    // Funding
+    if(rationale.includes('funding') && (rationale.includes('unfavorable')||rationale.includes('skip')||rationale.includes('high funding'))) gates.push({k:'FUNDING',ok:false});
+    else gates.push({k:'FUNDING',ok:true});
+    // Cooldown
+    if(rationale.includes('cooldown')||rationale.includes('cool-down')) gates.push({k:'COOLDOWN',ok:false});
+    else gates.push({k:'COOLDOWN',ok:true});
+    // Signal
+    const hasSignal=action==='buy'||action==='sell';
+    gates.push({k:'SIGNAL',ok:hasSignal});
+
+    const items=gates.map(g=>`<span class="gate-item ${g.ok?'gate-ok':'gate-off'}">${g.k} ${g.ok?'✓':'✗'}</span>`).join('');
+    return `<div class="gate-card"><div class="gate-asset">${a} <span style="font-size:10px;font-weight:400;color:#888;">→ ${action.toUpperCase()}</span></div><div class="gate-rows">${items}</div></div>`;
+  }).join('');
+
+  if(latestEntry) document.getElementById('gateAge').textContent='Cycle #'+(latestEntry.cycle||'?')+' · '+safeDate(latestEntry.timestamp,d=>d.toLocaleTimeString());
+}
+
+// ── Render: P&L ─────────────────────────────────────────────────────────────
 function renderPnL() {
-  const curAV = parseFloat(live.account_value) || (() => { for(let i=entries.length-1;i>=0;i--){const v=parseFloat(entries[i].account_value);if(v>0)return v;} return 0; })();
+  const curAV=parseFloat(live.account_value)||( ()=>{for(let i=entries.length-1;i>=0;i--){const v=parseFloat(entries[i].account_value);if(v>0)return v;}return 0;})();
   if(!curAV) return;
 
-  const set = (uid,pid,fromEntry) => {
-    const base = parseFloat(fromEntry?.account_value||0);
+  const set=(uid,pid,fromEntry)=>{
+    const base=parseFloat(fromEntry?.account_value||0);
     if(!base) return;
     const usd=curAV-base, pct=(usd/base)*100;
     const u=document.getElementById(uid),p=document.getElementById(pid);
@@ -334,25 +557,10 @@ function renderPnL() {
   const ago30=entries.find(e=>new Date(e.timestamp).getTime()>=Date.now()-30*864e5)||entries[0];
   const first=entries.find(e=>parseFloat(e.account_value)>0);
 
-  set('p0','p0p',todayFirst);
-  set('p7','p7p',ago7);
-  set('p30','p30p',ago30);
-  set('pa','pap',first);
-
-  // Footnote: * = includes unrealized mark-to-market PnL from open positions.
-  // Appended to .pnl-row (the grid container), not #p0 (which gets its textContent
-  // cleared on every render call — the closest('div[id]') bug returned #p0 itself).
-  const pnlRow = document.querySelector('.pnl-row');
-  if(pnlRow && !pnlRow.querySelector('.pnl-note')) {
-    const note = document.createElement('div');
-    note.className='pnl-note';
-    note.style.cssText='font-size:10px;color:#aaa;margin-top:6px;grid-column:1/-1;text-align:center;padding:0 14px 8px;';
-    note.textContent='* Includes unrealized mark-to-market P&L from open positions';
-    pnlRow.appendChild(note);
-  }
+  set('p0','p0p',todayFirst); set('p7','p7p',ago7); set('p30','p30p',ago30); set('pa','pap',first);
 }
 
-// ── Charts ────────────────────────────────────────────────────────────────────
+// ── Render: Charts ───────────────────────────────────────────────────────────
 function setR(r,btn) {
   cRange=r;
   document.querySelectorAll('.tbn').forEach(b=>b.classList.remove('active'));
@@ -363,7 +571,6 @@ function setR(r,btn) {
 function renderCharts() {
   const ms={'1d':864e5,'1w':7*864e5,'1m':30*864e5,'all':Infinity}[cRange]||Infinity;
   const cut=Date.now()-ms;
-
   let pts=entries.filter(e=>new Date(e.timestamp).getTime()>=cut&&parseFloat(e.account_value)>0);
   if(live.account_value&&live.timestamp){
     const liveT=new Date(live.timestamp).getTime();
@@ -396,8 +603,7 @@ function renderCharts() {
     const pnls=days.map((d,i)=>{
       const cur=byDay[d],prev=i>0?byDay[days[i-1]]:null;
       if(!cur.length) return 0;
-      const last=cur[cur.length-1];
-      const base=prev?.length?prev[prev.length-1]:cur[0];
+      const last=cur[cur.length-1], base=prev?.length?prev[prev.length-1]:cur[0];
       return parseFloat((last-base).toFixed(2));
     });
     if(cDaily) cDaily.destroy();
@@ -409,7 +615,7 @@ function renderCharts() {
   }
 }
 
-// ── Tables ────────────────────────────────────────────────────────────────────
+// ── Render: Tables ───────────────────────────────────────────────────────────
 function renderPositions() {
   const rows=Array.isArray(live.positions)?live.positions.filter(p=>Math.abs(parseFloat(p.quantity||0))>0):[];
   const tb=document.getElementById('tPos');
@@ -434,53 +640,97 @@ function renderFills() {
   const rows=Array.isArray(live.recent_fills)?[...live.recent_fills].reverse():[];
   const tb=document.getElementById('tFill');
   if(!rows.length){tb.innerHTML='<tr class="empty"><td colspan="6">No fills yet</td></tr>';return;}
-  // V4-LOW-4: guard against Invalid Date string in fills table
   tb.innerHTML=rows.map(f=>{
     const buy=f.is_buy??f.isBuy;
-    const t=safeDate(f.timestamp, d=>d.toLocaleString());
+    const t=safeDate(f.timestamp,d=>d.toLocaleString());
     const val=(parseFloat(f.size||0)*parseFloat(f.price||0))||null;
     return `<tr><td style="font-size:10px;color:#888;">${t}</td><td><strong>${f.coin||'—'}</strong></td><td><span class="badge ${buy?'buy':'sell'}">${buy!=null?(buy?'BUY':'SELL'):'—'}</span></td><td>${f2(f.size||0,4)||'—'}</td><td>${fu(f.price)}</td><td>${val?fu(val):'—'}</td></tr>`;
   }).join('');
 }
 
-// V4-MEDIUM-1: fixed togR — reasoning text stored in data-full (encodeURIComponent)
-// so double-quotes in Claude analysis no longer break the onclick attribute.
+function renderTradesTab() {
+  const tb=document.getElementById('tTrades');
+  if(!trades.length){tb.innerHTML='<tr class="empty"><td colspan="8">No closed trades yet</td></tr>';return;}
+  tb.innerHTML=[...trades].reverse().map(t=>{
+    const dir=(t.direction||t.side||'').toLowerCase();
+    const pnl=parseFloat(t.realized_pnl||0);
+    const et=t.exit_type||'unknown';
+    const etClass=et==='tp'?'exit-tp':et==='sl'?'exit-sl':et==='time_limit'?'exit-time':'exit-unk';
+    const etLabel=et==='time_limit'?'TIME':et.toUpperCase();
+    const dur=t.duration_minutes?Math.round(t.duration_minutes)+'m':'—';
+    return `<tr>
+      <td style="font-size:10px;color:#888;">${safeDate(t.closed_at||t.timestamp,d=>d.toLocaleString())}</td>
+      <td><strong>${t.asset||'—'}</strong></td>
+      <td><span class="badge ${dir==='buy'?'long':dir==='sell'?'short':'hold'}">${dir==='buy'?'LONG':dir==='sell'?'SHORT':'—'}</span></td>
+      <td>${fu(t.entry_price)}</td>
+      <td>${fu(t.exit_price)}</td>
+      <td class="${pnl>=0?'g':'r'}" style="font-weight:700;">${fpnl(pnl)}</td>
+      <td><span class="${etClass}">${etLabel}</span></td>
+      <td>${dur}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderSignalsTab() {
+  const tb=document.getElementById('tSigs');
+  if(!signals.length){tb.innerHTML='<tr class="empty"><td colspan="7">No signals fired yet</td></tr>';return;}
+  tb.innerHTML=[...signals].reverse().slice(0,50).map(s=>{
+    const dir=(s.direction||'').toLowerCase();
+    return `<tr>
+      <td style="font-size:10px;color:#888;">${safeDate(s.timestamp,d=>d.toLocaleString())}</td>
+      <td><strong>${s.asset||'—'}</strong></td>
+      <td><span class="badge ${dir==='buy'?'long':dir==='sell'?'short':'hold'}">${dir==='buy'?'LONG':dir==='sell'?'SHORT':'—'}</span></td>
+      <td>${s.stochrsi_k!=null?parseFloat(s.stochrsi_k).toFixed(1):'—'}</td>
+      <td>${s.bb_touch||'—'}</td>
+      <td>${s.tp?fu(s.tp):'—'}</td>
+      <td>${s.sl?fu(s.sl):'—'}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Render: AI Log ───────────────────────────────────────────────────────────
 function renderAI() {
   const cont=document.getElementById('aiCont');
   if(!entries.length){cont.innerHTML='<div style="color:#aaa;font-style:italic;">No decisions yet.</div>';return;}
   cont.innerHTML='';
   [...entries].reverse().slice(0,60).forEach((e,i)=>{
-    const decs=e.decisions||[],r=e.reasoning||'',t=safeDate(e.timestamp, d=>d.toLocaleString());
+    const decs=e.decisions||[],r=e.reasoning||'',t=safeDate(e.timestamp,d=>d.toLocaleString());
     const badges=decs.map(d=>{const a=(d.action||'hold').toLowerCase();return `<span class="badge ${a}" style="margin-right:4px;">${d.asset||'?'}: ${a.toUpperCase()}${d.allocation_usd>0?' $'+d.allocation_usd:''}</span>`;}).join('');
     const safe=r.replace(/</g,'&lt;').replace(/>/g,'&gt;'),preview=safe.slice(0,280),more=safe.length>280;
     const div=document.createElement('div'); div.className='dcard';
     const showBtn=more?`<button class="tog" data-idx="${i}" data-full="${encodeURIComponent(safe)}" onclick="togR(this)">Show more</button>`:'';
-    div.innerHTML=`<div class="dcard-hdr"><div>${badges||'<span style="color:#aaa;font-size:11px;">No decisions</span>'}</div><div class="dcard-time">${e.cycle?'Cycle #'+e.cycle+' · ':''}${t}</div></div>${r?`<div class="reason" id="rr${i}">${preview}${more?'...':''}</div>${showBtn}`:``}`;
+    div.innerHTML=`<div class="dcard-hdr"><div>${badges||'<span style="color:#aaa;font-size:11px;">No decisions</span>'}</div><div class="dcard-time">${e.cycle?'Cycle #'+e.cycle+' · ':''}${t}</div></div>${r?`<div class="reason" id="rr${i}">${preview}${more?'...':''}</div>${showBtn}`:''}`;
     cont.appendChild(div);
   });
 }
 
 function togR(btn){
-  const full=decodeURIComponent(btn.dataset.full), i=btn.dataset.idx;
-  const el=document.getElementById('rr'+i);
+  const full=decodeURIComponent(btn.dataset.full),i=btn.dataset.idx,el=document.getElementById('rr'+i);
   if(el.classList.contains('open')){el.innerHTML=full.slice(0,280)+'...';el.classList.remove('open');btn.textContent='Show more';}
   else{el.innerHTML=full;el.classList.add('open');btn.textContent='Show less';}
 }
 
 function show(name,btn){
-  ['pos','fills','orders','ai'].forEach(t=>{document.getElementById('tab-'+t).style.display=t===name?'block':'none';});
+  ['pos','fills','orders','trades','signals','ai'].forEach(t=>{document.getElementById('tab-'+t).style.display=t===name?'block':'none';});
   document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
 }
 
+// ── Main init & polling ───────────────────────────────────────────────────────
 async function init() {
-  await checkAuth();         // fetch /meta: bot start date + auth check
-  await loadDiary();         // fast — shows data immediately
-  loadLive();                // async — updates in background, no wait
+  await checkAuth();
+  await loadDiary();
+  loadLive();
+  loadSignals();
+  loadStats();
+  loadTrades();
+  startCountdown(60);
 }
 
-setInterval(loadDiary, 60000);
-setInterval(loadLive,  30000);
+// Poll diary + live every 60s, signals/stats every 30s
+setInterval(()=>{ loadDiary(); loadLive(); startCountdown(60); }, 60000);
+setInterval(()=>{ loadSignals(); loadStats(); loadTrades(); }, 30000);
+
 init();
 </script>
 </body>
