@@ -2914,8 +2914,75 @@ def main():
         )
         return resp
 
+    # ── Price cache ──────────────────────────────────────────────────────────
+    _price_cache: dict = {"ts": 0.0, "data": {}}
+
+    async def handle_prices(request):
+        """Current price + 24h change % for all tracked assets. Cached 60s."""
+        try:
+            if time.time() - _price_cache["ts"] < 60 and _price_cache["data"]:
+                return web.json_response(_price_cache["data"])
+            result = {}
+            for _a in (args.assets or []):
+                try:
+                    c = await hyperliquid.get_candles(_a, "1h", 26)
+                    if c and len(c) >= 2:
+                        cur  = float(c[-1][4])
+                        base = float(c[-min(25,len(c))][1])
+                        hi   = max(float(x[2]) for x in c[-24:])
+                        lo   = min(float(x[3]) for x in c[-24:])
+                        chg  = round((cur - base) / base * 100, 2) if base else 0
+                        result[_a] = {"price": cur, "change_pct": chg, "high_24h": hi, "low_24h": lo}
+                except Exception:
+                    pass
+            _price_cache["data"] = result
+            _price_cache["ts"]   = time.time()
+            return web.json_response(result)
+        except Exception as e:
+            return web.json_response({}, status=200)
+
+    async def handle_events(request):
+        """Chronological event timeline from diary.jsonl."""
+        try:
+            limit = min(int(request.query.get('limit', '50')), 200)
+            events = []
+            if os.path.exists(diary_path):
+                with open(diary_path, "r", encoding="utf-8") as _f:
+                    for _l in _f:
+                        try:
+                            e = json.loads(_l)
+                            et = e.get("event", "")
+                            if et in ("trade_opened", "trade_closed", "sl_hit", "tp_hit", "time_exit", "order_placed"):
+                                events.append({
+                                    "timestamp": e.get("closed_at") or e.get("timestamp"),
+                                    "type":      et,
+                                    "asset":     e.get("asset"),
+                                    "direction": e.get("direction") or e.get("side"),
+                                    "pnl":       e.get("realized_pnl"),
+                                    "exit_type": e.get("exit_type"),
+                                    "price":     e.get("exit_price") or e.get("entry_price"),
+                                })
+                        except Exception:
+                            pass
+            return web.json_response(events[-limit:])
+        except Exception as e:
+            return web.json_response([], status=200)
+
+    async def handle_benchmark(request):
+        """BTC price history for benchmark comparison. Returns normalized to 100."""
+        try:
+            days = int(request.query.get("days", "90"))
+            candles = await hyperliquid.get_candles("BTC", "1d", days + 1)
+            if not candles or len(candles) < 2:
+                return web.json_response([])
+            base = float(candles[0][4])
+            result = [{"date": c[0], "normalized": round(float(c[4]) / base * 100, 4)} for c in candles]
+            return web.json_response(result)
+        except Exception as e:
+            return web.json_response([], status=200)
+
     async def handle_meta(request):
-        """Return bot metadata: start date, auth enabled flag."""
+        """Return bot metadata: start date, auth enabled flag, config."""
         _meta_path = pathlib.Path(__file__).parent.parent / "bot_started.json"
         _started = None
         try:
@@ -2927,6 +2994,28 @@ def main():
             "bot_started": _started.get("started_at") if _started else None,
             "network": (CONFIG.get("hyperliquid_network") or "mainnet").upper(),
             "assets": args.assets or [],
+            "config": {
+                "bb_period":            CONFIG.get("bb_period", 20),
+                "bb_std":               CONFIG.get("bb_std", 2.0),
+                "stochrsi_period":      CONFIG.get("stochrsi_period", 14),
+                "stochrsi_ob":          CONFIG.get("stochrsi_ob", 80),
+                "stochrsi_os":          CONFIG.get("stochrsi_os", 20),
+                "time_limit_candles":   CONFIG.get("time_limit_candles", 8),
+                "trend_pause_adx":      CONFIG.get("trend_pause_adx", 30),
+                "max_leverage":         CONFIG.get("max_leverage", 5),
+                "cooldown_minutes":     CONFIG.get("cooldown_minutes", 15),
+                "max_daily_trades":     CONFIG.get("max_daily_trades", 40),
+                "max_concurrent":       CONFIG.get("max_concurrent_positions", 3),
+                "taker_fee_pct":        CONFIG.get("taker_fee_pct", 0.00045),
+                "max_position_pct":     CONFIG.get("max_position_pct", 15),
+                "daily_loss_limit_pct": CONFIG.get("daily_loss_circuit_breaker_pct", 12),
+                "mandatory_sl_pct":     CONFIG.get("mandatory_sl_pct", 3),
+                "anomaly_trigger_pct":  CONFIG.get("anomaly_trigger_pct", 3.0),
+                "adx_overrides": {
+                    a: CONFIG.get(f"adx_override_{a.lower()}") for a in (args.assets or [])
+                    if CONFIG.get(f"adx_override_{a.lower()}") is not None
+                },
+            },
         })
 
     async def handle_signals(request):
@@ -3122,6 +3211,9 @@ def main():
         app.router.add_get('/trades', handle_trades)
         app.router.add_get('/indicators', handle_indicators)
         app.router.add_get('/health', handle_health)
+        app.router.add_get('/prices', handle_prices)
+        app.router.add_get('/events', handle_events)
+        app.router.add_get('/benchmark', handle_benchmark)
         app.router.add_route('OPTIONS', '/{path_info:.*}', lambda r: web.Response())
 
     async def main_async():
