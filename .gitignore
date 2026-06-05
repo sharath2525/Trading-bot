@@ -48,3 +48,20 @@ Thumbs.db
 # Operator control files (not source)
 KILLSWITCH
 CIRCUIT_BREAKER_HOLD
+
+# Reports and analysis docs — local only, not for version control
+reports/
+*.md
+!CLAUDE.md
+!README.md
+
+# Misc generated/temp files
+*.txt
+0.15%
+MAX_TRADE_HOURS
+DEVNOTES.md
+STRATEGY.md
+DEPLOY_AND_OPERATIONS.md
+IMPLEMENTATION_PLAN.md
+package-lock.json
+trading-bot-bug-council-report*.md
