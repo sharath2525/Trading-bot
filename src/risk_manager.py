@@ -37,6 +37,13 @@ class RiskManager:
         self.circuit_breaker_active = False
         self.circuit_breaker_date = None
         self.circuit_breaker_was_active = False  # BUG-v7-O5: set True when breaker resets at midnight
+
+        # Weekly tracking (H-6 FIX: cumulative loss halt across multiple days)
+        self.weekly_loss_circuit_breaker_pct = float(CONFIG.get("weekly_loss_circuit_breaker_pct") or 30)
+        self.weekly_start_value = None
+        self.weekly_start_date = None   # Monday of the current ISO week
+        self.weekly_breaker_active = False
+
         self._state_file = _RISK_STATE_FILE
         self._load_circuit_state()
 
@@ -49,6 +56,9 @@ class RiskManager:
             "circuit_breaker_date": str(self.circuit_breaker_date) if self.circuit_breaker_date else None,
             "daily_high_value": self.daily_high_value,
             "daily_high_date": str(self.daily_high_date) if self.daily_high_date else None,
+            "weekly_start_value": self.weekly_start_value,
+            "weekly_start_date": str(self.weekly_start_date) if self.weekly_start_date else None,
+            "weekly_breaker_active": self.weekly_breaker_active,
         }
         tmp = self._state_file + ".tmp"
         try:
@@ -74,6 +84,11 @@ class RiskManager:
             cb_date_str = payload.get("circuit_breaker_date")
             if cb_date_str:
                 self.circuit_breaker_date = date.fromisoformat(cb_date_str)
+            self.weekly_start_value = payload.get("weekly_start_value")
+            w_date_str = payload.get("weekly_start_date")
+            if w_date_str:
+                self.weekly_start_date = date.fromisoformat(w_date_str)
+            self.weekly_breaker_active = bool(payload.get("weekly_breaker_active", False))
             logging.info(
                 "[RISK] restored circuit state: breaker=%s daily_high=%s",
                 self.circuit_breaker_active, self.daily_high_value,
@@ -83,8 +98,12 @@ class RiskManager:
 
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _reset_daily_if_needed(self, account_value: float):
-        """Reset daily high watermark at UTC day boundary."""
+    def _reset_daily_if_needed(self, account_value: float) -> bool:
+        """Reset daily high watermark at UTC day boundary.
+
+        Returns True if trading is held pending operator confirmation
+        (OPERATOR_CONFIRM_RESTART=true and CIRCUIT_BREAKER_HOLD file exists).
+        """
         today = datetime.now(timezone.utc).date()
         if self.daily_high_date != today:
             # BUG-v7-O5 FIX: track whether the circuit breaker was active when the day rolled.
@@ -92,6 +111,20 @@ class RiskManager:
             self.circuit_breaker_was_active = bool(self.circuit_breaker_active)
             self.daily_high_value = account_value
             self.daily_high_date = today
+            # H-2 FIX: when OPERATOR_CONFIRM_RESTART=true, leave circuit_breaker_active=True
+            # until operator removes the CIRCUIT_BREAKER_HOLD file. This prevents automatic
+            # resumption after a systematic loss day until a human reviews the situation.
+            _hold_file = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "CIRCUIT_BREAKER_HOLD",
+            )
+            _needs_confirm = bool(CONFIG.get("operator_confirm_restart"))
+            if self.circuit_breaker_was_active and _needs_confirm and os.path.exists(_hold_file):
+                logging.warning(
+                    "[RISK] Circuit breaker tripped yesterday. OPERATOR_CONFIRM_RESTART=true — "
+                    "trading halted until operator removes CIRCUIT_BREAKER_HOLD file."
+                )
+                return True  # stay halted
             self.circuit_breaker_active = False
             self.circuit_breaker_date = None
             self._save_circuit_state()
@@ -103,6 +136,7 @@ class RiskManager:
         elif account_value > (self.daily_high_value or 0):
             self.daily_high_value = account_value
             self._save_circuit_state()
+        return False
 
     # ------------------------------------------------------------------
     # Individual checks — each returns (allowed: bool, reason: str)
@@ -165,7 +199,8 @@ class RiskManager:
 
     def check_daily_drawdown(self, account_value: float) -> tuple[bool, str]:
         """Activate circuit breaker if account drops max % from daily high."""
-        self._reset_daily_if_needed(account_value)
+        if self._reset_daily_if_needed(account_value):
+            return False, "Daily circuit breaker: awaiting operator confirmation — remove CIRCUIT_BREAKER_HOLD file to resume"
         if self.circuit_breaker_active:
             return False, "Daily loss circuit breaker is active — no new trades until tomorrow (UTC)"
         if self.daily_high_value and self.daily_high_value > 0:
@@ -174,10 +209,64 @@ class RiskManager:
                 self.circuit_breaker_active = True
                 self.circuit_breaker_date = datetime.now(timezone.utc).date()
                 self._save_circuit_state()
+                # H-2 FIX: if operator confirmation is required, create the hold file so
+                # the midnight reset leaves trading halted until the operator removes it.
+                if CONFIG.get("operator_confirm_restart"):
+                    _hold_file = os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "CIRCUIT_BREAKER_HOLD",
+                    )
+                    try:
+                        with open(_hold_file, "w") as _hf:
+                            _hf.write(f"Circuit breaker tripped at {datetime.now(timezone.utc).isoformat()}\n"
+                                      f"Drawdown: {drawdown_pct:.2f}% of daily high\n"
+                                      f"Delete this file to allow trading to resume at next UTC midnight reset.\n")
+                    except Exception:
+                        pass
                 return False, (
                     f"Daily drawdown {drawdown_pct:.2f}% exceeds circuit breaker "
                     f"threshold of {self.daily_loss_circuit_breaker_pct}%"
                 )
+        return True, ""
+
+    def check_weekly_drawdown(self, account_value: float) -> tuple[bool, str]:
+        """H-6 FIX: Halt trading when cumulative weekly loss exceeds threshold.
+
+        Resets each Monday UTC. Default threshold: WEEKLY_LOSS_CIRCUIT_BREAKER_PCT=30.
+        Prevents compounding daily losses across multiple consecutive loss days.
+        """
+        from datetime import date, timedelta
+        today = datetime.now(timezone.utc).date()
+        # ISO weekday: Monday=1. Find the Monday of the current week.
+        monday = today - timedelta(days=today.weekday())
+
+        if self.weekly_start_date != monday:
+            # New week — reset weekly tracking
+            self.weekly_start_value = account_value
+            self.weekly_start_date = monday
+            self.weekly_breaker_active = False
+            self._save_circuit_state()
+
+        if self.weekly_breaker_active:
+            return False, (
+                f"Weekly loss circuit breaker active — trading halted until Monday UTC "
+                f"(weekly loss exceeded {self.weekly_loss_circuit_breaker_pct}%)"
+            )
+
+        if self.weekly_start_value and self.weekly_start_value > 0:
+            weekly_drawdown = ((self.weekly_start_value - account_value) / self.weekly_start_value) * 100
+            if weekly_drawdown > self.weekly_loss_circuit_breaker_pct:
+                self.weekly_breaker_active = True
+                self._save_circuit_state()
+                logging.critical(
+                    "[RISK] WEEKLY circuit breaker tripped — %.1f%% loss this week (threshold %.0f%%)",
+                    weekly_drawdown, self.weekly_loss_circuit_breaker_pct,
+                )
+                return False, (
+                    f"Weekly drawdown {weekly_drawdown:.1f}% exceeds threshold "
+                    f"{self.weekly_loss_circuit_breaker_pct}% — no new trades until Monday UTC"
+                )
+
         return True, ""
 
     def check_concurrent_positions(self, current_count: int) -> tuple[bool, str]:
@@ -222,8 +311,9 @@ class RiskManager:
     # Stop-loss / Take-profit enforcement
     # ------------------------------------------------------------------
 
-    # Hyperliquid base taker fee (both sides of a round trip = 2×)
-    TAKER_FEE_PCT = 0.045
+    # H-10 FIX: renamed for clarity. Value is in PERCENT (0.045%), NOT a decimal (0.00045).
+    # Always divide by 100 before multiplying by price: price * (TAKER_FEE_PCT / 100).
+    TAKER_FEE_PCT = 0.045  # = 0.045% per side (0.00045 as a decimal fraction)
 
     def enforce_stop_loss(self, sl_price: float | None, entry_price: float,
                            is_buy: bool, atr14: float | None = None) -> float:
@@ -235,7 +325,21 @@ class RiskManager:
         atr14 is optional — falls back to percentage-only when not provided.
         """
         if sl_price is not None:
-            return sl_price
+            # FL-3/H-1 FIX: validate SL is positive and on the correct side of entry.
+            # A negative SL (low-price asset with large ATR) gets rejected by the exchange.
+            # A wrong-side SL (above entry for long) triggers immediately on fill.
+            _sl_valid = (
+                sl_price > 0
+                and (not is_buy or sl_price < entry_price)  # long SL must be below entry
+                and (is_buy or sl_price > entry_price)       # short SL must be above entry
+            )
+            if _sl_valid:
+                return sl_price
+            logging.warning(
+                "RISK: SL %.6f invalid for %s at %.6f — recomputing",
+                sl_price, "LONG" if is_buy else "SHORT", entry_price,
+            )
+            # Fall through to auto-compute a valid SL
         pct_distance = entry_price * (self.mandatory_sl_pct / 100.0)
         atr_distance = float(atr14) if atr14 and atr14 > 0 else 0.0
         sl_distance = max(pct_distance, atr_distance)
@@ -373,6 +477,11 @@ class RiskManager:
 
         # 1. Daily drawdown circuit breaker
         ok, reason = self.check_daily_drawdown(account_value)
+        if not ok:
+            return False, reason, trade
+
+        # 1b. Weekly drawdown circuit breaker (H-6 FIX)
+        ok, reason = self.check_weekly_drawdown(account_value)
         if not ok:
             return False, reason, trade
 

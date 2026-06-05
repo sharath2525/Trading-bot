@@ -1,63 +1,50 @@
-# Environments — never commit secrets
+# Environment — contains private keys and API credentials
 .env
 .env.*
 !.env.example
 
-# Python artifacts
+# Runtime state — contains wallet/position data
+state.json
+state.json.tmp
+active_trades.json
+active_trades.json.tmp
+risk_state.json
+risk_state.json.tmp
+daily_count.json
+diary_index.json
+
+# Trade logs — may contain PnL and position details
+*.jsonl
+*.log
+bot_started.json
+
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+.Python
 *.egg-info/
+dist/
+build/
+.eggs/
 *.egg
 
 # Virtual environments
-.venv/
 venv/
+.venv/
 env/
 
-# Editors / OS
-.DS_Store
-.idea/
+# IDE
 .vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
 Thumbs.db
 
-# Caches / type checkers
-.pytest_cache/
-.mypy_cache/
-.cache/
-.ruff_cache/
-
-# Runtime log files (grow unbounded, not useful in git)
-*.log
-nohup.out
-
-# Runtime data files (generated at runtime, not source)
-diary.jsonl
-decisions.jsonl
-signals.jsonl
-prompts.log
-state.json
-state.json.tmp
-risk_state.json
-risk_state.json.tmp
-bot_started.json
-active_trades.json
-
-# Stray artifact files
-0.15%
-MAX_TRADE_HOURS
-
-# Private notes — local only, not for server or GitHub
-DEVNOTES.md
-STRATEGY.md
-DEPLOY_AND_OPERATIONS.md
-IMPLEMENTATION_PLAN.md
-trading-bot-bug-council-report.md
-
-# Reports folder — bug council reports, feature notes, internal analysis
-reports/
-
-# Node artifacts (not a Node project — safe to ignore)
-package-lock.json
-node_modules/
+# Operator control files (not source)
+KILLSWITCH
+CIRCUIT_BREAKER_HOLD

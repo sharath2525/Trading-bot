@@ -62,11 +62,14 @@ def compute_bb_stochrsi_signal(candles_5m: list, cfg: dict) -> dict:
         k_vals = [v for v in sr_data["k"] if v is not None]
         d_vals = [v for v in sr_data["d"] if v is not None]
 
-        if len(k_vals) < 2:
+        # C-2 FIX: use closed-candle K values only.
+        # k_vals[-1] is the forming candle's K (may repaint before close).
+        # Use k_vals[-2] (last closed candle) and k_vals[-3] for hook detection.
+        if len(k_vals) < 3:
             return no_signal
 
-        k_cur  = k_vals[-1]   # latest smoothed %K
-        k_prev = k_vals[-2]   # previous bar %K (hook detection)
+        k_cur  = k_vals[-2]   # last CLOSED candle's K (not forming)
+        k_prev = k_vals[-3]   # previous closed candle's K (hook detection)
         d_cur  = d_vals[-1] if d_vals else None
 
         atr_val = latest(atr_data)
@@ -180,7 +183,13 @@ def session_gate_ok(cfg: dict) -> tuple[bool, str]:
     start_block = int(cfg.get("session_block_start_utc") or 0)
     end_block   = int(cfg.get("session_block_end_utc") or 6)
 
-    if start_block <= h < end_block:
+    # FL-2 FIX: support cross-midnight block ranges (e.g. 22:00–06:00 UTC).
+    # Simple comparison "start <= h < end" is always False when start > end.
+    if start_block < end_block:
+        _blocked = start_block <= h < end_block
+    else:  # overnight range wraps past midnight
+        _blocked = h >= start_block or h < end_block
+    if _blocked:
         return False, f"session gate — UTC {h:02d}:xx blocked ({start_block:02d}:00–{end_block:02d}:00 UTC)"
 
     # Weekend block: Fri 20:00 UTC → Sun 08:00 UTC

@@ -68,12 +68,13 @@ CONFIG = {
     "max_leverage": _get_env("MAX_LEVERAGE", "5"),
     "max_total_exposure_pct": _get_env("MAX_TOTAL_EXPOSURE_PCT", "50"),
     "daily_loss_circuit_breaker_pct": _get_env("DAILY_LOSS_CIRCUIT_BREAKER_PCT", "12"),
+    "weekly_loss_circuit_breaker_pct": float(_get_env("WEEKLY_LOSS_CIRCUIT_BREAKER_PCT", "30")),
     "mandatory_sl_pct": _get_env("MANDATORY_SL_PCT", "3"),
     "max_concurrent_positions": _get_env("MAX_CONCURRENT_POSITIONS", "3"),
     "min_balance_reserve_pct": _get_env("MIN_BALANCE_RESERVE_PCT", "20"),
 
     # API server
-    "api_host": _get_env("API_HOST", "0.0.0.0"),
+    "api_host": _get_env("API_HOST", "127.0.0.1"),
     "api_port": _get_env("APP_PORT") or _get_env("API_PORT") or "3000",
 
     # Telegram
@@ -110,6 +111,12 @@ CONFIG = {
         for k, v in os.environ.items()
         if k.upper().startswith("ADX_OVERRIDE_") and v.strip()
     },
+
+    # Circuit breaker restart gate — set OPERATOR_CONFIRM_RESTART=true to require
+    # manual intervention before trading resumes after a daily circuit breaker trip.
+    # When True, the bot stays halted at midnight reset until operator removes the
+    # CIRCUIT_BREAKER_HOLD file from the project root.
+    "operator_confirm_restart": _get_bool("OPERATOR_CONFIRM_RESTART", False),
 
     # AI anomaly detector + regime classifier
     "anomaly_trigger_pct": float(_get_env("ANOMALY_TRIGGER_PCT", "3.0")),

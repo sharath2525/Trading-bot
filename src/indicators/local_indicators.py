@@ -229,14 +229,15 @@ def stoch_rsi(candles: list[dict], rsi_period: int = 14, stoch_period: int = 14,
     valid_k_smoothed = [v for v in k_line if v is not None]
     d_line = sma(valid_k_smoothed, d_smooth) if len(valid_k_smoothed) >= d_smooth else [None] * len(valid_k_smoothed)
 
-    # Pad to original length with hard trims to prevent length mismatches
+    # Pad to original length. Trim from the FRONT (excess Nones) to preserve
+    # the most recent values when k_line is unexpectedly longer than rsi_vals.
     pad_k = max(0, len(rsi_vals) - len(k_line))
     full_k: list[float | None] = ([None] * pad_k) + k_line
-    full_k = full_k[:len(rsi_vals)]  # hard trim
+    full_k = full_k[-len(rsi_vals):]  # E-5 FIX: keep tail (recent values), not head
 
     pad_d = max(0, len(rsi_vals) - len(d_line))
     full_d: list[float | None] = ([None] * pad_d) + d_line
-    full_d = full_d[:len(rsi_vals)]  # hard trim
+    full_d = full_d[-len(rsi_vals):]  # E-5 FIX: keep tail (recent values), not head
 
     return {"k": full_k, "d": full_d}
 

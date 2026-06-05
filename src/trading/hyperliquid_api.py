@@ -307,13 +307,13 @@ class HyperliquidAPI:
         order_type = {"limit": {"tif": tif}}
         return await self._order_retry(lambda: self.exchange.order(asset, False, amount, limit_price, order_type), asset, is_buy=False)
 
-    async def _trigger_order_retry(self, fn, asset: str, tpsl_type: str):
+    async def _trigger_order_retry(self, fn, asset: str, tpsl_type: str, trigger_px: float = 0.0):
         """Retry-safe placement for TP/SL trigger orders with idempotency guard.
 
         Before each retry after the first failure, checks open orders for an
-        existing trigger order of the same type (``"tp"`` or ``"sl"``) for the
-        asset.  If one already exists the retry is skipped and
-        ``{"status": "already_placed"}`` is returned.
+        existing trigger order of the same type AND price for the asset.
+        Matching by price (E-7 FIX) prevents a stale old SL at a different price
+        from blocking placement of an updated SL after a trail.
         """
         last_err = None
         for attempt in range(3):
@@ -333,9 +333,15 @@ class HyperliquidAPI:
                         if o.get('coin') == asset:
                             ot = o.get('orderType')
                             if isinstance(ot, dict) and (ot.get('trigger') or {}).get('tpsl') == tpsl_type:
+                                # E-7 FIX: also match by price when available.
+                                # An old SL at a different price (e.g. pre-trail) must NOT
+                                # block placement of the updated SL at the new trail price.
+                                existing_px = float(o.get('triggerPx') or 0)
+                                if trigger_px > 0 and existing_px > 0 and abs(existing_px - trigger_px) / trigger_px > 0.0001:
+                                    continue  # different price — not the same order, keep retrying
                                 logging.info(
-                                    "[IDEMPOTENT] %s %s trigger order already exists — skipping retry",
-                                    tpsl_type.upper(), asset,
+                                    "[IDEMPOTENT] %s %s trigger already exists at %.6f — skipping retry",
+                                    tpsl_type.upper(), asset, existing_px,
                                 )
                                 return {"status": "already_placed"}
                 except Exception as _ce:
@@ -385,7 +391,7 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
-        return await self._trigger_order_retry(lambda: self.exchange.order(asset, not is_buy, amount, tp_price, order_type, True), asset, tpsl_type="tp")
+        return await self._trigger_order_retry(lambda: self.exchange.order(asset, not is_buy, amount, tp_price, order_type, True), asset, tpsl_type="tp", trigger_px=float(tp_price))
 
     async def place_stop_loss(self, asset, is_buy, amount, sl_price):
         """Create a reduce-only trigger order that executes a stop-loss exit.
@@ -402,7 +408,7 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}}
-        return await self._trigger_order_retry(lambda: self.exchange.order(asset, not is_buy, amount, sl_price, order_type, True), asset, tpsl_type="sl")
+        return await self._trigger_order_retry(lambda: self.exchange.order(asset, not is_buy, amount, sl_price, order_type, True), asset, tpsl_type="sl", trigger_px=float(sl_price))
 
     async def market_close(self, asset: str, slippage: float = 0.01):
         """Close the entire open position for asset at market price.
@@ -571,8 +577,8 @@ class HyperliquidAPI:
         caused the dashboard to show $13.90 (margin used) instead of $102.67
         (true total equity) when a cross-margin BTC position was open.
 
-        TRUE total = perps_value (crossMarginSummary.accountValue, includes PnL)
-                   + spot_usdc  (USDC in the spot/unified wallet).
+        total_value = perps_value only (FL-5: spot_usdc excluded from risk calculations).
+        spot_usdc is still returned in the result dict for display purposes.
         """
         state = await self._retry(lambda: self.info.user_state(self.query_address))
         positions = state.get("assetPositions", [])
@@ -601,11 +607,11 @@ class HyperliquidAPI:
         except Exception as e:
             logging.warning("spot balance fetch failed: %s", e)
 
-        # TRUE total = cross-margin equity + spot USDC (separate wallets on Hyperliquid).
-        # perps_value = crossMarginSummary.accountValue (cross-margin equity + unrealized PnL).
-        # spot_usdc   = USDC held in the spot wallet (needs manual transfer to use for perps).
-        # Always sum both — never choose one over the other.
-        total_value = perps_value + spot_usdc
+        # FL-5 FIX: use perps_value only for risk calculations.
+        # spot_usdc requires a manual wallet transfer before it can be used as perp margin.
+        # Including it inflated position sizing beyond what the perp wallet could actually margin.
+        # balance/total_value now reflect only deployable perp equity.
+        total_value = perps_value
 
         logging.info(
             "[BALANCE] perps=%.2f spot_usdc=%.2f total=%.2f",

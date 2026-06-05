@@ -188,16 +188,16 @@ class TradeStateMachine:
             self._save()
             logging.info("[STATE] %s stale entry_time cleared", asset)
 
-    def is_trade_expired(self, asset: str, max_hours: int = 12) -> bool:
-        """Return True if trade has been open > max_hours with no TP hit."""
+    def is_trade_expired_minutes(self, asset: str, max_minutes: float) -> bool:
+        """Return True if trade has been open > max_minutes. Used for candle-count exits."""
         t = self._entry_time.get(asset)
         if not t:
             return False
-        elapsed_hours = (time.time() - t) / 3600
-        if elapsed_hours > max_hours:
+        elapsed_minutes = (time.time() - t) / 60.0
+        if elapsed_minutes > max_minutes:
             logging.warning(
-                "[TIMEOUT] %s trade open %.1fh > %dh limit — exit",
-                asset, elapsed_hours, max_hours,
+                "[TIMEOUT] %s trade open %.1fmin > %.0fmin limit — exit",
+                asset, elapsed_minutes, max_minutes,
             )
             return True
         return False
