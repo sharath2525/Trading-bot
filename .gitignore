@@ -1,9 +1,14 @@
-# Environment — contains private keys and API credentials
+# =============================================================
+# RULE: Only push files needed to RUN the bot after a fresh clone.
+#       Everything else (reports, plans, secrets, runtime data) stays LOCAL.
+# =============================================================
+
+# ── SECRETS ──────────────────────────────────────────────────
 .env
 .env.*
 !.env.example
 
-# Runtime state — contains wallet/position data
+# ── RUNTIME STATE (generated at runtime, not source) ─────────
 state.json
 state.json.tmp
 active_trades.json
@@ -12,13 +17,39 @@ risk_state.json
 risk_state.json.tmp
 daily_count.json
 diary_index.json
-
-# Trade logs — may contain PnL and position details
+bot_started.json
 *.jsonl
 *.log
-bot_started.json
 
-# Python
+# ── REPORTS & ANALYSIS (local research, never push) ──────────
+reports/
+
+# ── MARKDOWN DOCS (block all, whitelist only core project docs) ──
+*.md
+!README.md
+!CLAUDE.md
+!MASTER_RULES.md
+
+# ── PLANNING / STRATEGY / DESIGN FILES ───────────────────────
+# Catch any loose planning/analysis files by name pattern
+*PLAN*
+*REPORT*
+*NOTES*
+*STRATEGY*
+*REDESIGN*
+*DEPLOY*
+*IMPLEMENTATION*
+*ANALYSIS*
+*council*
+*review*
+
+# ── JUNK / ACCIDENTAL FILES ──────────────────────────────────
+0.15%
+MAX_TRADE_HOURS
+package-lock.json
+*.txt
+
+# ── PYTHON ───────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
@@ -30,38 +61,21 @@ build/
 .eggs/
 *.egg
 
-# Virtual environments
+# ── VIRTUAL ENVIRONMENTS ─────────────────────────────────────
 venv/
 .venv/
 env/
 
-# IDE
+# ── IDE ───────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS
+# ── OS ────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Operator control files (not source)
+# ── OPERATOR CONTROL FLAGS ────────────────────────────────────
 KILLSWITCH
 CIRCUIT_BREAKER_HOLD
-
-# Reports and analysis docs — local only, not for version control
-reports/
-*.md
-!CLAUDE.md
-!README.md
-
-# Misc generated/temp files
-*.txt
-0.15%
-MAX_TRADE_HOURS
-DEVNOTES.md
-STRATEGY.md
-DEPLOY_AND_OPERATIONS.md
-IMPLEMENTATION_PLAN.md
-package-lock.json
-trading-bot-bug-council-report*.md
