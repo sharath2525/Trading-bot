@@ -578,54 +578,80 @@ def main():
             exit_price = override_exit_price
             realized_pnl = override_pnl
 
-            # Fetch closing fill when no price is already known
+            # Fetch closing fill when no price is already known.
+            # PNL-FIX: retry up to 3 times with 1s backoff so transient 429s
+            # don't permanently zero out realized_pnl and leave exit_type=unknown.
             _matching: list[dict] = []
             if exit_price is None and qty > 0:
-                try:
-                    _fills = await hyperliquid.get_recent_fills(limit=50)
-                    _opened_ts = None
-                    if opened_at_str:
-                        try:
-                            _opened_ts = datetime.fromisoformat(opened_at_str)
-                            if _opened_ts.tzinfo is None:
-                                _opened_ts = _opened_ts.replace(tzinfo=timezone.utc)
-                        except Exception:
-                            pass
-                    for _fill in _fills:
-                        if (_fill.get('coin') or _fill.get('asset')) != asset:
-                            continue
-                        # Must be after trade opened
-                        _t_raw = _fill.get('time') or _fill.get('timestamp')
-                        if _t_raw and _opened_ts:
+                for _fill_attempt in range(3):
+                    try:
+                        if _fill_attempt > 0:
+                            await asyncio.sleep(1.5)
+                        _fills = await hyperliquid.get_recent_fills(limit=50)
+                        _opened_ts = None
+                        if opened_at_str:
                             try:
-                                _t_int = int(_t_raw)
-                                _fdt = datetime.fromtimestamp(
-                                    _t_int / 1000 if _t_int > 1e12 else _t_int, tz=timezone.utc
-                                )
-                                if _fdt < _opened_ts:
-                                    continue
+                                _opened_ts = datetime.fromisoformat(opened_at_str)
+                                if _opened_ts.tzinfo is None:
+                                    _opened_ts = _opened_ts.replace(tzinfo=timezone.utc)
                             except Exception:
                                 pass
-                        # LB-v10-3 FIX: get_recent_fills() normalizes to snake_case 'is_buy';
-                        # the original API may return camelCase 'isBuy'. Use dual-lookup so
-                        # neither normalization path silently mismatches every fill direction.
-                        _fbuy = bool(_fill.get('is_buy', _fill.get('isBuy', False)))
-                        if is_long and _fbuy:
-                            continue   # long is closed by a sell fill
-                        if not is_long and not _fbuy:
-                            continue   # short is closed by a buy fill
-                        _matching.append(_fill)
-                    if _matching:
-                        _tqty = sum(float(f.get('sz') or f.get('size') or 0) for f in _matching)
-                        _tval = sum(
-                            float(f.get('px') or f.get('price') or 0)
-                            * float(f.get('sz') or f.get('size') or 0)
-                            for f in _matching
-                        )
-                        if _tqty > 0:
-                            exit_price = round(_tval / _tqty, 6)
-                except Exception as _fe:
-                    logging.warning("[PNL] fill lookup failed for %s: %s", asset, _fe)
+                        for _fill in _fills:
+                            if (_fill.get('coin') or _fill.get('asset')) != asset:
+                                continue
+                            # Must be after trade opened
+                            _t_raw = _fill.get('time') or _fill.get('timestamp')
+                            if _t_raw and _opened_ts:
+                                try:
+                                    _t_int = int(_t_raw)
+                                    _fdt = datetime.fromtimestamp(
+                                        _t_int / 1000 if _t_int > 1e12 else _t_int, tz=timezone.utc
+                                    )
+                                    if _fdt < _opened_ts:
+                                        continue
+                                except Exception:
+                                    pass
+                            # LB-v10-3 FIX: get_recent_fills() normalizes to snake_case 'is_buy';
+                            # the original API may return camelCase 'isBuy'. Use dual-lookup so
+                            # neither normalization path silently mismatches every fill direction.
+                            _fbuy = bool(_fill.get('is_buy', _fill.get('isBuy', False)))
+                            if is_long and _fbuy:
+                                continue   # long is closed by a sell fill
+                            if not is_long and not _fbuy:
+                                continue   # short is closed by a buy fill
+                            _matching.append(_fill)
+                        if _matching:
+                            _tqty = sum(float(f.get('sz') or f.get('size') or 0) for f in _matching)
+                            _tval = sum(
+                                float(f.get('px') or f.get('price') or 0)
+                                * float(f.get('sz') or f.get('size') or 0)
+                                for f in _matching
+                            )
+                            if _tqty > 0:
+                                exit_price = round(_tval / _tqty, 6)
+                                break  # got a valid exit price — stop retrying
+                    except Exception as _fe:
+                        logging.warning("[PNL] fill lookup attempt %d failed for %s: %s",
+                                        _fill_attempt + 1, asset, _fe)
+
+            # PNL FALLBACK: if fill lookup still failed after retries, estimate exit price
+            # from TP/SL/current market price so realized_pnl is never silently None.
+            if exit_price is None and entry_price and qty > 0:
+                _tp_f  = float(tp_price_tr)  if tp_price_tr  else None
+                _sl_f  = float(sl_price_tr)  if sl_price_tr  else None
+                _cur_p = asset_prices.get(asset) if 'asset_prices' in dir() else None
+                # Use TP if exit_type hints TP, SL if hints SL, else current market price
+                if exit_type == "tp" and _tp_f:
+                    exit_price = _tp_f
+                elif exit_type == "sl" and _sl_f:
+                    exit_price = _sl_f
+                elif exit_type == "time_limit" and _cur_p:
+                    exit_price = float(_cur_p)
+                elif _cur_p:
+                    exit_price = float(_cur_p)
+                if exit_price:
+                    logging.info("[PNL] %s using estimated exit price %.6f (fills unavailable)",
+                                 asset, exit_price)
 
             # Net P&L: gross move minus round-trip taker fees and funding cost
             if realized_pnl is None and exit_price and entry_price and qty:
@@ -674,12 +700,15 @@ def main():
                         exit_type = "sl"
 
             # Per-asset SL cooldown — block re-entry after a confirmed stop-loss or forced loss.
-            # Exit path FIX: trigger cooldown on sl/force regardless of pnl — pnl=None means
-            # fill lookup failed, not that the trade was profitable.
-            if exit_type in ("sl", "force"):
+            # COOLDOWN FIX: also trigger on "unknown" exit with negative PnL — previously all
+            # 10 trades had exit_type=unknown (fill lookup failed), so cooldown never fired and
+            # the bot could immediately re-enter the same asset after a loss.
+            _is_loss = realized_pnl is not None and realized_pnl < 0
+            if exit_type in ("sl", "force") or (exit_type == "unknown" and _is_loss):
                 _cd_mins = int(CONFIG.get("cooldown_minutes") or 60)
                 _sl_cooldown_map[asset] = datetime.now(timezone.utc) + timedelta(minutes=_cd_mins)
-                logging.info("[COOLDOWN] %s blocked %d min after %s exit", asset, _cd_mins, exit_type)
+                logging.info("[COOLDOWN] %s blocked %d min after %s exit (pnl=%.4f)",
+                             asset, _cd_mins, exit_type, realized_pnl or 0)
 
             _close_event = {
                 "timestamp": now.isoformat(),
@@ -1800,6 +1829,19 @@ def main():
                 _bb_mid = float(_sig.get("bb_mid") or 0)
                 _fee_buf = _entry * float(CONFIG.get("taker_fee_pct") or 0.00045) * 2
 
+                # ATR SCALE SANITY CHECK — xyz: assets (SPX, GOLD, etc.) may return candles
+                # in the underlying index units (e.g. S&P at 5300) while the HL contract
+                # trades at a fraction of that (e.g. $0.28). This causes ATR >> entry price,
+                # blowing up SL/TP distances. Cap ATR at 3% of entry as a safe fallback.
+                if _entry > 0 and _atr_5m > _entry * 0.20:
+                    _safe_atr = round(_entry * 0.03, 8)
+                    logging.warning(
+                        "[ATR SCALE] %s ATR=%.6f is %.1f%% of entry=%.6f — scale mismatch "
+                        "(likely xyz: candle unit vs contract price). Capping to 3%% = %.6f",
+                        _asset, _atr_5m, _atr_5m / _entry * 100, _entry, _safe_atr,
+                    )
+                    _atr_5m = _safe_atr
+
                 if _entry <= 0 or _atr_5m <= 0 or _bb_mid <= 0:
                     outputs["trade_decisions"].append(_make_hold(_asset, "missing price, ATR5m, or BB mid"))
                     continue
@@ -1879,9 +1921,15 @@ def main():
                 except Exception:
                     pass
 
-                # LIMIT order — 0.15% better than market (0% maker fee on Hyperliquid)
-                _lim_off = _entry * 0.0015
-                _lim_px = round(_entry - _lim_off, 6) if _direction_str == "buy" else round(_entry + _lim_off, 6)
+                # LIMIT order — place AT signal price (last closed candle close).
+                # CRITICAL FIX: the old 0.15% offset placed buys BELOW a bouncing price
+                # and sells ABOVE a falling price — exact opposite of mean reversion fill
+                # direction. Result: near-zero fill rate on all signals.
+                # On Hyperliquid maker fee = 0% anyway, so there is zero benefit to the
+                # offset. A limit at _entry fills as taker (0.045%) or maker if the spread
+                # allows — either way the trade executes instead of expiring unfilled.
+                # 0.045% taker on a $15 position = $0.007; negligible vs a missed trade.
+                _lim_px = round(_entry, 6)
 
                 outputs["trade_decisions"].append({
                     "asset":          _asset,
@@ -2480,9 +2528,17 @@ def main():
                         logging.info("[LIMIT PENDING] %s unfilled limit cancelled after %.0fs — slot freed", _pl_asset, _pl_age_s)
                         add_event(f"[LIMIT PENDING] {_pl_asset} unfilled limit cancelled after {int(_pl_age_s)}s — re-evaluating next cycle")
                     except Exception as _pl_ce:
-                        logging.warning("[LIMIT PENDING] %s cancel failed: %s — will retry next tick", _pl_asset, _pl_ce)
+                        logging.warning("[LIMIT PENDING] %s cancel failed: %s", _pl_asset, _pl_ce)
+                        # If the order is already gone on exchange (expired/filled elsewhere)
+                        # cancel_order raises but the order doesn't exist — treat as success
+                        # after 15+ min to avoid permanent slot lock.
+                        if _pl_age_s > 900:
+                            logging.warning("[LIMIT PENDING] %s order age %.0fs > 15min, treating stale cancel as success to free slot", _pl_asset, _pl_age_s)
+                            _pl_cancel_ok = True
+                        else:
+                            continue  # leave active_trade intact so we retry cancel next tick
                     if not _pl_cancel_ok:
-                        continue  # leave active_trade intact so we retry cancel next tick
+                        continue
                     try:
                         active_trades.remove(_pl_tr)
                     except ValueError:
@@ -2540,7 +2596,9 @@ def main():
                     if _iaccval_pre > 0:
                         account_value = _iaccval_pre
                         state = _istate_pre
-                    for _ri_asset in args.assets:
+                    for _ri_idx, _ri_asset in enumerate(args.assets):
+                        if _ri_idx > 0:
+                            await asyncio.sleep(0.2)  # stagger price fetches — prevents 429
                         try:
                             _rip = await hyperliquid.get_current_price(_ri_asset)
                             if _rip > 0:
@@ -2554,7 +2612,12 @@ def main():
                     logging.warning("[INNER tick %d] pre-score state/price refresh failed: %s", _tick + 1, _ire_pre)
 
                 # Refresh 5m candles and recompute trigger_5m per asset
-                for _i_asset in args.assets:
+                # RATE-LIMIT FIX: stagger candle fetches by 0.35s per asset so 10 assets
+                # spread over ~3.5s instead of firing simultaneously.
+                # Without this, 10 simultaneous requests → Hyperliquid 429 every inner tick.
+                for _i_asset_idx, _i_asset in enumerate(args.assets):
+                    if _i_asset_idx > 0:
+                        await asyncio.sleep(0.35)
                     try:
                         _f5m = await hyperliquid.get_candles(_i_asset, "5m", 100)  # 100 candles sufficient for BB(20)+StochRSI(14,14) warmup
                         if not _f5m:
@@ -2637,7 +2700,7 @@ def main():
                             agent.claude_anomaly_check, _i_asset, _i_chg_5c, _idir_str)
                         if _iverd != "APPROVE":
                             continue
-                    _ilim_px = round(_ie * (1 - 0.0015), 6) if _idir_str == "buy" else round(_ie * (1 + 0.0015), 6)
+                    _ilim_px = round(_ie, 6)  # AT signal price — same fix as outer loop
                     _inner_outputs["trade_decisions"].append({
                         "asset": _i_asset, "action": _idir_str,
                         "allocation_usd": _ialloc, "order_type": "limit",

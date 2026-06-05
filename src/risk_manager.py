@@ -362,7 +362,17 @@ class RiskManager:
         """
         min_profit_pct = self.TAKER_FEE_PCT * 2 * 3  # 0.27% fee floor
         fee_distance = entry_price * (min_profit_pct / 100.0)
-        atr_distance = float(atr14) * 1.5 if atr14 and atr14 > 0 else 0.0
+        # ATR sanity: if atr14 > 20% of entry it's a scale mismatch (xyz: asset candle units).
+        # Clamp to 0 so we fall back to fee floor only — prevents TP being forced to entry+$450.
+        raw_atr = float(atr14) if atr14 and atr14 > 0 else 0.0
+        safe_atr = raw_atr if entry_price <= 0 or raw_atr <= entry_price * 0.20 else 0.0
+        if raw_atr != safe_atr:
+            logging.warning(
+                "RISK: enforce_take_profit atr14=%.4f > 20%% of entry=%.4f — "
+                "clamping ATR to 0 (scale mismatch guard)",
+                raw_atr, entry_price,
+            )
+        atr_distance = safe_atr * 1.5
         min_distance = max(fee_distance, atr_distance)
         if is_buy:
             min_tp = round(entry_price + min_distance, 6)
