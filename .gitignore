@@ -7,6 +7,15 @@
 .env
 .env.*
 !.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.secret
+secrets/
+credentials/
+keystore/
+wallet*.json
 
 # ── RUNTIME STATE (generated at runtime, not source) ─────────
 state.json
@@ -29,6 +38,7 @@ reports/
 !README.md
 !CLAUDE.md
 !MASTER_RULES.md
+DEVNOTES.md
 
 # ── PLANNING / STRATEGY / DESIGN FILES ───────────────────────
 # Catch any loose planning/analysis files by name pattern

@@ -86,12 +86,13 @@ def compute_bb_stochrsi_signal(candles_5m: list, cfg: dict) -> dict:
         # ── Signal conditions ─────────────────────────────────────────────────
         signal = "NONE"
 
-        # LONG: price at or below lower BB AND StochRSI was oversold AND is now turning up
-        if current_price <= bb_lower and k_cur <= srsi_os and k_cur > k_prev:
+        # LONG: price at/below lower BB AND K crossed OUT OF oversold zone (k_prev in zone, k_cur above threshold)
+        # C-4 FIX: "hooking out" = K crossing the OS threshold, not just turning while still inside.
+        if current_price <= bb_lower and k_prev <= srsi_os and k_cur > srsi_os:
             signal = "LONG"
 
-        # SHORT: price at or above upper BB AND StochRSI was overbought AND is now turning down
-        elif current_price >= bb_upper and k_cur >= srsi_ob and k_cur < k_prev:
+        # SHORT: price at/above upper BB AND K crossed OUT OF overbought zone (k_prev in zone, k_cur below threshold)
+        elif current_price >= bb_upper and k_prev >= srsi_ob and k_cur < srsi_ob:
             signal = "SHORT"
 
         if signal != "NONE":

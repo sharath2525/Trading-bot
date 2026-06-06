@@ -607,11 +607,12 @@ class HyperliquidAPI:
         except Exception as e:
             logging.warning("spot balance fetch failed: %s", e)
 
-        # FL-5 FIX: use perps_value only for risk calculations.
-        # spot_usdc requires a manual wallet transfer before it can be used as perp margin.
-        # Including it inflated position sizing beyond what the perp wallet could actually margin.
-        # balance/total_value now reflect only deployable perp equity.
-        total_value = perps_value
+        # FL-5 FIX (updated for unified accounts):
+        # On standard accounts: perps_value holds deployable equity; spot_usdc needs manual transfer.
+        # On unified accounts: spot_usdc IS the perp margin — no transfer needed.
+        # Use perps_value when positions are open (it includes unrealised PnL).
+        # Fall back to spot_usdc when perps_value=0 (unified account with no open positions).
+        total_value = perps_value if perps_value > 0 else spot_usdc
 
         logging.info(
             "[BALANCE] perps=%.2f spot_usdc=%.2f total=%.2f",

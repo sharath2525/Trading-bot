@@ -338,17 +338,20 @@ def calculate_sharpe_from_diary(diary_path: str, risk_free: float = 0.0) -> floa
     """
     import math as _math
     pnls: list[float] = []
+    # E-4 FIX: also read rotated diary (.old) so Sharpe doesn't reset to None after log rotation.
+    _paths_to_read = [diary_path, diary_path + ".old"]
     try:
-        if not os.path.exists(diary_path):
-            return None
-        with open(diary_path, "r", encoding="utf-8") as _f:
-            for _line in _f:
-                try:
-                    _e = json.loads(_line)
-                    if _e.get("event") == "trade_closed" and _e.get("realized_pnl") is not None:
-                        pnls.append(float(_e["realized_pnl"]))
-                except Exception:
-                    continue
+        for _dp in _paths_to_read:
+            if not os.path.exists(_dp):
+                continue
+            with open(_dp, "r", encoding="utf-8") as _f:
+                for _line in _f:
+                    try:
+                        _e = json.loads(_line)
+                        if _e.get("event") == "trade_closed" and _e.get("realized_pnl") is not None:
+                            pnls.append(float(_e["realized_pnl"]))
+                    except Exception:
+                        continue
     except Exception:
         return None
     if len(pnls) < 5:
@@ -483,6 +486,56 @@ def main():
                 logging.error("[LEVERAGE] Failed to set leverage for %s: %s — ABORTING to avoid uncontrolled leverage", _lev_asset, _lev_err)
                 add_event(f"[LEVERAGE] CRITICAL: could not set leverage for {_lev_asset} — bot halted. Fix and restart.")
                 return  # Fail closed: do not trade with unknown leverage
+
+        # ── C-3 FIX: Startup reconciliation — verify active_trades vs live exchange positions ──
+        try:
+            logging.info("[STARTUP RECONCILE] verifying active_trades against live exchange positions...")
+            _sr_live_positions = await hyperliquid.get_positions()
+            _sr_live_assets = {
+                p.get("coin") for p in _sr_live_positions
+                if abs(float(p.get("szi") or 0)) > 1e-8
+            }
+            # Remove stale active_trades with no live position
+            for _sr_tr in active_trades[:]:
+                _sr_asset = _sr_tr.get("asset")
+                if _sr_asset not in _sr_live_assets:
+                    logging.warning("[STARTUP RECONCILE] %s in active_trades but no live position — removing stale entry", _sr_asset)
+                    active_trades.remove(_sr_tr)
+                    state_mgr.clear_entry(_sr_asset)
+            # Add untracked live positions so guardian can monitor them
+            _sr_tracked = {tr.get("asset") for tr in active_trades}
+            for _sr_pos in _sr_live_positions:
+                _sr_pa = _sr_pos.get("coin")
+                _sr_sz = abs(float(_sr_pos.get("szi") or 0))
+                if _sr_sz < 1e-8 or not _sr_pa or _sr_pa in _sr_tracked:
+                    continue
+                _sr_is_long = float(_sr_pos.get("szi") or 0) > 0
+                logging.warning(
+                    "[STARTUP RECONCILE] %s has live %.6f %s position not in active_trades — adding for guardian monitoring",
+                    _sr_pa, _sr_sz, "LONG" if _sr_is_long else "SHORT",
+                )
+                active_trades.append({
+                    "asset": _sr_pa, "is_long": _sr_is_long,
+                    "amount": _sr_sz, "half_size": round(_sr_sz / 2, 6),
+                    "entry_price": float(_sr_pos.get("entryPx") or 0),
+                    "entry_atr": 0.0,
+                    "tp_price": None, "tp1_price": None, "tp2_price": None, "sl_price": None,
+                    "tp_oid": None, "tp1_oid": None, "tp2_oid": None, "sl_oid": None,
+                    "tp1_hit": False, "trail_breakeven_done": False, "trail_active": False,
+                    "exit_plan": "startup-reconcile: untracked — SL orphan check covers",
+                    "funding_rate": 0.0,
+                    "opened_at": datetime.now(timezone.utc).isoformat(),
+                })
+                state_mgr.record_entry(_sr_pa)
+                asyncio.create_task(send_alert(
+                    f"⚠️ [STARTUP] Untracked {_sr_pa} position found sz={_sr_sz:.6f} "
+                    f"{'LONG' if _sr_is_long else 'SHORT'} — added to monitoring"
+                ))
+            save_active_trades(active_trades)
+            logging.info("[STARTUP RECONCILE] complete — tracking %d position(s)", len(active_trades))
+        except Exception as _sr_err:
+            logging.error("[STARTUP RECONCILE] failed: %s — proceeding without reconciliation", _sr_err)
+        # ─────────────────────────────────────────────────────────────────────────
 
         # ── Score-pipeline state (persist across cycles) ──────────────────────────
         # CRITICAL-7: Load daily count from disk to survive process restarts
@@ -1018,6 +1071,38 @@ def main():
                         # let _log_trade_close resolve tp/sl from the fill price.
                         _recon_exit_type = tr.get('pending_exit_type', 'unknown')
                         await _log_trade_close(tr, _recon_exit_type)
+                # E-1 FIX: Reverse check — detect live exchange positions NOT tracked in active_trades.
+                # Without this, manual trades, crash-window entries (H-8), or corrupted state leave
+                # positions with no TP/SL monitoring. SL orphan check will cover on next inner tick.
+                _recon_tracked = {tr.get("asset") for tr in active_trades}
+                for _recon_pos in state.get("positions", []):
+                    _rp_asset = _recon_pos.get("coin")
+                    _rp_sz    = abs(float(_recon_pos.get("szi") or 0))
+                    if _rp_sz < 1e-8 or not _rp_asset or _rp_asset in _recon_tracked:
+                        continue
+                    _rp_is_long = float(_recon_pos.get("szi") or 0) > 0
+                    logging.warning(
+                        "[RECONCILE] %s has live %.6f %s position not in active_trades — adding for monitoring",
+                        _rp_asset, _rp_sz, "LONG" if _rp_is_long else "SHORT",
+                    )
+                    active_trades.append({
+                        "asset": _rp_asset, "is_long": _rp_is_long,
+                        "amount": _rp_sz, "half_size": round(_rp_sz / 2, 6),
+                        "entry_price": float(_recon_pos.get("entryPx") or 0),
+                        "entry_atr": 0.0,
+                        "tp_price": None, "tp1_price": None, "tp2_price": None, "sl_price": None,
+                        "tp_oid": None, "tp1_oid": None, "tp2_oid": None, "sl_oid": None,
+                        "tp1_hit": False, "trail_breakeven_done": False, "trail_active": False,
+                        "exit_plan": "reconcile: untracked position — SL orphan check covers",
+                        "funding_rate": 0.0,
+                        "opened_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    state_mgr.record_entry(_rp_asset)
+                    save_active_trades(active_trades)
+                    asyncio.create_task(send_alert(
+                        f"⚠️ [RECONCILE] Untracked {_rp_asset} sz={_rp_sz:.6f} "
+                        f"{'LONG' if _rp_is_long else 'SHORT'} added — SL orphan check covers"
+                    ))
                 # BUG-P11-1 FIX: TP1 hit detection — set tp1_hit=True and halve tracked amount
                 # when TP1 order disappears from open orders but position still exists.
                 # Without this, tp1_hit stays False forever and the trailing stop guardian
@@ -1748,8 +1833,9 @@ def main():
                 _cds_pre = _ac_pre.get("candles_5m", [])
                 if len(_cds_pre) < 5:
                     continue
-                _p_now_pre = float(_cds_pre[-1].get("close") or 0)
-                _p_5ago_pre = float(_cds_pre[-5].get("close") or 0)
+                # H-2 FIX: use last CLOSED candle [-2] not forming candle [-1] to match signal logic.
+                _p_now_pre = float(_cds_pre[-2].get("close") or 0) if len(_cds_pre) >= 2 else 0.0
+                _p_5ago_pre = float(_cds_pre[-6].get("close") or 0) if len(_cds_pre) >= 6 else float(_cds_pre[-5].get("close") or 0)
                 if _p_5ago_pre <= 0:
                     continue
                 _chg_pre = abs(_p_now_pre - _p_5ago_pre) / _p_5ago_pre * 100
@@ -2146,7 +2232,12 @@ def main():
                                 logging.info("[LIMIT] %s partial fill %.6f/%.6f — unfilled remainder cancelled", asset, filled_qty, amount)
                                 add_event(f"[LIMIT] {asset} partial fill {filled_qty:.4f}/{amount:.4f} — remainder cancelled to avoid unprotected exposure")
                             except Exception as _pce:
-                                logging.warning("[LIMIT] %s partial fill cancel failed: %s", asset, _pce)
+                                # H-4 FIX: CRITICAL alert — remainder may fill later without TP/SL; SL orphan check covers within 5 min.
+                                logging.critical("[LIMIT] %s partial fill cancel FAILED: %s — unprotected remainder for up to 5 min until SL orphan check", asset, _pce)
+                                asyncio.create_task(send_alert(
+                                    f"⚠️ CRITICAL [{asset}] partial fill cancel failed: {_pce} — "
+                                    f"unfilled remainder {amount - filled_qty:.6f} may fill without SL. Orphan check covers next 5-min tick."
+                                ))
 
                         # Use actual filled quantity for TP/SL sizing.
                         # Fall back to the requested amount for resting limit orders
@@ -2257,9 +2348,12 @@ def main():
                             "entry_oid": entry_oid if (order_type == "limit" and filled_qty == 0) else None,
                             "limit_placed_at": datetime.now(timezone.utc).isoformat() if (order_type == "limit" and filled_qty == 0) else None,
                         })
-                        # CRITICAL-8: record_entry (state.json) BEFORE save_active_trades
-                        state_mgr.record_entry(asset)
+                        # H-8 FIX: save_active_trades (active_trades.json) BEFORE record_entry (state.json).
+                        # If crash happens between the two writes, active_trades has the trade so
+                        # the guardian can monitor TP/SL. state.json still shows IDLE which could
+                        # allow a re-entry, but startup reconciliation (C-3) will re-add it safely.
                         save_active_trades(active_trades)
+                        state_mgr.record_entry(asset)
                         # Only count confirmed fills against the daily cap.
                         # Resting limit orders (filled_qty==0) are counted when they fill
                         # in the pending-limit-cancel block below.
@@ -2638,8 +2732,16 @@ def main():
                         logging.warning("[INNER] 5m refresh %s: %s", _i_asset, _i5e)
 
                 # Re-run BB+StochRSI pipeline with fresh 5m data
+                # F-2 FIX: Two-phase signal scan. Phase 1 computes signals and collects anomaly
+                # needs without awaiting. Phase 2 gathers all Claude anomaly checks concurrently
+                # (mirrors outer-loop asyncio.gather pattern). Sequential awaits blocked the event
+                # loop for up to 45s per flash crash — exactly when position monitoring is critical.
                 _inner_outputs: dict = {"reasoning": "", "trade_decisions": []}
                 _isess_ok, _isess_reason = session_gate_ok(CONFIG)
+                _i_anm_pct = float(CONFIG.get("anomaly_trigger_pct") or 3.0)
+
+                # Phase 1: compute signals, collect pending decisions + anomaly needs
+                _i_pending: list[tuple[dict, str, float, str]] = []  # (decision, asset, chg, dir)
                 for _i_asset in args.assets:
                     _iac = next((m for m in market_sections if m.get("asset") == _i_asset), None)
                     if not _iac:
@@ -2681,27 +2783,24 @@ def main():
                         _isl = round(_ie + 1.5 * _iatr_5m, 6)
                         if _itp >= _ie - _ifee_buf:
                             continue
-                    _itp1 = _itp
-                    _itp2 = _itp
+                    # C-1 FIX: MASTER_RULE 1 — single exit, no partial closes.
+                    # Inner loop must use tp_price only. Setting tp1/tp2=None prevents dual
+                    # reduce-only orders that caused guardian thrashing and incorrect sizing.
+                    _itp1 = None
+                    _itp2 = None
                     _i_buying_power = account_value * float(CONFIG.get("max_leverage") or 5)
                     _i_pct_cap = _i_buying_power * (float(CONFIG.get("max_position_pct") or 15) / 100.0)
                     _i_atr_sized = risk_mgr.atr_position_size(account_value, _ie, _isl)
                     _ialloc = min(_i_pct_cap, _i_atr_sized)
-                    # Anomaly check
+                    # Compute anomaly change using CLOSED candle (H-2 FIX for inner loop)
                     _i_chg_5c = 0.0
-                    if len(_i_candles_5m) >= 5:
-                        _ip_now = float(_i_candles_5m[-1]["close"])
-                        _ip_5a = float(_i_candles_5m[-5]["close"])
-                        if _ip_5a > 0:
-                            _i_chg_5c = abs(_ip_now - _ip_5a) / _ip_5a * 100
-                    _i_anm_pct = float(CONFIG.get("anomaly_trigger_pct") or 3.0)
-                    if _i_chg_5c > _i_anm_pct:
-                        _iverd = await asyncio.to_thread(
-                            agent.claude_anomaly_check, _i_asset, _i_chg_5c, _idir_str)
-                        if _iverd != "APPROVE":
-                            continue
-                    _ilim_px = round(_ie, 6)  # AT signal price — same fix as outer loop
-                    _inner_outputs["trade_decisions"].append({
+                    if len(_i_candles_5m) >= 6:
+                        _ip_now_i = float(_i_candles_5m[-2]["close"])   # last closed candle
+                        _ip_5a_i  = float(_i_candles_5m[-6]["close"])   # 5 closed candles back
+                        if _ip_5a_i > 0:
+                            _i_chg_5c = abs(_ip_now_i - _ip_5a_i) / _ip_5a_i * 100
+                    _ilim_px = round(_ie, 6)
+                    _idecision = {
                         "asset": _i_asset, "action": _idir_str,
                         "allocation_usd": _ialloc, "order_type": "limit",
                         "limit_price": _ilim_px, "tp_price": _itp, "tp1_price": _itp1, "tp2_price": _itp2,
@@ -2709,7 +2808,29 @@ def main():
                         "score": 8.0,
                         "exit_plan": f"inner BB-rev TP={_itp:.4f} SL={_isl:.4f} K={_isig.get('stochrsi_k')}",
                         "rationale": f"inner BB+StochRSI K={_isig.get('stochrsi_k')} {_idir_str}",
-                    })
+                    }
+                    _i_pending.append((_idecision, _i_asset, _i_chg_5c, _idir_str))
+
+                # Phase 2: gather anomaly verdicts concurrently for all assets that need it
+                _i_anomaly_tasks = [
+                    (_ia2, _ic2, _id2) for (_, _ia2, _ic2, _id2) in _i_pending if _ic2 > _i_anm_pct
+                ]
+                _i_anomaly_verdicts: dict[str, str] = {}
+                if _i_anomaly_tasks:
+                    _i_anm_gathered = await asyncio.gather(
+                        *[asyncio.to_thread(agent.claude_anomaly_check, _a2, _c2, _d2)
+                          for (_a2, _c2, _d2) in _i_anomaly_tasks],
+                        return_exceptions=True,
+                    )
+                    for (_a2, _, _), _v2 in zip(_i_anomaly_tasks, _i_anm_gathered):
+                        _i_anomaly_verdicts[_a2] = _v2 if not isinstance(_v2, Exception) else "REJECT"
+
+                # Phase 3: filter by anomaly verdicts and populate trade decisions
+                for (_idec, _ia3, _ic3, _id3) in _i_pending:
+                    if _ic3 > _i_anm_pct and _i_anomaly_verdicts.get(_ia3) != "APPROVE":
+                        logging.info("[INNER ANOMALY] %s rejected by Claude (%.1f%% move)", _ia3, _ic3)
+                        continue
+                    _inner_outputs["trade_decisions"].append(_idec)
 
                 # Execute inner-loop trades (state gate + spread + candle gate + risk)
                 for _iout in _inner_outputs.get("trade_decisions", []):
@@ -2894,9 +3015,9 @@ def main():
                             "funding_rate": float(_iact_ctx.get("funding_rate") or 0),
                             "opened_at": datetime.now(timezone.utc).isoformat(),
                         })
-                        # CRITICAL-8: record_entry (state.json) BEFORE save_active_trades
-                        state_mgr.record_entry(_ia)
+                        # H-8 FIX: save active_trades first so guardian can monitor TP/SL on crash
                         save_active_trades(active_trades)
+                        state_mgr.record_entry(_ia)
                         # CHAOS-v10-6 FIX: Re-check circuit breaker after each trade so a loss
                         # that trips the breaker mid-loop blocks all remaining sibling assets.
                         if risk_mgr.circuit_breaker_active:
@@ -2937,9 +3058,9 @@ def main():
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
                                     "asset": _ia,
                                     "direction": _iout["action"],
-                                    "score": round(_iout.get("score", _iscr), 2),
+                                    "score": round(float(_iout.get("score") or 8.0), 2),
                                     "action": "queued_inner",
-                                    "reason": f"inner score={_iout.get('score', _iscr):.1f} tick={_tick+1}",
+                                    "reason": f"inner score={float(_iout.get('score') or 8.0):.1f} tick={_tick+1}",
                                     "trend_4h": _iact_ctx.get("trend_4h"),
                                     "trend_1h": _iact_ctx.get("trend_1h"),
                                 }) + "\n")
@@ -3023,8 +3144,17 @@ def main():
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
+    # H-7 FIX: Cache /live responses for 30s. Without caching, a browser auto-refreshing at 1s
+    # makes ~60 Hyperliquid API calls/minute, exhausting the rate budget and triggering F-3
+    # (idempotency guard silencing all order placement during rate limit events).
+    _live_cache: dict = {"data": None, "ts": 0.0}
+    _LIVE_CACHE_TTL = 30  # seconds
+
     async def handle_live(request):
         """Return real-time account state fetched directly from Hyperliquid."""
+        _now_live = time.time()
+        if _live_cache["data"] is not None and (_now_live - _live_cache["ts"]) < _LIVE_CACHE_TTL:
+            return web.json_response(_live_cache["data"])
         try:
             state = await hyperliquid.get_user_state()
             positions = []
@@ -3095,7 +3225,7 @@ def main():
                                 funding_rates[_fa] = round(float(_fr) * 100, 6)
             except Exception:
                 pass
-            return web.json_response({
+            _live_result = {
                 "account_value":    round_or_none(_live_av, 2),
                 "balance":          round_or_none(state.get('balance'), 2),
                 "perps_value":      round_or_none(state.get('perps_value'), 2),
@@ -3106,8 +3236,12 @@ def main():
                 "open_orders":      open_orders,
                 "recent_fills":     recent_fills,
                 "funding_rates":    funding_rates,
-                "timestamp":        datetime.now(timezone.utc).isoformat()
-            })
+                "timestamp":        datetime.now(timezone.utc).isoformat(),
+                "cached": False,
+            }
+            _live_cache["data"] = _live_result
+            _live_cache["ts"] = time.time()
+            return web.json_response(_live_result)
         except Exception as e:
             logging.error("handle_live error: %s", e)
             return web.json_response({"error": str(e)}, status=500)
@@ -3462,8 +3596,9 @@ def main():
                 except Exception:
                     result[_a] = []
             # Fetch actual funding rates from Hyperliquid info endpoint
+            # H-1 FIX: use get_meta_and_ctxs() — hyperliquid._get() does not exist.
             try:
-                raw_info = await hyperliquid._get("info", {"type": "metaAndAssetCtxs"})
+                raw_info = await hyperliquid.get_meta_and_ctxs()
                 if raw_info and isinstance(raw_info, list) and len(raw_info) >= 2:
                     meta = raw_info[0].get("universe", [])
                     ctxs = raw_info[1]
@@ -3574,16 +3709,17 @@ def main():
                             pass
             snap["daily_trades"] = daily_trades
             # Get live positions for exposure calc
+            # F-1 FIX: get_account_state() does not exist — use get_user_state() which returns
+            # enriched positions with live PnL. Extracts correct account value from total_value.
             try:
-                live_data = await hyperliquid.get_account_state()
+                live_data = await hyperliquid.get_user_state()
                 if live_data:
-                    positions = live_data.get("assetPositions", [])
-                    acct_val = float((live_data.get("marginSummary") or {}).get("accountValue") or 0)
+                    positions = live_data.get("positions", [])
+                    acct_val = float(live_data.get("total_value") or 0)
                     open_pos = 0
                     total_notional = 0.0
-                    for p in positions:
-                        pos = p.get("position", {})
-                        szi = float(pos.get("szi", 0))
+                    for pos in positions:
+                        szi = float(pos.get("szi") or 0)
                         if abs(szi) > 0:
                             open_pos += 1
                             entry_px = float(pos.get("entryPx") or 0)
